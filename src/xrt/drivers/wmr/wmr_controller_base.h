@@ -20,6 +20,7 @@
 #include "util/u_logging.h"
 #include "xrt/xrt_device.h"
 
+#include "wmr_common.h"
 #include "wmr_controller_protocol.h"
 #include "wmr_config.h"
 
@@ -172,6 +173,15 @@ wmr_controller_connection_receive_bytes(struct wmr_controller_connection *wcc,
 		assert(wcb->receive_bytes != NULL);
 		wcb->receive_bytes(wcb, time_ns, buffer, buf_size);
 	}
+}
+
+static inline struct xrt_device *
+wmr_controller_base_to_xrt_device(struct wmr_controller_base *wcb)
+{
+	if (wcb != NULL) {
+		return &wcb->base;
+	}
+	return NULL;
 }
 
 #ifdef __cplusplus

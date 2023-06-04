@@ -174,13 +174,9 @@ wmr_hmd_controller_create(struct wmr_hmd *hmd,
 	return conn;
 }
 
-struct xrt_device *
+struct wmr_controller_base *
 wmr_hmd_controller_connection_get_controller(struct wmr_hmd_controller_connection *wcc)
 {
 	struct wmr_controller_base *wcb = wcc->base.wcb;
-	if (wcb == NULL)
-		return NULL;
-
-	struct xrt_device *xdev = &wcb->base;
-	return xdev;
+	return wcb;
 }

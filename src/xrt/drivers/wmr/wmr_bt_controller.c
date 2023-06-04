@@ -146,7 +146,7 @@ wmr_bt_connection_destroy(struct wmr_controller_connection *base)
  *
  */
 
-struct xrt_device *
+struct wmr_controller_base *
 wmr_bt_controller_create(struct os_hid_device *controller_hid,
                          enum xrt_device_type controller_type,
                          uint16_t vid,
@@ -202,5 +202,5 @@ wmr_bt_controller_create(struct os_hid_device *controller_hid,
 		return NULL;
 	}
 
-	return xdev;
+	return wcb;
 }

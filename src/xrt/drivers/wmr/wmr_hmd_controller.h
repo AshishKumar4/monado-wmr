@@ -46,7 +46,7 @@ wmr_hmd_controller_create(struct wmr_hmd *hmd,
                           uint16_t pid,
                           enum u_logging_level log_level);
 
-struct xrt_device *
+struct wmr_controller_base *
 wmr_hmd_controller_connection_get_controller(struct wmr_hmd_controller_connection *wcc);
 
 #ifdef __cplusplus

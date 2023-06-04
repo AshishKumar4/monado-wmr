@@ -1820,10 +1820,10 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
                struct os_hid_device *hid_ctrl,
                struct xrt_prober_device *dev_holo,
                enum u_logging_level log_level,
-               struct xrt_device **out_hmd,
+               struct wmr_hmd **out_hmd,
                struct xrt_device **out_handtracker,
-               struct xrt_device **out_left_controller,
-               struct xrt_device **out_right_controller)
+               struct wmr_controller_base **out_left_controller,
+               struct wmr_controller_base **out_right_controller)
 {
 	DRV_TRACE_MARKER();
 
@@ -2042,7 +2042,7 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 
 	wmr_hmd_setup_ui(wh);
 
-	*out_hmd = &wh->base;
+	*out_hmd = wh;
 	*out_handtracker = hand_device;
 
 	os_mutex_lock(&wh->controller_status_lock);

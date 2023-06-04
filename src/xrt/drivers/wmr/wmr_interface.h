@@ -20,7 +20,6 @@
 extern "C" {
 #endif
 
-
 /*!
  * @defgroup drv_wmr Windows Mixed Reality driver
  * @ingroup drv
@@ -134,9 +133,9 @@ wmr_create_headset(struct xrt_prober *xp,
                    struct xrt_prober_device *xpdev_companion,
                    enum wmr_headset_type type,
                    enum u_logging_level log_level,
-                   struct xrt_device **out_hmd,
-                   struct xrt_device **out_left,
-                   struct xrt_device **out_right,
+                   struct wmr_hmd **out_hmd,
+                   struct wmr_controller_base **out_ctrl_left,
+                   struct wmr_controller_base **out_ctrl_right,
                    struct xrt_device **out_ht_left,
                    struct xrt_device **out_ht_right);
 
@@ -149,7 +148,7 @@ xrt_result_t
 wmr_create_bt_controller(struct xrt_prober *xp,
                          struct xrt_prober_device *xpdev,
                          enum u_logging_level log_level,
-                         struct xrt_device **out_xdev);
+                         struct wmr_controller_base **out_ctrl);
 
 
 #ifdef __cplusplus

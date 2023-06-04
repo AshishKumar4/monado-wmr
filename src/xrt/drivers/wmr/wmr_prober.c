@@ -341,9 +341,9 @@ wmr_create_headset(struct xrt_prober *xp,
                    struct xrt_prober_device *xpdev_companion,
                    enum wmr_headset_type type,
                    enum u_logging_level log_level,
-                   struct xrt_device **out_hmd,
-                   struct xrt_device **out_left,
-                   struct xrt_device **out_right,
+                   struct wmr_hmd **out_hmd,
+                   struct wmr_controller_base **out_ctrl_left,
+                   struct wmr_controller_base **out_ctrl_right,
                    struct xrt_device **out_ht_left,
                    struct xrt_device **out_ht_right)
 {
@@ -369,10 +369,10 @@ wmr_create_headset(struct xrt_prober *xp,
 		goto error_holo;
 	}
 
-	struct xrt_device *hmd = NULL;
+	struct wmr_hmd *hmd = NULL;
 	struct xrt_device *ht = NULL;
 	struct xrt_device *two_hands[2] = {NULL, NULL}; // Must initialize, always returned.
-	struct xrt_device *hmd_left_ctrl = NULL, *hmd_right_ctrl = NULL;
+	struct wmr_controller_base *hmd_left_ctrl = NULL, *hmd_right_ctrl = NULL;
 	wmr_hmd_create(type, hid_holo, hid_companion, xpdev_holo, log_level, &hmd, &ht, &hmd_left_ctrl,
 	               &hmd_right_ctrl);
 
@@ -385,13 +385,13 @@ wmr_create_headset(struct xrt_prober *xp,
 
 #ifdef XRT_BUILD_DRIVER_HANDTRACKING
 	if (ht != NULL) { // Create hand-tracked controllers
-		cemu_devices_create(hmd, ht, two_hands);
+		cemu_devices_create(wmr_hmd_to_xrt_device(hmd), ht, two_hands);
 	}
 #endif
 
 	*out_hmd = hmd;
-	*out_left = hmd_left_ctrl;
-	*out_right = hmd_right_ctrl;
+	*out_ctrl_left = hmd_left_ctrl;
+	*out_ctrl_right = hmd_right_ctrl;
 
 	*out_ht_left = two_hands[0];
 	*out_ht_right = two_hands[1];
@@ -408,7 +408,7 @@ xrt_result_t
 wmr_create_bt_controller(struct xrt_prober *xp,
                          struct xrt_prober_device *xpdev,
                          enum u_logging_level log_level,
-                         struct xrt_device **out_xdev)
+                         struct wmr_controller_base **out_ctrl)
 {
 	DRV_TRACE_MARKER();
 
@@ -459,14 +459,14 @@ wmr_create_bt_controller(struct xrt_prober *xp,
 	}
 
 	// Takes ownership of the hid_controller, even on failure
-	struct xrt_device *xdev =
+	struct wmr_controller_base *ctrl =
 	    wmr_bt_controller_create(hid_controller, controller_type, xpdev->vendor_id, xpdev->product_id, log_level);
-	if (xdev == NULL) {
+	if (ctrl == NULL) {
 		U_LOG_IFL_E(log_level, "Failed to create WMR controller (Bluetooth)");
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
-	*out_xdev = xdev;
+	*out_ctrl = ctrl;
 
 	return XRT_SUCCESS;
 }

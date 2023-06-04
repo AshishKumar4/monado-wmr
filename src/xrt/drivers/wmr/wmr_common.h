@@ -19,6 +19,9 @@
 extern "C" {
 #endif
 
+/* public type structs forward declarations */
+struct wmr_hmd;
+struct wmr_controller_base;
 
 /*!
  * Headset type, used to select different control and init/shutdown procedures.

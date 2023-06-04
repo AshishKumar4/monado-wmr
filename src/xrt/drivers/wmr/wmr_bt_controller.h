@@ -38,7 +38,7 @@ struct wmr_bt_connection
 	struct os_mutex hid_lock;
 };
 
-struct xrt_device *
+struct wmr_controller_base *
 wmr_bt_controller_create(struct os_hid_device *controller_hid,
                          enum xrt_device_type controller_type,
                          uint16_t vid,
