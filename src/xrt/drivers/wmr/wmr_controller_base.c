@@ -30,6 +30,7 @@
 #include "wmr_common.h"
 #include "wmr_controller_base.h"
 #include "wmr_config_key.h"
+#include "wmr_hmd.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -544,6 +545,11 @@ wmr_controller_base_deinit(struct wmr_controller_base *wcb)
 		wmr_controller_connection_disconnect(conn);
 	}
 
+	if (wcb->tracking_hmd) {
+		wmr_hmd_remove_tracked_controller(wcb->tracking_hmd, wcb);
+		wcb->tracking_hmd = NULL;
+	}
+
 	os_mutex_destroy(&wcb->conn_lock);
 	os_mutex_destroy(&wcb->data_lock);
 
@@ -633,4 +639,21 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	wmr_controller_send_bytes(wcb, wmr_controller_imu_on_cmd, sizeof(wmr_controller_imu_on_cmd));
 
 	return true;
+}
+
+void
+wmr_controller_attach_to_hmd(struct wmr_controller_base *wcb, struct wmr_hmd *hmd)
+{
+	/* Register the controller with the HMD for LED constellation tracking and LED sync timing updates */
+	wmr_hmd_add_tracked_controller(hmd, wcb);
+	wcb->tracking_hmd = hmd;
+}
+
+void
+wmr_controller_hmd_destroyed(struct wmr_controller_base *wcb, struct wmr_hmd *hmd)
+{
+	/* Just clear the tracking_hmd entry so we don't call the HMD when we
+	 * get destroyed */
+	assert(wcb->tracking_hmd == hmd);
+	wcb->tracking_hmd = NULL;
 }

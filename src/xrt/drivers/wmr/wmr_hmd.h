@@ -180,6 +180,11 @@ struct wmr_hmd
 	bool have_right_controller_status;
 
 	struct wmr_hmd_controller_connection *controller[WMR_MAX_CONTROLLERS];
+
+	/* Controllers being tracked by this headset */
+	struct os_mutex tracked_controller_lock;
+	int num_tracked_controllers;
+	struct wmr_controller_base *tracked_controllers[WMR_MAX_CONTROLLERS];
 };
 
 static inline struct wmr_hmd *
@@ -212,6 +217,11 @@ bool
 wmr_hmd_send_controller_packet(struct wmr_hmd *hmd, const uint8_t *buffer, uint32_t buf_size);
 int
 wmr_hmd_read_sync_from_controller(struct wmr_hmd *hmd, uint8_t *buffer, uint32_t buf_size, int timeout_ms);
+
+void
+wmr_hmd_add_tracked_controller(struct wmr_hmd *hmd, struct wmr_controller_base *wcb);
+void
+wmr_hmd_remove_tracked_controller(struct wmr_hmd *hmd, struct wmr_controller_base *wcb);
 #ifdef __cplusplus
 }
 #endif

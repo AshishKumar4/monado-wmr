@@ -114,6 +114,9 @@ struct wmr_controller_base
 
 	enum u_logging_level log_level;
 
+	//! HMD that is doing tracking of this controller
+	struct wmr_hmd *tracking_hmd;
+
 	//! Mutex protects shared data used from OpenXR callbacks
 	struct os_mutex data_lock;
 
@@ -183,6 +186,13 @@ wmr_controller_base_to_xrt_device(struct wmr_controller_base *wcb)
 	}
 	return NULL;
 }
+
+/* Tell the controller which HMD to register with for tracking */
+void
+wmr_controller_attach_to_hmd(struct wmr_controller_base *wcb, struct wmr_hmd *hmd);
+/* Called by the HMD when it is being destroyed */
+void
+wmr_controller_hmd_destroyed(struct wmr_controller_base *wcb, struct wmr_hmd *hmd);
 
 #ifdef __cplusplus
 }

@@ -268,6 +268,14 @@ wmr_open_system_impl(struct xrt_builder *xb,
 		}
 	}
 
+	if (head != NULL) {
+		if (ctrl_left) {
+			wmr_controller_attach_to_hmd(ctrl_left, head);
+		}
+		if (ctrl_right) {
+			wmr_controller_attach_to_hmd(ctrl_right, head);
+		}
+	}
 
 	/*
 	 * Tidy
