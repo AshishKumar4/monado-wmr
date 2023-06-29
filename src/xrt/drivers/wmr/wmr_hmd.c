@@ -1822,10 +1822,14 @@ wmr_hmd_setup_trackers(struct wmr_hmd *wh, struct xrt_slam_sinks *out_sinks, str
 }
 
 static bool
-wmr_hmd_request_controller_status(struct wmr_hmd *wh)
+wmr_hmd_request_controller_status(struct wmr_hmd *wh, int controller_no)
 {
 	DRV_TRACE_MARKER();
-	unsigned char cmd[64] = {WMR_MS_HOLOLENS_MSG_BT_CONTROL, WMR_MS_HOLOLENS_MSG_CONTROLLER_STATUS};
+	unsigned char cmd[64] = {
+	    WMR_MS_HOLOLENS_MSG_BT_CONTROL,
+	    WMR_BT_CONTROL_MSG_ONLINE_STATUS,
+	    controller_no,
+	};
 	return wmr_hmd_send_controller_packet(wh, cmd, sizeof(cmd));
 }
 
@@ -2086,7 +2090,7 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 		bool have_controller_status = false;
 
 		os_mutex_lock(&wh->controller_status_lock);
-		if (wmr_hmd_request_controller_status(wh)) {
+		if (wmr_hmd_request_controller_status(wh, 0) && wmr_hmd_request_controller_status(wh, 1)) {
 			/* @todo: Add a timed version of os_cond_wait and a timeout? */
 			/* This will be signalled from the reader thread */
 			while (!wh->have_left_controller_status && !wh->have_right_controller_status) {
