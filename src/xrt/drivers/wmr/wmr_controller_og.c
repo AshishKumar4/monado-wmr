@@ -443,6 +443,7 @@ wmr_controller_og_create(struct wmr_controller_connection *conn,
 		wcb->base.inputs[0].active = true;
 	}
 
+	u_var_add_gui_header(wcb, NULL, "Controls");
 	u_var_add_bool(wcb, &ctrl->last_inputs.menu, "input.menu");
 	u_var_add_bool(wcb, &ctrl->last_inputs.home, "input.home");
 	u_var_add_bool(wcb, &ctrl->last_inputs.bt_pairing, "input.bt_pairing");

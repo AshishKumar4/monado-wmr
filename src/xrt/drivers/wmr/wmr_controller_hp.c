@@ -376,6 +376,7 @@ wmr_controller_hp_create(struct wmr_controller_connection *conn,
 	wcb->base.binding_profiles = binding_profiles;
 	wcb->base.binding_profile_count = ARRAY_SIZE(binding_profiles);
 
+	u_var_add_gui_header(wcb, NULL, "Controls");
 	u_var_add_bool(wcb, &ctrl->last_inputs.menu, "input.menu");
 	u_var_add_bool(wcb, &ctrl->last_inputs.home, "input.home");
 	u_var_add_bool(wcb, &ctrl->last_inputs.bt_pairing, "input.bt_pairing");

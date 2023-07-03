@@ -124,7 +124,8 @@ struct wmr_camera
 
 	struct u_sink_debug debug_sinks[2];
 
-	struct xrt_frame_sink *cam_sinks[WMR_MAX_CAMERAS]; //!< Downstream sinks to push tracking frames to
+	struct xrt_frame_sink *slam_cam_sinks[WMR_MAX_CAMERAS]; //!< Downstream sinks to push SLAM tracking frames to
+	struct xrt_frame_sink *controller_cam_sink; //!< Downstream sink to push controller tracking frames to
 
 	enum u_logging_level log_level;
 };
@@ -420,12 +421,20 @@ img_xfer_cb(struct libusb_transfer *xfer)
 		update_expgain(cam, frames);
 
 		for (int i = 0; i < cam->slam_cam_count; i++) {
-			xrt_sink_push_frame(cam->cam_sinks[i], frames[i]);
+			xrt_sink_push_frame(cam->slam_cam_sinks[i], frames[i]);
 		}
 
 		for (int i = 0; i < cam->slam_cam_count; i++) {
 			xrt_frame_reference(&frames[i], NULL);
 		}
+	} else if (cam->controller_cam_sink != NULL) {
+		/* remove the top line pixels and push for controller processing */
+		struct xrt_frame *xf_roi = NULL;
+		struct xrt_rect roi = {.offset = {0, 1}, .extent = {.w = xf->width, .h = xf->height - 1}};
+
+		u_frame_create_roi(xf, roi, &xf_roi);
+		xrt_sink_push_frame(cam->controller_cam_sink, xf_roi);
+		xrt_frame_reference(&xf_roi, NULL);
 	}
 
 drop_frame:
@@ -457,8 +466,10 @@ wmr_camera_open(struct wmr_camera_open_config *config)
 
 	for (int i = 0; i < cam->tcam_count; i++) {
 		cam->tcam_confs[i] = *config->tcam_confs[i];
-		cam->cam_sinks[i] = config->tcam_sinks[i];
+		cam->slam_cam_sinks[i] = config->tcam_sinks[i];
 	}
+
+	cam->controller_cam_sink = config->controller_cam_sink;
 
 	if (os_thread_helper_init(&cam->usb_thread) != 0) {
 		WMR_CAM_ERROR(cam, "Failed to initialise threading");

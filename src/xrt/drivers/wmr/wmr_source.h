@@ -28,7 +28,10 @@ extern "C" {
 
 //! Create and return the data source as a @ref xrt_fs ready for data streaming.
 struct xrt_fs *
-wmr_source_create(struct xrt_frame_context *xfctx, struct xrt_prober_device *dev_holo, struct wmr_hmd_config cfg);
+wmr_source_create(struct xrt_frame_context *xfctx,
+                  struct xrt_prober_device *dev_holo,
+                  struct wmr_hmd_config cfg,
+                  struct xrt_frame_sink *out_controller_sink);
 
 //! @todo IMU data should be generated from within the data source, but right
 //! now we need this function because it is being generated from wmr_hmd

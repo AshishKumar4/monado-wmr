@@ -9,6 +9,7 @@
 #include "wmr_source.h"
 #include "wmr_camera.h"
 #include "wmr_config.h"
+#include "wmr_controller_tracking.h"
 #include "wmr_protocol.h"
 
 #include "math/m_api.h"
@@ -66,6 +67,9 @@ struct wmr_source
 	struct xrt_slam_sinks in_slam_sinks;                   //!< Pointers to intermediate sinks
 	struct xrt_slam_sinks out_slam_sinks;                  //!< Pointers to downstream sinks
 
+	struct xrt_frame_sink in_controller_sink;   //!< Sink that receives controller frames
+	struct xrt_frame_sink *out_controller_sink; //!< Sink to send controller frames to tracker
+
 	// UI Sinks (head tracking)
 	struct u_sink_debug ui_slam_cam_sinks[WMR_MAX_CAMERAS]; //!< Sink to display camera frames in UI
 	struct m_ff_vec3_f32 *gyro_ff;                          //!< Queue of gyroscope data to display in UI
@@ -104,6 +108,23 @@ DEFINE_RECEIVE_CAM(0)
 DEFINE_RECEIVE_CAM(1)
 DEFINE_RECEIVE_CAM(2)
 DEFINE_RECEIVE_CAM(3)
+
+static void
+receive_controller_frame(struct xrt_frame_sink *sink, struct xrt_frame *xf)
+{
+	struct wmr_source *ws = container_of(sink, struct wmr_source, in_controller_sink);
+
+	// Convert from device TS to system TS
+	xf->timestamp += ws->hw2mono;
+
+	timepoint_ns now_mono = (timepoint_ns)os_monotonic_get_ns();
+	WMR_TRACE(ws, "img seq %" PRIu64 " mono_t=%" PRIu64 " t=%" PRId64 " source_t=%" PRId64, xf->source_sequence,
+	          now_mono, xf->timestamp, xf->source_timestamp);
+
+	if (ws->out_controller_sink != NULL) {
+		xrt_sink_push_frame(ws->out_controller_sink, xf);
+	}
+}
 
 //! Define a function for each WMR_MAX_CAMERAS and reference it in this array
 void (*receive_cam[WMR_MAX_CAMERAS])(struct xrt_frame_sink *, struct xrt_frame *) = {
@@ -294,7 +315,10 @@ wmr_source_node_destroy(struct xrt_frame_node *node)
 
 //! Create and open the frame server for IMU/camera streaming.
 struct xrt_fs *
-wmr_source_create(struct xrt_frame_context *xfctx, struct xrt_prober_device *dev_holo, struct wmr_hmd_config cfg)
+wmr_source_create(struct xrt_frame_context *xfctx,
+                  struct xrt_prober_device *dev_holo,
+                  struct wmr_hmd_config cfg,
+                  struct xrt_frame_sink *out_controller_sink)
 {
 	DRV_TRACE_MARKER();
 
@@ -327,12 +351,16 @@ wmr_source_create(struct xrt_frame_context *xfctx, struct xrt_prober_device *dev
 	}
 	ws->in_slam_sinks.imu = &ws->imu_sink;
 
+	ws->in_controller_sink.push_frame = receive_controller_frame;
+	ws->out_controller_sink = out_controller_sink;
+
 	struct wmr_camera_open_config options = {
 	    .dev_holo = dev_holo,
 	    .tcam_confs = cfg.tcams,
 	    .tcam_sinks = ws->in_slam_sinks.cams,
 	    .tcam_count = cfg.tcam_count,
 	    .slam_cam_count = cfg.slam_cam_count,
+	    .controller_cam_sink = &ws->in_controller_sink,
 	    .log_level = ws->log_level,
 	};
 

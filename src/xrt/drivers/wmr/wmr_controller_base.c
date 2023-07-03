@@ -90,9 +90,13 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 
 	m_imu_3dof_update(&wcb->fusion, mono_time_ns, &imu_sample->acc, &imu_sample->gyro);
 	wcb->last_imu_timestamp_ns = mono_time_ns;
+	wcb->last_imu_device_timestamp_ns = now_hw_ns;
 	wcb->last_angular_velocity = imu_sample->gyro;
 	wcb->last_imu = *imu_sample;
 }
+
+static void
+wmr_controller_base_send_timesync(struct wmr_controller_base *wcb);
 
 static void
 receive_bytes(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *buffer, uint32_t buf_size)
@@ -105,6 +109,12 @@ receive_bytes(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *buffer
 	switch (buffer[0]) {
 	case WMR_MOTION_CONTROLLER_STATUS_MSG:
 		os_mutex_lock(&wcb->data_lock);
+		// Send a timesync packet if needed
+		if (wcb->timesync_updated) {
+			wmr_controller_base_send_timesync(wcb);
+			wcb->timesync_updated = false;
+		}
+
 		// Note: skipping msg type byte
 		bool b = wcb->handle_input_packet(wcb, time_ns, &buffer[1], (size_t)buf_size - 1);
 		os_mutex_unlock(&wcb->data_lock);
@@ -545,9 +555,9 @@ wmr_controller_base_deinit(struct wmr_controller_base *wcb)
 		wmr_controller_connection_disconnect(conn);
 	}
 
-	if (wcb->tracking_hmd) {
-		wmr_hmd_remove_tracked_controller(wcb->tracking_hmd, wcb);
-		wcb->tracking_hmd = NULL;
+	if (wcb->tracking_connection) {
+		wmr_controller_tracker_connection_disconnect(wcb->tracking_connection);
+		wcb->tracking_connection = NULL;
 	}
 
 	os_mutex_destroy(&wcb->conn_lock);
@@ -602,11 +612,6 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 		return false;
 	}
 
-	u_var_add_root(wcb, wcb->base.str, true);
-	u_var_add_ro_vec3_f32(wcb, &wcb->last_imu.acc, "imu.acc");
-	u_var_add_ro_vec3_f32(wcb, &wcb->last_imu.gyro, "imu.gyro");
-	u_var_add_i32(wcb, &wcb->last_imu.temperature, "imu.temperature");
-
 	/* Send init commands */
 	struct wmr_controller_fw_cmd fw_cmd = {
 	    0,
@@ -638,22 +643,146 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	const unsigned char wmr_controller_imu_on_cmd[64] = {0x06, 0x03, 0x02, 0xe1, 0x02};
 	wmr_controller_send_bytes(wcb, wmr_controller_imu_on_cmd, sizeof(wmr_controller_imu_on_cmd));
 
+	wcb->timesync_counter = 2;
+	wcb->timesync_led_intensity = 200;
+	wcb->timesync_val2 = 800;
+	wcb->timesync_time_offset = 0;
+
+	wcb->timesync_led_intensity_uvar =
+	    (struct u_var_draggable_u16){.val = &wcb->timesync_led_intensity, .min = 1, .max = 399, .step = 1};
+	wcb->timesync_val2_uvar =
+	    (struct u_var_draggable_u16){.val = &wcb->timesync_val2, .min = 0, .max = 1023, .step = 1};
+	wcb->timesync_time_offset_uvar =
+	    (struct u_var_draggable_u16){.val = &wcb->timesync_time_offset, .min = 0, .max = 8, .step = 1};
+
+	u_var_add_root(wcb, wcb->base.str, true);
+	u_var_add_gui_header(wcb, NULL, "IMU");
+	u_var_add_ro_vec3_f32(wcb, &wcb->last_imu.acc, "imu.accel");
+	u_var_add_ro_vec3_f32(wcb, &wcb->last_imu.gyro, "imu.gyro");
+	u_var_add_i32(wcb, &wcb->last_imu.temperature, "imu.temperature");
+	u_var_add_ro_u64(wcb, &wcb->last_imu_timestamp_ns, "Last CPU IMU TS");
+	u_var_add_ro_u64(wcb, &wcb->last_imu_device_timestamp_ns, "Last device IMU TS");
+
+	u_var_add_gui_header(wcb, NULL, "LED Sync");
+	u_var_add_draggable_u16(wcb, &wcb->timesync_led_intensity_uvar, "LED intensity");
+	u_var_add_draggable_u16(wcb, &wcb->timesync_val2_uvar, "U2");
+	u_var_add_draggable_u16(wcb, &wcb->timesync_time_offset_uvar, "time offset");
+	u_var_add_ro_u64(wcb, &wcb->last_timesync_timestamp_ns, "Last CPU timesync TS");
+	u_var_add_ro_u64(wcb, &wcb->last_timesync_device_timestamp_ns, "Last device timesync TS");
 	return true;
+}
+
+/*
+ * Timesync packet format:
+ *  XX    YY    AA    BB    CC    CC    CC    CC    CC    CC    DD    EE
+ *   0     1     2     3     4     5     6     7     8     9    10    11
+ *
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * |0              |    1          |        2      |            3  |
+ * |0 1 2 3 4 5 6 7|8 9 0 1 2 3 4 5|6 7 8 9 0 1 2 3|4 5 6 7 8 9 0 1|
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * |       XX      |      YY       | C |  U1[0:5]  :[6:8]| TS[0:4] |  XX YY AA BB
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * |                           TS[5:36]                            |  CC CC CC CC
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * |         TS[37:54]                 |   U2[0:10]          | F2  |  CC CC DD EE
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *
+ * XX = 0x3
+ * YY = 8 bit counter that increments sequentially across timesync and keepalives
+ * C  = 2 bit counter. Always starts as 1, then counts 1,2,3 per packet,
+ *      regardless of the time between. Must not be 0
+ * U1 = Led intensity / pulse length
+ *       - clamped at 1..399 in setLEDPulseLengthMaybe()
+ * TS = 55-bit sync timestamp (in µS) taken from camera exposure timings
+ * U2 = unknown 11-bits
+ *      - Gets multiplied by 2 and has 1000 added before use?
+ *      - Looks like it gets extended to 64-bit and used in an unclear way
+ *      - Looks like it should affect something in the HID status report packet
+ *      - First WMR packet is always 800
+ *      - Minimum value seen from WMR is 0, max (after the initial 800) is 1023
+ * F  = flags? 3 bits. Allowed values seem to be 1,2,3,4
+ *      - WMR always sends 1. Seems like 2 might be 'off'
+ *      - Referred to as 'LED train type'
+ */
+static void
+fill_timesync_packet(
+    uint8_t buf[12], uint8_t cmd_ctr, uint8_t ts_ctr, int led_intensity, uint64_t ts, int U2, uint8_t flags)
+{
+	ts_ctr = (ts_ctr & 0x3);
+	led_intensity = CLAMP(led_intensity, 1, 399);
+	U2 = CLAMP(U2, 0, 1023);
+
+	buf[0] = 0x3;
+	buf[1] = cmd_ctr;
+	buf[2] = ts_ctr | ((led_intensity & 0x3f) << 2);
+	buf[3] = ((led_intensity >> 6) & 0x7) | ((ts & 0x1f) << 3);
+	buf[4] = ts >> 5;
+	buf[5] = ts >> 13;
+	buf[6] = ts >> 21;
+	buf[7] = ts >> 29;
+	buf[8] = ts >> 37;
+	buf[9] = ts >> 45;
+	buf[10] = ((ts >> 53) & 0x3) | (U2 << 2);
+	buf[11] = ((U2 >> 6) & 0x1f) | ((flags & 0x3) << 5);
+}
+
+void
+wmr_controller_base_notify_timesync(struct wmr_controller_base *wcb, timepoint_ns next_slam_mono_ns)
+{
+	os_mutex_lock(&wcb->data_lock);
+	uint64_t next_device_slam_time_ns = (uint64_t)(next_slam_mono_ns - wcb->hw2mono);
+	uint64_t next_device_slam_time_us = next_device_slam_time_ns / 1000;
+
+	if (next_device_slam_time_us != wcb->timesync_device_slam_time_us) {
+		wcb->timesync_device_slam_time_us = next_device_slam_time_us;
+		wcb->timesync_updated = true;
+	}
+
+	wcb->last_timesync_device_timestamp_ns = next_device_slam_time_ns;
+	wcb->last_timesync_timestamp_ns = next_slam_mono_ns;
+	os_mutex_unlock(&wcb->data_lock);
+}
+
+/* Called with data_lock held */
+static void
+wmr_controller_base_send_timesync(struct wmr_controller_base *wcb)
+{
+	/* @todo: Check if timesync values have changed and skip sending if not */
+	uint8_t timesync_pkt[12];
+
+	os_mutex_lock(&wcb->conn_lock);
+	struct wmr_controller_connection *conn = wcb->wcc;
+	if (conn != NULL) {
+		uint64_t time_offset_us = wcb->timesync_time_offset * (U_TIME_1S_IN_NS / 360000);
+		uint8_t ts_ctr = wcb->timesync_counter++;
+		if (wcb->timesync_counter == 4) {
+			wcb->timesync_counter = 1;
+		}
+		int led_intensity = wcb->timesync_led_intensity;
+		uint64_t slam_time_us = wcb->timesync_device_slam_time_us + time_offset_us;
+		int val2 = wcb->timesync_val2;
+
+		fill_timesync_packet(timesync_pkt, wcb->cmd_counter++, ts_ctr, led_intensity, slam_time_us, val2, 1);
+		os_mutex_unlock(&wcb->data_lock);
+		wmr_controller_connection_send_bytes(conn, timesync_pkt, sizeof(timesync_pkt));
+
+		os_mutex_unlock(&wcb->conn_lock);
+		os_mutex_lock(&wcb->data_lock);
+
+		WMR_DEBUG(
+		    wcb, "%s controller timesync counter %u led_intensity %u time %" PRIu64 " offset %" PRIu64 " U2 %u",
+		    wcb->base.device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER ? "Left" : "Right", ts_ctr,
+		    wcb->timesync_led_intensity, slam_time_us, time_offset_us, val2);
+		WMR_TRACE_HEX(wcb, timesync_pkt, sizeof(timesync_pkt));
+	} else {
+		os_mutex_unlock(&wcb->conn_lock);
+	}
 }
 
 void
 wmr_controller_attach_to_hmd(struct wmr_controller_base *wcb, struct wmr_hmd *hmd)
 {
 	/* Register the controller with the HMD for LED constellation tracking and LED sync timing updates */
-	wmr_hmd_add_tracked_controller(hmd, wcb);
-	wcb->tracking_hmd = hmd;
-}
-
-void
-wmr_controller_hmd_destroyed(struct wmr_controller_base *wcb, struct wmr_hmd *hmd)
-{
-	/* Just clear the tracking_hmd entry so we don't call the HMD when we
-	 * get destroyed */
-	assert(wcb->tracking_hmd == hmd);
-	wcb->tracking_hmd = NULL;
+	wcb->tracking_connection = wmr_hmd_add_tracked_controller(hmd, wcb);
 }

@@ -18,10 +18,12 @@
 #include "math/m_imu_3dof.h"
 #include "util/u_device.h"
 #include "util/u_logging.h"
+#include "util/u_var.h"
 #include "xrt/xrt_device.h"
 
 #include "wmr_common.h"
 #include "wmr_controller_protocol.h"
+#include "wmr_controller_tracking.h"
 #include "wmr_config.h"
 
 #ifdef __cplusplus
@@ -114,8 +116,8 @@ struct wmr_controller_base
 
 	enum u_logging_level log_level;
 
-	//! HMD that is doing tracking of this controller
-	struct wmr_hmd *tracking_hmd;
+	//! Controller tracker connection that is doing 6dof tracking of this controller
+	struct wmr_controller_tracker_connection *tracking_connection;
 
 	//! Mutex protects shared data used from OpenXR callbacks
 	struct os_mutex data_lock;
@@ -134,11 +136,36 @@ struct wmr_controller_base
 	uint64_t last_timestamp_ticks;
 
 	//! Time of last IMU sample, in CPU time.
-	timepoint_ns last_imu_timestamp_ns;
-	//!< Estimated offset from IMU to monotonic clock
+	uint64_t last_imu_timestamp_ns;
+	//! Time of last IMU sample, in device time.
+	uint64_t last_imu_device_timestamp_ns;
+	//!< Estimated offset from IMU to monotonic clock. Protected by data_lock
 	time_duration_ns hw2mono;
 	//!< Last IMU sample received
 	struct wmr_controller_base_imu_sample last_imu;
+
+	//!< Command counter for timesync and keep-alives. conn_lock
+	uint8_t cmd_counter;
+	//!< Last keepalive timestamp. conn_lock
+	timepoint_ns last_keepalive_timestamp_ns;
+	//!< Last timesync counter. 0, 1 or 2 then loops. Starts @ 1. conn_lock
+	uint8_t timesync_counter;
+	//!< Variable in the timesync packet. valid values: 1..399.
+	uint16_t timesync_led_intensity;
+	//!< Variable in the timesync packet. valid values: 0..1023
+	uint16_t timesync_val2;
+	uint64_t timesync_device_slam_time_us;
+	uint16_t timesync_time_offset;
+	bool timesync_updated;
+
+	//! Time of last timesync SLAM sample, in CPU time.
+	uint64_t last_timesync_timestamp_ns;
+	//! Time of last timesync SLAM sample, in device time.
+	uint64_t last_timesync_device_timestamp_ns;
+
+	struct u_var_draggable_u16 timesync_led_intensity_uvar;
+	struct u_var_draggable_u16 timesync_val2_uvar;
+	struct u_var_draggable_u16 timesync_time_offset_uvar;
 
 	//! Main fusion calculator.
 	struct m_imu_3dof fusion;
@@ -160,6 +187,9 @@ void
 wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
                                struct wmr_controller_base_imu_sample *imu,
                                timepoint_ns rx_mono_ns);
+
+void
+wmr_controller_base_notify_timesync(struct wmr_controller_base *wcb, timepoint_ns next_slam_mono_ns);
 
 static inline void
 wmr_controller_connection_receive_bytes(struct wmr_controller_connection *wcc,
@@ -190,9 +220,6 @@ wmr_controller_base_to_xrt_device(struct wmr_controller_base *wcb)
 /* Tell the controller which HMD to register with for tracking */
 void
 wmr_controller_attach_to_hmd(struct wmr_controller_base *wcb, struct wmr_hmd *hmd);
-/* Called by the HMD when it is being destroyed */
-void
-wmr_controller_hmd_destroyed(struct wmr_controller_base *wcb, struct wmr_hmd *hmd);
 
 #ifdef __cplusplus
 }

@@ -29,6 +29,7 @@
 #include "wmr_camera.h"
 #include "wmr_common.h"
 #include "wmr_hmd_controller.h"
+#include "wmr_controller_tracking.h"
 
 
 #ifdef __cplusplus
@@ -181,10 +182,7 @@ struct wmr_hmd
 
 	struct wmr_hmd_controller_connection *controller[WMR_MAX_CONTROLLERS];
 
-	/* Controllers being tracked by this headset */
-	struct os_mutex tracked_controller_lock;
-	int num_tracked_controllers;
-	struct wmr_controller_base *tracked_controllers[WMR_MAX_CONTROLLERS];
+	struct wmr_controller_tracker *controller_tracker;
 };
 
 static inline struct wmr_hmd *
@@ -218,10 +216,9 @@ wmr_hmd_send_controller_packet(struct wmr_hmd *hmd, const uint8_t *buffer, uint3
 int
 wmr_hmd_read_sync_from_controller(struct wmr_hmd *hmd, uint8_t *buffer, uint32_t buf_size, int timeout_ms);
 
-void
+struct wmr_controller_tracker_connection *
 wmr_hmd_add_tracked_controller(struct wmr_hmd *hmd, struct wmr_controller_base *wcb);
-void
-wmr_hmd_remove_tracked_controller(struct wmr_hmd *hmd, struct wmr_controller_base *wcb);
+
 #ifdef __cplusplus
 }
 #endif

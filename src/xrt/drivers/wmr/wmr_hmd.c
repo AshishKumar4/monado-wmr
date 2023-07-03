@@ -1221,16 +1221,6 @@ wmr_hmd_destroy(struct xrt_device *xdev)
 	os_mutex_destroy(&wh->controller_status_lock);
 	os_cond_destroy(&wh->controller_status_cond);
 
-	os_mutex_lock(&wh->tracked_controller_lock);
-	for (int i = 0; i < wh->num_tracked_controllers; i++) {
-		if (wh->tracked_controllers[i] != NULL) {
-			wmr_controller_hmd_destroyed(wh->tracked_controllers[i], wh);
-			wh->tracked_controllers[i] = NULL;
-		}
-	}
-	os_mutex_unlock(&wh->tracked_controller_lock);
-	os_mutex_destroy(&wh->tracked_controller_lock);
-
 	if (wh->hid_hololens_sensors_dev != NULL) {
 		os_hid_destroy(wh->hid_hololens_sensors_dev);
 		wh->hid_hololens_sensors_dev = NULL;
@@ -1896,14 +1886,6 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 		return;
 	}
 
-	ret = os_mutex_init(&wh->tracked_controller_lock);
-	if (ret != 0) {
-		WMR_ERROR(wh, "Failed to init Tracked Controller mutex!");
-		wmr_hmd_destroy(&wh->base);
-		wh = NULL;
-		return;
-	}
-
 	// Thread and other state.
 	ret = os_thread_helper_init(&wh->oth);
 	if (ret != 0) {
@@ -2006,8 +1988,15 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 	// Switch on IMU on the HMD.
 	hololens_sensors_enable_imu(wh);
 
+	// Set up controller 6dof tracker
+	struct xrt_frame_sink *out_controller_sink = NULL;
+	if (wmr_controller_tracker_create(&wh->tracking.xfctx, &wh->base, &wh->config, &wh->controller_tracker,
+	                                  &out_controller_sink) != 0) {
+		WMR_WARN(wh, "Failed to create Controller Tracker. Controllers will not be 6dof");
+	}
+
 	// Switch on data streams on the HMD (only cameras for now as IMU is not yet integrated into wmr_source)
-	wh->tracking.source = wmr_source_create(&wh->tracking.xfctx, dev_holo, wh->config);
+	wh->tracking.source = wmr_source_create(&wh->tracking.xfctx, dev_holo, wh->config, out_controller_sink);
 
 	struct xrt_slam_sinks sinks = {0};
 	struct xrt_device *hand_device = NULL;
@@ -2100,25 +2089,11 @@ wmr_hmd_read_sync_from_controller(struct wmr_hmd *hmd, uint8_t *buffer, uint32_t
 	return res;
 }
 
-void
+struct wmr_controller_tracker_connection *
 wmr_hmd_add_tracked_controller(struct wmr_hmd *hmd, struct wmr_controller_base *wcb)
 {
-	os_mutex_lock(&hmd->tracked_controller_lock);
-	assert(hmd->num_tracked_controllers < WMR_MAX_CONTROLLERS);
-
-	hmd->tracked_controllers[hmd->num_tracked_controllers] = wcb;
-	hmd->num_tracked_controllers++;
-	os_mutex_unlock(&hmd->tracked_controller_lock);
-}
-
-void
-wmr_hmd_remove_tracked_controller(struct wmr_hmd *hmd, struct wmr_controller_base *wcb)
-{
-	os_mutex_lock(&hmd->tracked_controller_lock);
-	for (int i = 0; i < hmd->num_tracked_controllers; i++) {
-		if (hmd->tracked_controllers[i] == wcb) {
-			hmd->tracked_controllers[i] = NULL;
-		}
+	if (hmd->controller_tracker != NULL) {
+		return wmr_controller_tracker_add_controller(hmd->controller_tracker, wcb);
 	}
-	os_mutex_unlock(&hmd->tracked_controller_lock);
+	return NULL;
 }
