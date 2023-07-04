@@ -16,6 +16,7 @@
 #include "math/m_api.h"
 #include "math/m_clock_tracking.h"
 #include "math/m_vec2.h"
+#include "math/m_vec3.h"
 #include "math/m_predict.h"
 
 #include "util/u_file.h"
@@ -36,6 +37,7 @@
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
+#include <inttypes.h>
 
 #define WMR_TRACE(wcb, ...) U_LOG_XDEV_IFL_T(&wcb->base, wcb->log_level, __VA_ARGS__)
 #define WMR_TRACE_HEX(wcb, ...) U_LOG_XDEV_IFL_T_HEX(&wcb->base, wcb->log_level, __VA_ARGS__)
@@ -56,6 +58,39 @@ static inline struct wmr_controller_base *
 wmr_controller_base(struct xrt_device *p)
 {
 	return (struct wmr_controller_base *)p;
+}
+
+void
+wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
+                               struct wmr_controller_base_imu_sample *imu_sample,
+                               timepoint_ns rx_mono_ns)
+{
+	/* Extend 32-bit tick count to 64-bit and convert to ns */
+	uint32_t tick_delta = imu_sample->timestamp_ticks - (uint32_t)wcb->last_timestamp_ticks;
+	wcb->last_timestamp_ticks += tick_delta;
+
+	timepoint_ns now_hw_ns = wcb->last_timestamp_ticks * WMR_MOTION_CONTROLLER_NS_PER_TICK;
+
+	// Convert hardware timestamp into monotonic clock. Update offset estimate hw2mono.
+	const float IMU_FREQ = 500.f;
+	timepoint_ns mono_time_ns = m_clock_offset_a2b(IMU_FREQ, now_hw_ns, rx_mono_ns, &wcb->hw2mono);
+
+	/*
+	 * Check if the timepoint does time travel, we get one or two
+	 * old samples when the device has not been cleanly shut down.
+	 */
+	if (wcb->last_imu_timestamp_ns > (uint64_t)mono_time_ns) {
+		WMR_WARN(wcb, "Received sample from the past, new: %" PRIu64 ", last: %" PRIu64 ", diff: %" PRIu64,
+		         mono_time_ns, now_hw_ns, mono_time_ns - now_hw_ns);
+		return;
+	}
+
+	WMR_TRACE(wcb, "Accel [m/s^2] : %f", m_vec3_len(imu_sample->acc));
+
+	m_imu_3dof_update(&wcb->fusion, mono_time_ns, &imu_sample->acc, &imu_sample->gyro);
+	wcb->last_imu_timestamp_ns = mono_time_ns;
+	wcb->last_angular_velocity = imu_sample->gyro;
+	wcb->last_imu = *imu_sample;
 }
 
 static void
@@ -562,6 +597,9 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	}
 
 	u_var_add_root(wcb, wcb->base.str, true);
+	u_var_add_ro_vec3_f32(wcb, &wcb->last_imu.acc, "imu.acc");
+	u_var_add_ro_vec3_f32(wcb, &wcb->last_imu.gyro, "imu.gyro");
+	u_var_add_i32(wcb, &wcb->last_imu.temperature, "imu.temperature");
 
 	/* Send init commands */
 	struct wmr_controller_fw_cmd fw_cmd = {

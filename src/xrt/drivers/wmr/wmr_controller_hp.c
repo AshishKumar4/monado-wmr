@@ -142,14 +142,6 @@ struct wmr_controller_hp_input
 	} thumbstick;
 
 	uint8_t battery;
-
-	struct
-	{
-		uint64_t timestamp_ticks;
-		struct xrt_vec3 acc;
-		struct xrt_vec3 gyro;
-		int32_t temperature;
-	} imu;
 };
 #undef WMR_PACKED
 
@@ -158,7 +150,7 @@ struct wmr_controller_hp
 {
 	struct wmr_controller_base base;
 
-	//! The last decoded package of IMU and button data
+	//! The last decoded packet of button data
 	struct wmr_controller_hp_input last_inputs;
 };
 
@@ -190,7 +182,10 @@ vec3_from_wmr_controller_gyro(const int32_t sample[3], struct xrt_vec3 *out_vec)
 }
 
 static bool
-wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl, const unsigned char *buffer, size_t len)
+wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl,
+                               const unsigned char *buffer,
+                               size_t len,
+                               struct wmr_controller_base_imu_sample *imu_sample)
 {
 	struct wmr_controller_hp_input *last_input = &ctrl->last_inputs;
 	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(ctrl);
@@ -244,43 +239,25 @@ wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl, const unsigned ch
 	acc[0] = read24(&p); // x
 	acc[1] = read24(&p); // y
 	acc[2] = read24(&p); // z
-	vec3_from_wmr_controller_accel(acc, &last_input->imu.acc);
-	math_matrix_3x3_transform_vec3(&wcb->config.sensors.accel.mix_matrix, &last_input->imu.acc,
-	                               &last_input->imu.acc);
-	math_vec3_accum(&wcb->config.sensors.accel.bias_offsets, &last_input->imu.acc);
-	math_quat_rotate_vec3(&wcb->config.sensors.transforms.P_oxr_acc.orientation, &last_input->imu.acc,
-	                      &last_input->imu.acc);
+	vec3_from_wmr_controller_accel(acc, &imu_sample->acc);
+	math_matrix_3x3_transform_vec3(&wcb->config.sensors.accel.mix_matrix, &imu_sample->acc, &imu_sample->acc);
+	math_vec3_accum(&wcb->config.sensors.accel.bias_offsets, &imu_sample->acc);
+	math_quat_rotate_vec3(&wcb->config.sensors.transforms.P_oxr_acc.orientation, &imu_sample->acc,
+	                      &imu_sample->acc);
 
-	U_LOG_IFL_T(wcb->log_level, "Accel [m/s^2] : %f",
-	            sqrtf(last_input->imu.acc.x * last_input->imu.acc.x +
-	                  last_input->imu.acc.y * last_input->imu.acc.y +
-	                  last_input->imu.acc.z * last_input->imu.acc.z));
-
-
-	last_input->imu.temperature = read16(&p);
+	imu_sample->temperature = read16(&p);
 
 	int32_t gyro[3];
 	gyro[0] = read24(&p);
 	gyro[1] = read24(&p);
 	gyro[2] = read24(&p);
-	vec3_from_wmr_controller_gyro(gyro, &last_input->imu.gyro);
-	math_matrix_3x3_transform_vec3(&wcb->config.sensors.gyro.mix_matrix, &last_input->imu.gyro,
-	                               &last_input->imu.gyro);
-	math_vec3_accum(&wcb->config.sensors.gyro.bias_offsets, &last_input->imu.gyro);
-	math_quat_rotate_vec3(&wcb->config.sensors.transforms.P_oxr_gyr.orientation, &last_input->imu.gyro,
-	                      &last_input->imu.gyro);
+	vec3_from_wmr_controller_gyro(gyro, &imu_sample->gyro);
+	math_matrix_3x3_transform_vec3(&wcb->config.sensors.gyro.mix_matrix, &imu_sample->gyro, &imu_sample->gyro);
+	math_vec3_accum(&wcb->config.sensors.gyro.bias_offsets, &imu_sample->gyro);
+	math_quat_rotate_vec3(&wcb->config.sensors.transforms.P_oxr_gyr.orientation, &imu_sample->gyro,
+	                      &imu_sample->gyro);
 
-
-	uint32_t prev_ticks = last_input->imu.timestamp_ticks & UINT32_C(0xFFFFFFFF);
-
-	// Write the new ticks value into the lower half of timestamp_ticks
-	last_input->imu.timestamp_ticks &= (UINT64_C(0xFFFFFFFF) << 32u);
-	last_input->imu.timestamp_ticks += (uint32_t)read32(&p);
-
-	if ((last_input->imu.timestamp_ticks & UINT64_C(0xFFFFFFFF)) < prev_ticks) {
-		// Timer overflow, so increment the upper half of timestamp_ticks
-		last_input->imu.timestamp_ticks += (UINT64_C(0x1) << 32u);
-	}
+	imu_sample->timestamp_ticks = (uint32_t)read32(&p);
 
 	/* Todo: More decoding here
 	    read16(&p); // Unknown. Seems to depend on controller orientation (probably mag)
@@ -297,15 +274,11 @@ static bool
 handle_input_packet(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *buffer, uint32_t buf_size)
 {
 	struct wmr_controller_hp *ctrl = (struct wmr_controller_hp *)(wcb);
+	struct wmr_controller_base_imu_sample imu_sample;
 
-	bool b = wmr_controller_hp_packet_parse(ctrl, buffer, buf_size);
+	bool b = wmr_controller_hp_packet_parse(ctrl, buffer, buf_size, &imu_sample);
 	if (b) {
-		m_imu_3dof_update(&wcb->fusion,
-		                  ctrl->last_inputs.imu.timestamp_ticks * WMR_MOTION_CONTROLLER_NS_PER_TICK,
-		                  &ctrl->last_inputs.imu.acc, &ctrl->last_inputs.imu.gyro);
-
-		wcb->last_imu_timestamp_ns = time_ns;
-		wcb->last_angular_velocity = ctrl->last_inputs.imu.gyro;
+		wmr_controller_base_imu_sample(wcb, &imu_sample, (timepoint_ns)time_ns);
 	}
 
 	return b;
@@ -398,8 +371,6 @@ wmr_controller_hp_create(struct wmr_controller_connection *conn,
 		wcb->base.inputs[0].active = true;
 	}
 
-	ctrl->last_inputs.imu.timestamp_ticks = 0;
-
 	wcb->base.outputs[0].name = XRT_OUTPUT_NAME_WMR_HAPTIC;
 
 	wcb->base.binding_profiles = binding_profiles;
@@ -422,10 +393,6 @@ wmr_controller_hp_create(struct wmr_controller_connection *conn,
 		u_var_add_bool(wcb, &ctrl->last_inputs.x_a, "input.a");
 		u_var_add_bool(wcb, &ctrl->last_inputs.y_b, "input.b");
 	}
-
-	u_var_add_ro_vec3_f32(wcb, &ctrl->last_inputs.imu.acc, "imu.acc");
-	u_var_add_ro_vec3_f32(wcb, &ctrl->last_inputs.imu.gyro, "imu.gyro");
-	u_var_add_i32(wcb, &ctrl->last_inputs.imu.temperature, "imu.temperature");
 
 	return wcb;
 }
