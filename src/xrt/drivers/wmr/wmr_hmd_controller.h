@@ -33,7 +33,9 @@ struct wmr_hmd_controller_connection
 
 	/* Protect access when sending / receiving data */
 	struct os_mutex lock;
+	struct os_cond cond;
 	bool disconnected; /* Set to true once disconnect() is called */
+	int busy;          /* Incremented while passing data */
 
 	struct wmr_hmd *hmd;
 };
