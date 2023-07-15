@@ -7,8 +7,15 @@
  * @author Jan Schmidt <jan@centricular.com>
  * @ingroup drv_wmr
  */
+#include <inttypes.h>
+#include <stdio.h>
+
 #include "os/os_threading.h"
+
+#include "util/u_debug.h"
 #include "util/u_trace_marker.h"
+
+#include "constellation/blobwatch.h"
 
 #include "wmr_controller_tracking.h"
 #include "wmr_hmd.h"
@@ -20,6 +27,10 @@ DEBUG_GET_ONCE_LOG_OPTION(wmr_log, "WMR_LOG", U_LOGGING_INFO)
 #define WMR_INFO(c, ...) U_LOG_IFL_I(c->log_level, __VA_ARGS__)
 #define WMR_WARN(c, ...) U_LOG_IFL_W(c->log_level, __VA_ARGS__)
 #define WMR_ERROR(c, ...) U_LOG_IFL_E(c->log_level, __VA_ARGS__)
+
+/* WMR thresholds for min brightness and min-blob-required magnitude */
+#define BLOB_PIXEL_THRESHOLD_WMR 0x8
+#define BLOB_THRESHOLD_MIN_WMR 0x10
 
 struct wmr_controller_tracker_connection
 {
@@ -61,6 +72,14 @@ struct wmr_controller_tracker
 
 	uint64_t last_timestamp;
 	uint64_t last_sequence;
+
+	struct u_sink_debug debug_sink;
+
+	struct xrt_frame_sink *fast_q_sink;
+	struct xrt_frame_sink fast_process_sink;
+
+	//! Constellation tracking
+	blobwatch *bw;
 };
 
 static void
@@ -79,6 +98,8 @@ wmr_controller_tracker_receive_frame(struct xrt_frame_sink *sink, struct xrt_fra
 {
 	struct wmr_controller_tracker *wct = container_of(sink, struct wmr_controller_tracker, base);
 
+	assert(xf->format == XRT_FORMAT_L8);
+
 	/* The frame cadence is SLAM/controller/controller, and we need to pass the estimate of the
 	 * next SLAM frame timestamp to the timesync */
 	bool is_second_frame = wct->last_sequence + 1 == xf->source_sequence;
@@ -93,12 +114,42 @@ wmr_controller_tracker_receive_frame(struct xrt_frame_sink *sink, struct xrt_fra
 		}
 		os_mutex_unlock(&wct->tracked_controller_lock);
 	}
+
+	xrt_sink_push_frame(wct->fast_q_sink, xf);
 }
 
 static void
 wmr_controller_tracker_node_break_apart(struct xrt_frame_node *node)
 {
 	DRV_TRACE_MARKER();
+}
+
+// Fast frame processing: blob extraction and match to existing predictions
+static void
+wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt_frame *xf)
+{
+	struct wmr_controller_tracker *wct = container_of(sink, struct wmr_controller_tracker, fast_process_sink);
+	blobservation *bwobs = NULL;
+
+	blobwatch_process(wct->bw, xf->data, xf->width, xf->height, &bwobs);
+
+	if (bwobs != NULL) {
+		printf("frame %" PRIu64 " TS %" PRIu64 " Blobs: %d\n", xf->source_sequence, xf->timestamp,
+		       bwobs->num_blobs);
+
+		for (int index = 0; index < bwobs->num_blobs; index++) {
+			printf("  Blob[%d]: %f,%f %dx%d id %d age %u\n", index, bwobs->blobs[index].x,
+			       bwobs->blobs[index].y, bwobs->blobs[index].width, bwobs->blobs[index].height,
+			       bwobs->blobs[index].led_id, bwobs->blobs[index].age);
+		}
+
+		if (u_sink_debug_is_active(&wct->debug_sink)) {
+			// @todo: Render debug view
+			u_sink_debug_push_frame(&wct->debug_sink, xf);
+		}
+
+		blobwatch_release_observation(wct->bw, bwobs);
+	}
 }
 
 static void
@@ -109,6 +160,7 @@ wmr_controller_tracker_node_destroy(struct xrt_frame_node *node)
 	DRV_TRACE_MARKER();
 	WMR_DEBUG(wct, "Destroying WMR controller tracker");
 
+	// Unlink the controller connections first
 	os_mutex_lock(&wct->tracked_controller_lock);
 	for (int i = 0; i < wct->num_controllers; i++) {
 		if (wct->controllers[i] != NULL) {
@@ -119,7 +171,14 @@ wmr_controller_tracker_node_destroy(struct xrt_frame_node *node)
 	os_mutex_unlock(&wct->tracked_controller_lock);
 	os_mutex_destroy(&wct->tracked_controller_lock);
 
+	//! Clean up
+	u_sink_debug_destroy(&wct->debug_sink);
 	u_var_remove_root(wct);
+
+	if (wct->bw) {
+		blobwatch_free(wct->bw);
+	}
+
 	free(wct);
 }
 
@@ -152,11 +211,28 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 		return -1;
 	}
 
+	// Constellation tracking
+	wct->bw = blobwatch_new(BLOB_PIXEL_THRESHOLD_WMR, BLOB_THRESHOLD_MIN_WMR);
+
+	// Fast processing thread
+	wct->fast_process_sink.push_frame = wmr_controller_tracker_process_frame_fast;
+
+	if (!u_sink_simple_queue_create(xfctx, &wct->fast_process_sink, &wct->fast_q_sink)) {
+		WMR_ERROR(wct, "Failed to init Tracked Controller mutex!");
+		wmr_controller_tracker_node_destroy(&wct->node);
+		return -1;
+	}
+
+	// Debug UI
+	u_sink_debug_init(&wct->debug_sink);
+
 	u_var_add_root(wct, "WMR Controller Tracker", false);
 	u_var_add_log_level(wct, &wct->log_level, "Log Level");
 	u_var_add_ro_i32(wct, &wct->num_controllers, "Num Controllers");
 	u_var_add_ro_u64(wct, &wct->last_timestamp, "Last Frame Timestamp");
+	u_var_add_sink_debug(wct, &wct->debug_sink, "Debug");
 
+	// Hand ownership to the frame context
 	xrt_frame_context_add(xfctx, &wct->node);
 
 	WMR_DEBUG(wct, "WMR Controller tracker created");

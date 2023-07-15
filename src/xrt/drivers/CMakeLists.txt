@@ -530,6 +530,8 @@ if(XRT_BUILD_DRIVER_WMR)
 		wmr/wmr_controller_protocol.h
 		wmr/wmr_source.c
 		wmr/wmr_source.h
+		wmr/constellation/blobwatch.c
+		wmr/constellation/blobwatch.h
 		)
 	target_link_libraries(
 		drv_wmr
