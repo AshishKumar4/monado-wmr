@@ -19,6 +19,7 @@
 #include "constellation/blobwatch.h"
 #include "constellation/camera_model.h"
 #include "constellation/correspondence_search.h"
+#include "constellation/debug_draw.h"
 #include "constellation/led_models.h"
 
 #include "wmr_controller_tracking.h"
@@ -69,9 +70,13 @@ struct wmr_controller_tracker_camera
 
 	//! Constellation tracking - fast tracking thread
 	blobwatch *bw;
+	int last_num_blobs;
 
 	//! Full search / pose recovery thread
 	struct correspondence_search *cs;
+
+	//! Debug output
+	struct u_sink_debug debug_sink;
 };
 
 /*!
@@ -108,7 +113,6 @@ struct wmr_controller_tracker
 
 	struct u_var_button full_search_button;
 	bool do_full_search;
-	struct u_sink_debug debug_sinks[WMR_MAX_CAMERAS]; /* cam_count entries */
 
 	// Fast recovery thread
 	struct xrt_frame_sink *fast_q_sink;
@@ -212,16 +216,21 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 		blobwatch_process(cam->bw, frames[i], &bwobs);
 		frames_bwobs[i] = bwobs;
 
-		if (bwobs != NULL) {
-			printf("frame %" PRIu64 " TS %" PRIu64 " cam %d ROI %d,%d w/h %d,%d Blobs: %d\n",
-			       xf->source_sequence, xf->timestamp, i, cam->wcfg.roi.offset.w, cam->wcfg.roi.offset.h,
-			       cam->wcfg.roi.extent.w, cam->wcfg.roi.extent.h, bwobs->num_blobs);
+		if (bwobs == NULL) {
+			cam->last_num_blobs = 0;
+			continue;
+		}
 
-			for (int index = 0; index < bwobs->num_blobs; index++) {
-				printf("  Blob[%d]: %f,%f %dx%d id %d age %u\n", index, bwobs->blobs[index].x,
-				       bwobs->blobs[index].y, bwobs->blobs[index].width, bwobs->blobs[index].height,
-				       bwobs->blobs[index].led_id, bwobs->blobs[index].age);
-			}
+		cam->last_num_blobs = bwobs->num_blobs;
+
+		printf("frame %" PRIu64 " TS %" PRIu64 " cam %d ROI %d,%d w/h %d,%d Blobs: %d\n", xf->source_sequence,
+		       xf->timestamp, i, cam->wcfg.roi.offset.w, cam->wcfg.roi.offset.h, cam->wcfg.roi.extent.w,
+		       cam->wcfg.roi.extent.h, bwobs->num_blobs);
+
+		for (int index = 0; index < bwobs->num_blobs; index++) {
+			printf("  Blob[%d]: %f,%f %dx%d id %d age %u\n", index, bwobs->blobs[index].x,
+			       bwobs->blobs[index].y, bwobs->blobs[index].width, bwobs->blobs[index].height,
+			       bwobs->blobs[index].led_id, bwobs->blobs[index].age);
 		}
 	}
 
@@ -285,15 +294,26 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 
 	/* Release camera frames and blobs */
 	for (int i = 0; i < wct->cam_count; i++) {
-		if (u_sink_debug_is_active(&wct->debug_sinks[i])) {
-			// @todo: Render debug view
-			u_sink_debug_push_frame(&wct->debug_sinks[i], frames[i]);
+		struct wmr_controller_tracker_camera *cam = wct->cam + i;
+
+		if (u_sink_debug_is_active(&cam->debug_sink)) {
+			struct xrt_frame *xf_src = frames[i];
+			struct xrt_frame *xf_dbg = NULL;
+
+			u_frame_create_one_off(XRT_FORMAT_R8G8B8, xf_src->width, xf_src->height, &xf_dbg);
+			xf_dbg->timestamp = xf_src->timestamp;
+
+			if (frames_bwobs[i] != NULL) {
+				debug_draw_blobs(xf_dbg, frames_bwobs[i], xf_src);
+			}
+
+			u_sink_debug_push_frame(&cam->debug_sink, xf_dbg);
+			xrt_frame_reference(&xf_dbg, NULL);
 		}
 
 		xrt_frame_reference(&frames[i], NULL);
 
 		if (frames_bwobs[i] != NULL) {
-			struct wmr_controller_tracker_camera *cam = wct->cam + i;
 			blobwatch_release_observation(cam->bw, frames_bwobs[i]);
 		}
 	}
@@ -327,11 +347,10 @@ wmr_controller_tracker_node_destroy(struct xrt_frame_node *node)
 	os_mutex_destroy(&wct->tracked_controller_lock);
 
 	//! Clean up
-
 	for (int i = 0; i < wct->cam_count; i++) {
 		struct wmr_controller_tracker_camera *cam = wct->cam + i;
 
-		u_sink_debug_destroy(&wct->debug_sinks[i]);
+		u_sink_debug_destroy(&cam->debug_sink);
 
 		if (cam->cs) {
 			correspondence_search_free(cam->cs);
@@ -445,10 +464,13 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 	u_var_add_button(wct, &wct->full_search_button, "Trigger ab-initio search");
 
 	for (int i = 0; i < wct->cam_count; i++) {
+		struct wmr_controller_tracker_camera *cam = wct->cam + i;
+		u_var_add_ro_i32(wct, &cam->last_num_blobs, "Num Blobs");
+
 		char cam_name[64];
 		sprintf(cam_name, "Cam %u", i);
-		u_sink_debug_init(&wct->debug_sinks[i]);
-		u_var_add_sink_debug(wct, &wct->debug_sinks[i], cam_name);
+		u_sink_debug_init(&cam->debug_sink);
+		u_var_add_sink_debug(wct, &cam->debug_sink, cam_name);
 	}
 
 	// Hand ownership to the frame context

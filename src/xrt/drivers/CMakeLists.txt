@@ -534,6 +534,8 @@ if(XRT_BUILD_DRIVER_WMR)
 		wmr/constellation/blobwatch.h
 		wmr/constellation/correspondence_search.c
 		wmr/constellation/correspondence_search.h
+		wmr/constellation/debug_draw.c
+		wmr/constellation/debug_draw.h
 		wmr/constellation/lambdatwist/cubic.h
 		wmr/constellation/lambdatwist/eig3x3known0.h
 		wmr/constellation/lambdatwist/lambdatwist_p3p.h
