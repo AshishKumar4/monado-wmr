@@ -485,7 +485,7 @@ read_controller_config(struct wmr_controller_base *wcb)
 	free(cache_filename);
 
 	WMR_DEBUG(wcb, "Parsed %d LED entries from controller calibration", wcb->config.led_count);
-
+	wcb->have_config = true;
 	return true;
 }
 
@@ -785,4 +785,24 @@ wmr_controller_attach_to_hmd(struct wmr_controller_base *wcb, struct wmr_hmd *hm
 {
 	/* Register the controller with the HMD for LED constellation tracking and LED sync timing updates */
 	wcb->tracking_connection = wmr_hmd_add_tracked_controller(hmd, wcb);
+}
+
+bool
+wmr_controller_base_get_led_model(struct wmr_controller_base *wcb, struct constellation_led_model *led_model)
+{
+	if (!wcb->have_config) {
+		return false;
+	}
+
+	constellation_led_model_init(led_model, wcb->config.led_count);
+	for (int i = 0; i < wcb->config.led_count; i++) {
+		struct constellation_led *led = led_model->leds + i;
+
+		led->id = i;
+		led->pos = wcb->config.leds[i].pos;
+		led->dir = wcb->config.leds[i].norm;
+		led->radius_mm = 3.5;
+	}
+
+	return true;
 }

@@ -16,6 +16,7 @@
 #include "util/u_trace_marker.h"
 
 #include "constellation/blobwatch.h"
+#include "constellation/led_models.h"
 
 #include "wmr_controller_tracking.h"
 #include "wmr_hmd.h"
@@ -38,12 +39,24 @@ struct wmr_controller_tracker_connection
 	 * only cleaned up once both release it. */
 	struct xrt_reference ref;
 
+	/* Index in the devices array for this device */
+	int id;
+
 	/* Protect access when around API calls and disconnects */
 	struct os_mutex lock;
 	bool disconnected; /* Set to true once disconnect() is called */
 
 	struct wmr_controller_base *wcb;        //! Controller instance
 	struct wmr_controller_tracker *tracker; //! Tracker instance
+};
+
+struct wmr_controller_tracker_device
+{
+	struct wmr_controller_tracker_connection *connection;
+
+	bool have_led_model;
+	struct constellation_led_model led_model;
+	struct constellation_search_model *search_led_model;
 };
 
 /*!
@@ -66,7 +79,7 @@ struct wmr_controller_tracker
 
 	//! Controller communication connections
 	int num_controllers;
-	struct wmr_controller_tracker_connection *controllers[WMR_MAX_CONTROLLERS];
+	struct wmr_controller_tracker_device controllers[WMR_MAX_CONTROLLERS];
 
 	enum u_logging_level log_level;
 
@@ -93,6 +106,21 @@ wmr_controller_tracker_connection_notify_timesync(struct wmr_controller_tracker_
 	os_mutex_unlock(&wctc->lock);
 }
 
+static bool
+wmr_controller_tracker_connection_get_led_model(struct wmr_controller_tracker_connection *wctc,
+                                                struct constellation_led_model *led_model)
+{
+	bool ret = false;
+
+	os_mutex_lock(&wctc->lock);
+	if (!wctc->disconnected) {
+		ret = wmr_controller_base_get_led_model(wctc->wcb, led_model);
+	}
+	os_mutex_unlock(&wctc->lock);
+
+	return ret;
+}
+
 static void
 wmr_controller_tracker_receive_frame(struct xrt_frame_sink *sink, struct xrt_frame *xf)
 {
@@ -106,14 +134,28 @@ wmr_controller_tracker_receive_frame(struct xrt_frame_sink *sink, struct xrt_fra
 	wct->last_timestamp = xf->timestamp;
 	wct->last_sequence = xf->source_sequence;
 
+	os_mutex_lock(&wct->tracked_controller_lock);
+
+	for (int i = 0; i < wct->num_controllers; i++) {
+		struct wmr_controller_tracker_device *device = wct->controllers + i;
+		if (!device->have_led_model) {
+			if (wmr_controller_tracker_connection_get_led_model(device->connection, &device->led_model)) {
+				WMR_INFO(wct, "WMR Controller Tracker: Retrieved controller LED model for device %d",
+				         i);
+				device->search_led_model = constellation_search_model_new(&device->led_model);
+				device->have_led_model = true;
+			}
+		}
+	}
+
 	if (is_second_frame) {
 		timepoint_ns next_slam_ts = (timepoint_ns)(xf->timestamp) + U_TIME_1S_IN_NS / 90;
-		os_mutex_lock(&wct->tracked_controller_lock);
 		for (int i = 0; i < wct->num_controllers; i++) {
-			wmr_controller_tracker_connection_notify_timesync(wct->controllers[i], next_slam_ts);
+			wmr_controller_tracker_connection_notify_timesync(wct->controllers[i].connection, next_slam_ts);
 		}
-		os_mutex_unlock(&wct->tracked_controller_lock);
 	}
+
+	os_mutex_unlock(&wct->tracked_controller_lock);
 
 	xrt_sink_push_frame(wct->fast_q_sink, xf);
 }
@@ -163,9 +205,17 @@ wmr_controller_tracker_node_destroy(struct xrt_frame_node *node)
 	// Unlink the controller connections first
 	os_mutex_lock(&wct->tracked_controller_lock);
 	for (int i = 0; i < wct->num_controllers; i++) {
-		if (wct->controllers[i] != NULL) {
-			wmr_controller_tracker_connection_disconnect(wct->controllers[i]);
-			wct->controllers[i] = NULL;
+		struct wmr_controller_tracker_device *device = wct->controllers + i;
+
+		if (device->connection != NULL) {
+			// Clean up the LED tracking model
+			constellation_led_model_clear(&device->led_model);
+			if (device->search_led_model) {
+				constellation_search_model_free(device->search_led_model);
+			}
+
+			wmr_controller_tracker_connection_disconnect(device->connection);
+			device->connection = NULL;
 		}
 	}
 	os_mutex_unlock(&wct->tracked_controller_lock);
@@ -253,12 +303,15 @@ wmr_controller_tracker_connection_destroy(struct wmr_controller_tracker_connecti
 }
 
 static struct wmr_controller_tracker_connection *
-wmr_controller_tracker_connection_create(struct wmr_controller_tracker *tracker, struct wmr_controller_base *wcb)
+wmr_controller_tracker_connection_create(int id,
+                                         struct wmr_controller_tracker *tracker,
+                                         struct wmr_controller_base *wcb)
 {
 	DRV_TRACE_MARKER();
 
 	struct wmr_controller_tracker_connection *wctc = calloc(1, sizeof(struct wmr_controller_tracker_connection));
 
+	wctc->id = id;
 	wctc->wcb = wcb;
 	wctc->tracker = tracker;
 
@@ -284,9 +337,11 @@ wmr_controller_tracker_add_controller(struct wmr_controller_tracker *wct, struct
 
 	WMR_DEBUG(wct, "WMR Controller Tracker: Adding controller %d", wct->num_controllers);
 
-	struct wmr_controller_tracker_connection *wctc = wmr_controller_tracker_connection_create(wct, wcb);
+	struct wmr_controller_tracker_connection *wctc =
+	    wmr_controller_tracker_connection_create(wct->num_controllers, wct, wcb);
 	if (wctc != NULL) {
-		wct->controllers[wct->num_controllers] = wctc;
+		struct wmr_controller_tracker_device *device = wct->controllers + wct->num_controllers;
+		device->connection = wctc;
 		wct->num_controllers++;
 	}
 
