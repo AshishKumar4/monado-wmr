@@ -532,6 +532,8 @@ if(XRT_BUILD_DRIVER_WMR)
 		wmr/wmr_source.h
 		wmr/constellation/blobwatch.c
 		wmr/constellation/blobwatch.h
+		wmr/constellation/led_models.c
+		wmr/constellation/led_models.h
 		)
 	target_link_libraries(
 		drv_wmr
