@@ -532,8 +532,19 @@ if(XRT_BUILD_DRIVER_WMR)
 		wmr/wmr_source.h
 		wmr/constellation/blobwatch.c
 		wmr/constellation/blobwatch.h
+		wmr/constellation/correspondence_search.c
+		wmr/constellation/correspondence_search.h
+		wmr/constellation/lambdatwist/cubic.h
+		wmr/constellation/lambdatwist/eig3x3known0.h
+		wmr/constellation/lambdatwist/lambdatwist_p3p.h
+		wmr/constellation/lambdatwist/mat.h
+		wmr/constellation/lambdatwist/quadratic.h
+		wmr/constellation/lambdatwist/refine_lambda.h
+		wmr/constellation/lambdatwist/vec.h
 		wmr/constellation/led_models.c
 		wmr/constellation/led_models.h
+		wmr/constellation/pose_metrics.c
+		wmr/constellation/pose_metrics.h
 		)
 	target_link_libraries(
 		drv_wmr

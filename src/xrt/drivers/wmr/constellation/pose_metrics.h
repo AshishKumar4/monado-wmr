@@ -1,0 +1,92 @@
+// Copyright 2020-2023 Jan Schmidt
+// SPDX-License-Identifier: BSL-1.0
+/*
+ * Ported from OpenHMD - Free and Open Source API and drivers for immersive technology.
+ */
+/*!
+ * @file
+ * @brief  Metrics for constellation tracking poses
+ * @author Jan Schmidt <jan@centricular.com>
+ * @ingroup drv_wmr
+ */
+#pragma once
+
+#include "xrt/xrt_defines.h"
+
+#include "blobwatch.h"
+#include "led_models.h"
+#include "camera_model.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define MAX_OBJECT_LEDS 64
+
+struct pose_rect
+{
+	double left;
+	double top;
+	double right;
+	double bottom;
+};
+
+enum pose_match_flags
+{
+	POSE_MATCH_GOOD = 0x1,      /* A reasonable pose match - most LEDs matched to within a few pixels error */
+	POSE_MATCH_STRONG = 0x2,    /* A strong pose match is a match with very low error */
+	POSE_MATCH_POSITION = 0x10, /* The position of the pose matched the prior well */
+	POSE_MATCH_ORIENT = 0x20,   /* The orientation of the pose matched the prior well */
+	POSE_HAD_PRIOR =
+	    0x100, /* If a pose prior was supplied when calculating the score, then rot/trans_error are set */
+	POSE_MATCH_LED_IDS = 0x200, /* The LED IDs on the blobs all matched the LEDs we thought (or were unassigned) */
+};
+
+#define POSE_SET_FLAG(score, f) ((score)->match_flags |= (f))
+#define POSE_CLEAR_FLAG(score, f) ((score)->match_flags &= ~(f))
+#define POSE_HAS_FLAGS(score, f) (((score)->match_flags & (f)) == (f))
+
+struct pose_metrics
+{
+	enum pose_match_flags match_flags;
+
+	int matched_blobs;
+	int unmatched_blobs;
+	int visible_leds;
+
+	double reprojection_error;
+
+	struct xrt_vec3 orient_error; /* Rotation error (compared to a prior) */
+	struct xrt_vec3 pos_error;    /* Translation error (compared to a prior) */
+};
+
+void
+pose_metrics_evaluate_pose(struct pose_metrics *score,
+                           struct xrt_pose *pose,
+                           struct blob *blobs,
+                           int num_blobs,
+                           int device_id,
+                           struct constellation_led_model *leds_model,
+                           struct camera_model *calib,
+                           struct pose_rect *out_bounds);
+
+void
+pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
+                                      struct xrt_pose *pose,
+                                      bool prior_must_match,
+                                      struct xrt_pose *pose_prior,
+                                      const struct xrt_vec3 *pos_error_thresh,
+                                      const struct xrt_vec3 *rot_error_thresh,
+                                      struct blob *blobs,
+                                      int num_blobs,
+                                      int device_id,
+                                      struct constellation_led_model *leds_model,
+                                      struct camera_model *calib,
+                                      struct pose_rect *out_bounds);
+
+bool
+pose_metrics_score_is_better_pose(struct pose_metrics *old_score, struct pose_metrics *new_score);
+
+#ifdef __cplusplus
+}
+#endif

@@ -1,5 +1,5 @@
 /*
- * Blob detection
+ * LED constellation models
  * Copyright 2014-2015 Philipp Zabel
  * Copyright 2019-2023 Jan Schmidt
  * SPDX-License-Identifier:	LGPL-2.0+ or BSL-1.0
@@ -10,6 +10,10 @@
 
 #include "math/m_api.h"
 #include "math/m_vec3.h"
+
+/* This is the angle that Rift CV1 LEDs are visible at. Let's see if
+ * it works for other controller types... */
+#define LED_ANGLE 82
 
 struct constellation_led
 {
