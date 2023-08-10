@@ -16,8 +16,9 @@
 #endif
 
 void
-constellation_led_model_init(struct constellation_led_model *led_model, uint8_t num_leds)
+constellation_led_model_init(uint32_t device_id, struct constellation_led_model *led_model, uint8_t num_leds)
 {
+	led_model->id = device_id;
 	led_model->leds = calloc(num_leds, sizeof(struct constellation_led));
 	led_model->num_leds = num_leds;
 }
@@ -176,6 +177,7 @@ constellation_search_model_new(struct constellation_led_model *led_model)
 	struct constellation_search_model *m = calloc(1, sizeof(struct constellation_search_model));
 	int i;
 
+	m->id = led_model->id;
 	m->led_model = led_model;
 
 	m->points = calloc(led_model->num_leds, sizeof(struct constellation_search_led_candidate *));

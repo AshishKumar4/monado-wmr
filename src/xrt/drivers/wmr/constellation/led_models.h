@@ -29,12 +29,15 @@ struct constellation_led
 
 struct constellation_led_model
 {
+	// Device ID
+	uint32_t id;
+
 	struct constellation_led *leds;
 	uint8_t num_leds;
 };
 
 void
-constellation_led_model_init(struct constellation_led_model *led_model, uint8_t num_leds);
+constellation_led_model_init(uint32_t device_id, struct constellation_led_model *led_model, uint8_t num_leds);
 void
 constellation_led_model_dump(struct constellation_led_model *led_model, const char *desc);
 void
@@ -59,6 +62,8 @@ constellation_search_led_candidate_free(struct constellation_search_led_candidat
 
 struct constellation_search_model
 {
+	uint32_t id; /* Device ID */
+
 	uint8_t num_points;
 	struct constellation_search_led_candidate **points;
 

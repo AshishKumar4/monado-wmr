@@ -21,6 +21,7 @@
 #include <math.h>
 
 #include "math/m_vec3.h"
+#include "os/os_time.h"
 
 #include "lambdatwist/lambdatwist_p3p.h"
 #include "correspondence_search.h"
@@ -115,17 +116,11 @@ undistort_blob_points(struct blob *blobs, int num_blobs, struct xrt_vec2 *out_po
 void
 correspondence_search_set_blobs(struct correspondence_search *cs, struct blob *blobs, int num_blobs)
 {
-	int i, m;
+	int i;
 	struct xrt_vec2 undistorted_points[MAX_BLOBS_PER_FRAME];
 	struct cs_image_point *blob_list[MAX_BLOBS_PER_FRAME];
 
 	assert(num_blobs <= MAX_BLOBS_PER_FRAME);
-
-	/* Updating the blobs means we don't know if we have good poses any more */
-	for (m = 0; m < cs->num_models; m++) {
-		struct cs_model_info *mi = &cs->models[m];
-		mi->match_flags = 0;
-	}
 
 	if (cs->points != NULL)
 		free(cs->points);
@@ -172,19 +167,6 @@ correspondence_search_set_blobs(struct correspondence_search *cs, struct blob *b
 	}
 }
 
-bool
-correspondence_search_set_model(struct correspondence_search *cs, int id, struct constellation_search_model *model)
-{
-	if (cs->num_models == CS_MAX_MODELS)
-		return false;
-
-	cs->models[cs->num_models].id = id;
-	cs->models[cs->num_models].model = model;
-	cs->num_models++;
-
-	return true;
-}
-
 void
 correspondence_search_free(struct correspondence_search *cs)
 {
@@ -217,7 +199,7 @@ compare_blobs_distance(const void *elem1, const void *elem2, void *arg)
 #if DUMP_SCENE
 static void
 dump_pose(struct correspondence_search *cs,
-          struct led_search_model *model,
+          struct constellation_search_model *model,
           struct xrt_pose *pose,
           struct cs_model_info *mi)
 {
@@ -229,23 +211,24 @@ dump_pose(struct correspondence_search *cs,
 		struct xrt_vec3 pos, dir;
 
 		/* Project HMD LED into the image (no distortion) */
-		oquatf_get_rotated(&pose->orient, &leds->points[i].pos, &pos);
-		ovec3f_add(&pos, &pose->pos, &pos);
+		math_quat_rotate_vec3(&pose->orientation, &leds->leds[i].pos, &pos);
+		math_vec3_accum(&pose->position, &pos);
+
 		if (pos.z < 0)
 			continue; // Can't be behind the camera
 
-		ovec3f_multiply_scalar(&pos, 1.0 / pos.z, &pos);
+		math_vec3_scalar_mul(1.0 / pos.z, &pos);
 
 		double x = pos.x;
 		double y = pos.y;
 
-		ovec3f_normalize_me(&pos);
+		math_vec3_normalize(&pos);
 
-		oquatf_get_rotated(&pose->orient, &leds->points[i].dir, &dir);
-		ovec3f_normalize_me(&dir);
+		math_quat_rotate_vec3(&pose->orientation, &leds->leds[i].dir, &dir);
+		math_vec3_normalize(&dir);
 
 		double facing_dot;
-		facing_dot = m_vec3_dot(&pos, &dir);
+		facing_dot = m_vec3_dot(pos, dir);
 
 		if (facing_dot < 0) {
 			printf("  (%f,%f),\n", x, y);
@@ -334,9 +317,10 @@ correspondence_search_project_pose(struct correspondence_search *cs,
 				    mi->best_pose_led_depth, mi->best_pose_blob_depth,
 				    (mi->best_pose_found_time - mi->search_start_time) * 1000.0, mi->led_index,
 				    mi->blob_index);
-				DEBUG_TIMING("# pose orient %f %f %f %f pos %f %f %f\n", mi->best_pose.orient.x,
-				             mi->best_pose.orient.y, mi->best_pose.orient.z, mi->best_pose.orient.w,
-				             mi->best_pose.pos.x, mi->best_pose.pos.y, mi->best_pose.pos.z);
+				DEBUG_TIMING("# pose orient %f %f %f %f pos %f %f %f\n", mi->best_pose.orientation.x,
+				             mi->best_pose.orientation.y, mi->best_pose.orientation.z,
+				             mi->best_pose.orientation.w, mi->best_pose.position.x,
+				             mi->best_pose.position.y, mi->best_pose.position.z);
 			}
 
 #if DUMP_FULL_DEBUG
@@ -345,9 +329,9 @@ correspondence_search_project_pose(struct correspondence_search *cs,
 			DEBUG(
 			    "model %d new best pose candidate orient %f %f %f %f pos %f %f %f has %u visible LEDs, "
 			    "error %f (%f / LED) after %u trials and %u pose checks\n",
-			    mi->id, pose->orient.x, pose->orient.y, pose->orient.z, pose->orient.w, pose->pos.x,
-			    pose->pos.y, pose->pos.z, score.visible_leds, score.reprojection_error, error_per_led,
-			    cs->num_trials, cs->num_pose_checks);
+			    mi->id, pose->orientation.x, pose->orientation.y, pose->orientation.z, pose->orientation.w,
+			    pose->position.x, pose->position.y, pose->position.z, score.visible_leds,
+			    score.reprojection_error, error_per_led, cs->num_trials, cs->num_pose_checks);
 
 			DEBUG("model %d matched %u blobs of %u\n", mi->id, score.matched_blobs, score.visible_leds);
 #endif
@@ -361,8 +345,9 @@ correspondence_search_project_pose(struct correspondence_search *cs,
 			    score.visible_leds > 0 ? score.reprojection_error / score.visible_leds : -1;
 			DEBUG(
 			    "pose candidate orient %f %f %f %f pos %f %f %f has %u visible LEDs, error %f (%f / LED)\n",
-			    pose->orient.x, pose->orient.y, pose->orient.z, pose->orient.w, pose->pos.x, pose->pos.y,
-			    pose->pos.z, score.visible_leds, score.reprojection_error, error_per_led);
+			    pose->orientation.x, pose->orientation.y, pose->orientation.z, pose->orientation.w,
+			    pose->position.x, pose->position.y, pose->position.z, score.visible_leds,
+			    score.reprojection_error, error_per_led);
 			DEBUG("matched %u blobs of %u\n", score.matched_blobs, score.visible_leds);
 #endif
 		}
@@ -814,30 +799,8 @@ search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi
 }
 
 bool
-correspondence_search_have_pose(struct correspondence_search *cs,
-                                int model_id,
-                                struct xrt_pose *pose,
-                                struct pose_metrics *score)
-{
-	int i;
-
-	for (i = 0; i < cs->num_models; i++) {
-		struct cs_model_info *mi = &cs->models[i];
-		if (mi->id != model_id)
-			continue;
-
-		if (mi->match_flags & POSE_MATCH_GOOD) {
-			*pose = mi->best_pose;
-			*score = mi->best_score;
-			return true;
-		}
-	}
-	return false;
-}
-
-bool
 correspondence_search_find_one_pose(struct correspondence_search *cs,
-                                    int model_id,
+                                    struct constellation_search_model *model,
                                     enum correspondence_search_flags search_flags,
                                     struct xrt_pose *pose,
                                     struct xrt_vec3 *pos_error_thresh,
@@ -846,8 +809,6 @@ correspondence_search_find_one_pose(struct correspondence_search *cs,
                                     float gravity_tolerance_rad,
                                     struct pose_metrics *score)
 {
-	int i;
-
 	assert(pose != NULL);
 	assert(score != NULL);
 
@@ -855,61 +816,53 @@ correspondence_search_find_one_pose(struct correspondence_search *cs,
 	if ((search_flags & (CS_FLAG_SHALLOW_SEARCH | CS_FLAG_DEEP_SEARCH)) == 0)
 		search_flags |= CS_FLAG_SHALLOW_SEARCH | CS_FLAG_DEEP_SEARCH;
 
-	for (i = 0; i < cs->num_models; i++) {
-		struct cs_model_info *mi = &cs->models[i];
-		if (mi->id != model_id)
-			continue;
+	struct cs_model_info mi;
 
-		mi->search_flags = search_flags;
-		mi->match_flags = 0;
+	mi.id = model->id;
+	mi.model = model;
+	mi.search_flags = search_flags;
+	mi.match_flags = 0;
 
-		if (search_flags & CS_FLAG_HAVE_POSE_PRIOR) {
-			assert(pos_error_thresh != NULL);
-			assert(rot_error_thresh != NULL);
+	if (search_flags & CS_FLAG_HAVE_POSE_PRIOR) {
+		assert(pos_error_thresh != NULL);
+		assert(rot_error_thresh != NULL);
 
-			mi->pose_prior = *pose;
-			mi->pos_error_thresh = pos_error_thresh;
-			mi->rot_error_thresh = rot_error_thresh;
-		}
-
-		if (search_flags & CS_FLAG_MATCH_GRAVITY) {
-			struct xrt_quat pose_gravity_twist;
-
-			/* We need a pose prior to extract the gravity swing to match */
-			assert((search_flags & CS_FLAG_HAVE_POSE_PRIOR) != 0);
-			assert(gravity_vector != NULL);
-
-			mi->gravity_vector = *gravity_vector;
-			mi->gravity_tolerance_rad = gravity_tolerance_rad;
-
-			math_quat_decompose_swing_twist(&pose->orientation, gravity_vector, &mi->gravity_swing,
-			                                &pose_gravity_twist);
-		}
-
-		if (search_pose_for_model(cs, mi) && (mi->match_flags & POSE_MATCH_GOOD)) {
-			*pose = mi->best_pose;
-			*score = mi->best_score;
-
-			DEBUG_TIMING("# Best %s match for model %d was %d points out of %d with error %f pixels^2\n",
-			             (search_flags & CS_FLAG_MATCH_GRAVITY) ? "aligned" : "unaligned", model_id,
-			             mi->best_score.matched_blobs, mi->best_score.visible_leds,
-			             mi->best_score.reprojection_error);
-			DEBUG_TIMING("# Found at LED depth %d blob depth %d after %f ms of %f ms\n",
-			             mi->best_pose_led_depth, mi->best_pose_blob_depth,
-			             (mi->best_pose_found_time - mi->search_start_time) * 1000.0,
-			             (os_monotonic_get_ns() - mi->search_start_time) * 1000.0);
-			DEBUG_TIMING("# pose orient %f %f %f %f pos %f %f %f\n", mi->best_pose.orient.x,
-			             mi->best_pose.orient.y, mi->best_pose.orient.z, mi->best_pose.orient.w,
-			             mi->best_pose.pos.x, mi->best_pose.pos.y, mi->best_pose.pos.z);
-			return true;
-		}
-
-		*pose = mi->best_pose;
-		*score = mi->best_score;
-		return false;
+		mi.pose_prior = *pose;
+		mi.pos_error_thresh = pos_error_thresh;
+		mi.rot_error_thresh = rot_error_thresh;
 	}
 
-	DEBUG("No model found for id %d!\n", model_id);
-	score->match_flags = 0;
+	if (search_flags & CS_FLAG_MATCH_GRAVITY) {
+		struct xrt_quat pose_gravity_twist;
+
+		/* We need a pose prior to extract the gravity swing to match */
+		assert((search_flags & CS_FLAG_HAVE_POSE_PRIOR) != 0);
+		assert(gravity_vector != NULL);
+
+		mi.gravity_vector = *gravity_vector;
+		mi.gravity_tolerance_rad = gravity_tolerance_rad;
+
+		math_quat_decompose_swing_twist(&pose->orientation, gravity_vector, &mi.gravity_swing,
+		                                &pose_gravity_twist);
+	}
+
+	if (search_pose_for_model(cs, &mi) && (mi.match_flags & POSE_MATCH_GOOD)) {
+		*pose = mi.best_pose;
+		*score = mi.best_score;
+
+		DEBUG_TIMING("# Best %s match for model %d was %d points out of %d with error %f pixels^2\n",
+		             (search_flags & CS_FLAG_MATCH_GRAVITY) ? "aligned" : "unaligned", mi.id,
+		             mi.best_score.matched_blobs, mi.best_score.visible_leds, mi.best_score.reprojection_error);
+		DEBUG_TIMING("# Found at LED depth %d blob depth %d after %f ms of %f ms\n", mi.best_pose_led_depth,
+		             mi.best_pose_blob_depth, (mi.best_pose_found_time - mi.search_start_time) * 1000.0,
+		             (os_monotonic_get_ns() - mi.search_start_time) * 1000.0);
+		DEBUG_TIMING("# pose orient %f %f %f %f pos %f %f %f\n", mi.best_pose.orientation.x,
+		             mi.best_pose.orientation.y, mi.best_pose.orientation.z, mi.best_pose.orientation.w,
+		             mi.best_pose.position.x, mi.best_pose.position.y, mi.best_pose.position.z);
+		return true;
+	}
+
+	*pose = mi.best_pose;
+	*score = mi.best_score;
 	return false;
 }

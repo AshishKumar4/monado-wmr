@@ -17,8 +17,6 @@
 #include "led_models.h"
 #include "pose_metrics.h"
 
-#define CS_MAX_MODELS 3
-
 #define MAX_BLOB_SEARCH_DEPTH 5
 
 enum correspondence_search_flags
@@ -88,9 +86,6 @@ struct correspondence_search
 	struct cs_image_point *points;
 	struct blob *blobs; /* Original blobs structs [num_points] */
 
-	int num_models;
-	struct cs_model_info models[CS_MAX_MODELS];
-
 	unsigned int num_trials;
 	unsigned int num_pose_checks;
 
@@ -104,16 +99,13 @@ struct correspondence_search *
 correspondence_search_new(struct camera_model *camera_calib);
 void
 correspondence_search_set_blobs(struct correspondence_search *cs, struct blob *blobs, int num_blobs);
-bool
-correspondence_search_set_model(struct correspondence_search *cs,
-                                int model_id,
-                                struct constellation_search_model *model);
+
 void
 correspondence_search_free(struct correspondence_search *cs);
 
 bool
 correspondence_search_find_one_pose(struct correspondence_search *cs,
-                                    int model_id,
+                                    struct constellation_search_model *model,
                                     enum correspondence_search_flags search_flags,
                                     struct xrt_pose *pose,
                                     struct xrt_vec3 *pos_error_thresh,

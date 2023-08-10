@@ -794,7 +794,7 @@ wmr_controller_base_get_led_model(struct wmr_controller_base *wcb, struct conste
 		return false;
 	}
 
-	constellation_led_model_init(led_model, wcb->config.led_count);
+	constellation_led_model_init((int)wcb->base.device_type, led_model, wcb->config.led_count);
 	for (int i = 0; i < wcb->config.led_count; i++) {
 		struct constellation_led *led = led_model->leds + i;
 
