@@ -428,13 +428,8 @@ img_xfer_cb(struct libusb_transfer *xfer)
 			xrt_frame_reference(&frames[i], NULL);
 		}
 	} else if (cam->controller_cam_sink != NULL) {
-		/* remove the top line pixels and push for controller processing */
-		struct xrt_frame *xf_roi = NULL;
-		struct xrt_rect roi = {.offset = {0, 1}, .extent = {.w = xf->width, .h = xf->height - 1}};
-
-		u_frame_create_roi(xf, roi, &xf_roi);
-		xrt_sink_push_frame(cam->controller_cam_sink, xf_roi);
-		xrt_frame_reference(&xf_roi, NULL);
+		/* @todo: Build a frame bundle and push that instead */
+		xrt_sink_push_frame(cam->controller_cam_sink, xf);
 	}
 
 drop_frame:

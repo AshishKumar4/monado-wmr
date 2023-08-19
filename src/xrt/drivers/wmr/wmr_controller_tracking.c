@@ -13,9 +13,12 @@
 #include "os/os_threading.h"
 
 #include "util/u_debug.h"
+#include "util/u_frame.h"
 #include "util/u_trace_marker.h"
 
 #include "constellation/blobwatch.h"
+#include "constellation/camera_model.h"
+#include "constellation/correspondence_search.h"
 #include "constellation/led_models.h"
 
 #include "wmr_controller_tracking.h"
@@ -59,6 +62,18 @@ struct wmr_controller_tracker_device
 	struct constellation_search_model *search_led_model;
 };
 
+struct wmr_controller_tracker_camera
+{
+	struct wmr_camera_config wcfg;
+	struct camera_model camera_model;
+
+	//! Constellation tracking - fast tracking thread
+	blobwatch *bw;
+
+	//! Full search / pose recovery thread
+	struct correspondence_search *cs;
+};
+
 /*!
  * An @ref xrt_frame_sink that analyses video frame groups for LED constellation tracking
  * @implements xrt_frame_sink
@@ -81,18 +96,23 @@ struct wmr_controller_tracker
 	int num_controllers;
 	struct wmr_controller_tracker_device controllers[WMR_MAX_CONTROLLERS];
 
+	//!< Tracking camera entries
+	struct wmr_controller_tracker_camera cam[WMR_MAX_CAMERAS];
+	int cam_count;
+
+	/* Debug */
 	enum u_logging_level log_level;
 
 	uint64_t last_timestamp;
 	uint64_t last_sequence;
 
-	struct u_sink_debug debug_sink;
+	struct u_var_button full_search_button;
+	bool do_full_search;
+	struct u_sink_debug debug_sinks[WMR_MAX_CAMERAS]; /* cam_count entries */
 
+	// Fast recovery thread
 	struct xrt_frame_sink *fast_q_sink;
 	struct xrt_frame_sink fast_process_sink;
-
-	//! Constellation tracking
-	blobwatch *bw;
 };
 
 static void
@@ -121,6 +141,24 @@ wmr_controller_tracker_connection_get_led_model(struct wmr_controller_tracker_co
 	return ret;
 }
 
+static bool
+wmr_controller_tracker_connection_get_tracked_pose(struct wmr_controller_tracker_connection *wctc,
+                                                   uint64_t timestamp_ns,
+                                                   struct xrt_space_relation *xsr)
+{
+	bool ret = false;
+
+	os_mutex_lock(&wctc->lock);
+	if (!wctc->disconnected) {
+		struct xrt_device *xdev = (struct xrt_device *)(wctc->wcb);
+		xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_STAGE_SPACE_POSE, timestamp_ns, xsr);
+		ret = true;
+	}
+	os_mutex_unlock(&wctc->lock);
+
+	return ret;
+}
+
 static void
 wmr_controller_tracker_receive_frame(struct xrt_frame_sink *sink, struct xrt_frame *xf)
 {
@@ -128,26 +166,15 @@ wmr_controller_tracker_receive_frame(struct xrt_frame_sink *sink, struct xrt_fra
 
 	assert(xf->format == XRT_FORMAT_L8);
 
-	/* The frame cadence is SLAM/controller/controller, and we need to pass the estimate of the
-	 * next SLAM frame timestamp to the timesync */
+	/* The frame cadence is SLAM/controller/controller, and we need to pass the
+	 * estimate of the next SLAM frame timestamp to the timesync */
 	bool is_second_frame = wct->last_sequence + 1 == xf->source_sequence;
 	wct->last_timestamp = xf->timestamp;
 	wct->last_sequence = xf->source_sequence;
 
 	os_mutex_lock(&wct->tracked_controller_lock);
 
-	for (int i = 0; i < wct->num_controllers; i++) {
-		struct wmr_controller_tracker_device *device = wct->controllers + i;
-		if (!device->have_led_model) {
-			if (wmr_controller_tracker_connection_get_led_model(device->connection, &device->led_model)) {
-				WMR_INFO(wct, "WMR Controller Tracker: Retrieved controller LED model for device %d",
-				         i);
-				device->search_led_model = constellation_search_model_new(&device->led_model);
-				device->have_led_model = true;
-			}
-		}
-	}
-
+	// Update the controller timesync estimate
 	if (is_second_frame) {
 		timepoint_ns next_slam_ts = (timepoint_ns)(xf->timestamp) + U_TIME_1S_IN_NS / 90;
 		for (int i = 0; i < wct->num_controllers; i++) {
@@ -171,26 +198,104 @@ static void
 wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt_frame *xf)
 {
 	struct wmr_controller_tracker *wct = container_of(sink, struct wmr_controller_tracker, fast_process_sink);
-	blobservation *bwobs = NULL;
 
-	blobwatch_process(wct->bw, xf->data, xf->width, xf->height, &bwobs);
+	struct xrt_frame *frames[WMR_MAX_CAMERAS] = {NULL};
+	blobservation *frames_bwobs[WMR_MAX_CAMERAS] = {NULL};
 
-	if (bwobs != NULL) {
-		printf("frame %" PRIu64 " TS %" PRIu64 " Blobs: %d\n", xf->source_sequence, xf->timestamp,
-		       bwobs->num_blobs);
+	/* Split out camera views and collect blobs across all cameras */
+	for (int i = 0; i < wct->cam_count; i++) {
+		struct wmr_controller_tracker_camera *cam = wct->cam + i;
+		blobservation *bwobs = NULL;
 
-		for (int index = 0; index < bwobs->num_blobs; index++) {
-			printf("  Blob[%d]: %f,%f %dx%d id %d age %u\n", index, bwobs->blobs[index].x,
-			       bwobs->blobs[index].y, bwobs->blobs[index].width, bwobs->blobs[index].height,
-			       bwobs->blobs[index].led_id, bwobs->blobs[index].age);
+		u_frame_create_roi(xf, cam->wcfg.roi, &frames[i]);
+
+		blobwatch_process(cam->bw, frames[i], &bwobs);
+		frames_bwobs[i] = bwobs;
+
+		if (bwobs != NULL) {
+			printf("frame %" PRIu64 " TS %" PRIu64 " cam %d ROI %d,%d w/h %d,%d Blobs: %d\n",
+			       xf->source_sequence, xf->timestamp, i, cam->wcfg.roi.offset.w, cam->wcfg.roi.offset.h,
+			       cam->wcfg.roi.extent.w, cam->wcfg.roi.extent.h, bwobs->num_blobs);
+
+			for (int index = 0; index < bwobs->num_blobs; index++) {
+				printf("  Blob[%d]: %f,%f %dx%d id %d age %u\n", index, bwobs->blobs[index].x,
+				       bwobs->blobs[index].y, bwobs->blobs[index].width, bwobs->blobs[index].height,
+				       bwobs->blobs[index].led_id, bwobs->blobs[index].age);
+			}
+		}
+	}
+
+	/* Grab the 'do_full_search' value in case the user clicked the
+	 * button in the debug UI */
+	bool do_full_search = wct->do_full_search;
+	wct->do_full_search = false;
+
+	// Ready to start processing device poses now. Make sure we have the
+	// LED models and collect the best estimate of the current pose
+	// for each target device
+	os_mutex_lock(&wct->tracked_controller_lock);
+	for (int d = 0; d < wct->num_controllers; d++) {
+		struct wmr_controller_tracker_device *device = wct->controllers + d;
+		if (!device->have_led_model) {
+			if (!wmr_controller_tracker_connection_get_led_model(device->connection, &device->led_model)) {
+				continue; // Can't do anything without the LED info
+			}
+
+			WMR_INFO(wct, "WMR Controller Tracker: Retrieved controller LED model for device %u",
+			         device->led_model.id);
+			device->search_led_model = constellation_search_model_new(&device->led_model);
+			device->have_led_model = true;
 		}
 
-		if (u_sink_debug_is_active(&wct->debug_sink)) {
+		// Collect the controller prior pose
+		struct xrt_space_relation xsr;
+		if (!wmr_controller_tracker_connection_get_tracked_pose(device->connection, xf->timestamp, &xsr)) {
+			continue; // Can't retrieve the pose: means the device was disconnected
+		}
+
+		if (do_full_search) {
+			WMR_INFO(wct, "Doing full search for device %d", device->led_model.id);
+
+			for (int c = 0; c < wct->cam_count; c++) {
+				struct wmr_controller_tracker_camera *cam = wct->cam + c;
+
+				if (frames_bwobs[c] == NULL)
+					continue; // no blobs in this view
+
+				correspondence_search_set_blobs(cam->cs, frames_bwobs[c]->blobs,
+				                                frames_bwobs[c]->num_blobs);
+
+				enum correspondence_search_flags search_flags =
+				    CS_FLAG_STOP_FOR_STRONG_MATCH | CS_FLAG_MATCH_ALL_BLOBS | CS_FLAG_DEEP_SEARCH;
+				struct pose_metrics score;
+				struct xrt_pose obj_cam_pose;
+
+				if (correspondence_search_find_one_pose(cam->cs, device->search_led_model, search_flags,
+				                                        &obj_cam_pose, NULL, NULL, NULL, 0.0, &score)) {
+					WMR_INFO(wct,
+					         "Found a pose on cam %d device %d score match_flags 0x%x matched %u "
+					         "blobs of %u visible LEDs",
+					         c, device->led_model.id, score.match_flags, score.matched_blobs,
+					         score.visible_leds);
+				}
+			}
+		}
+	}
+	os_mutex_unlock(&wct->tracked_controller_lock);
+
+	/* Release camera frames and blobs */
+	for (int i = 0; i < wct->cam_count; i++) {
+		if (u_sink_debug_is_active(&wct->debug_sinks[i])) {
 			// @todo: Render debug view
-			u_sink_debug_push_frame(&wct->debug_sink, xf);
+			u_sink_debug_push_frame(&wct->debug_sinks[i], frames[i]);
 		}
 
-		blobwatch_release_observation(wct->bw, bwobs);
+		xrt_frame_reference(&frames[i], NULL);
+
+		if (frames_bwobs[i] != NULL) {
+			struct wmr_controller_tracker_camera *cam = wct->cam + i;
+			blobwatch_release_observation(cam->bw, frames_bwobs[i]);
+		}
 	}
 }
 
@@ -222,14 +327,61 @@ wmr_controller_tracker_node_destroy(struct xrt_frame_node *node)
 	os_mutex_destroy(&wct->tracked_controller_lock);
 
 	//! Clean up
-	u_sink_debug_destroy(&wct->debug_sink);
-	u_var_remove_root(wct);
 
-	if (wct->bw) {
-		blobwatch_free(wct->bw);
+	for (int i = 0; i < wct->cam_count; i++) {
+		struct wmr_controller_tracker_camera *cam = wct->cam + i;
+
+		u_sink_debug_destroy(&wct->debug_sinks[i]);
+
+		if (cam->cs) {
+			correspondence_search_free(cam->cs);
+		}
+
+		if (cam->bw) {
+			blobwatch_free(cam->bw);
+		}
 	}
 
+	u_var_remove_root(wct);
 	free(wct);
+}
+static void
+wct_full_search_btn_cb(void *wct_ptr)
+{
+	struct wmr_controller_tracker *wct = (struct wmr_controller_tracker *)wct_ptr;
+	wct->do_full_search = true;
+}
+
+static void
+camera_model_from_wmr(struct camera_model *cm, struct wmr_camera_config *cfg)
+{
+	struct t_camera_calibration cc;
+	struct wmr_distortion_6KT *intr = &cfg->distortion6KT;
+
+	cc.image_size_pixels.h = cfg->roi.extent.h;
+	cc.image_size_pixels.w = cfg->roi.extent.w;
+	cc.intrinsics[0][0] = intr->params.fx * (double)cfg->roi.extent.w;
+	cc.intrinsics[1][1] = intr->params.fy * (double)cfg->roi.extent.h;
+	cc.intrinsics[0][2] = intr->params.cx * (double)cfg->roi.extent.w;
+	cc.intrinsics[1][2] = intr->params.cy * (double)cfg->roi.extent.h;
+	cc.intrinsics[2][2] = 1.0;
+
+	cc.distortion_model = T_DISTORTION_WMR;
+	cc.wmr.k1 = intr->params.k[0];
+	cc.wmr.k2 = intr->params.k[1];
+	cc.wmr.p1 = intr->params.p1;
+	cc.wmr.p2 = intr->params.p2;
+	cc.wmr.k3 = intr->params.k[2];
+	cc.wmr.k4 = intr->params.k[3];
+	cc.wmr.k5 = intr->params.k[4];
+	cc.wmr.k6 = intr->params.k[5];
+	cc.wmr.codx = intr->params.dist_x;
+	cc.wmr.cody = intr->params.dist_y;
+	cc.wmr.rpmax = intr->params.metric_radius;
+
+	cm->width = cfg->roi.extent.w;
+	cm->height = cfg->roi.extent.h;
+	t_camera_model_params_from_t_camera_calibration(&cc, &cm->calib);
 }
 
 int
@@ -261,8 +413,16 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 		return -1;
 	}
 
-	// Constellation tracking
-	wct->bw = blobwatch_new(BLOB_PIXEL_THRESHOLD_WMR, BLOB_THRESHOLD_MIN_WMR);
+	// Set up the per-camera constellation tracking pieces
+	wct->cam_count = hmd_cfg->tcam_count;
+
+	for (int i = 0; i < hmd_cfg->tcam_count; i++) {
+		struct wmr_controller_tracker_camera *cam = wct->cam + i;
+		cam->wcfg = *hmd_cfg->tcams[i];
+		camera_model_from_wmr(&cam->camera_model, &cam->wcfg);
+		cam->bw = blobwatch_new(BLOB_PIXEL_THRESHOLD_WMR, BLOB_THRESHOLD_MIN_WMR);
+		cam->cs = correspondence_search_new(&cam->camera_model);
+	}
 
 	// Fast processing thread
 	wct->fast_process_sink.push_frame = wmr_controller_tracker_process_frame_fast;
@@ -274,13 +434,22 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 	}
 
 	// Debug UI
-	u_sink_debug_init(&wct->debug_sink);
+
+	wct->full_search_button.cb = wct_full_search_btn_cb;
+	wct->full_search_button.ptr = wct;
 
 	u_var_add_root(wct, "WMR Controller Tracker", false);
 	u_var_add_log_level(wct, &wct->log_level, "Log Level");
 	u_var_add_ro_i32(wct, &wct->num_controllers, "Num Controllers");
 	u_var_add_ro_u64(wct, &wct->last_timestamp, "Last Frame Timestamp");
-	u_var_add_sink_debug(wct, &wct->debug_sink, "Debug");
+	u_var_add_button(wct, &wct->full_search_button, "Trigger ab-initio search");
+
+	for (int i = 0; i < wct->cam_count; i++) {
+		char cam_name[64];
+		sprintf(cam_name, "Cam %u", i);
+		u_sink_debug_init(&wct->debug_sinks[i]);
+		u_var_add_sink_debug(wct, &wct->debug_sinks[i], cam_name);
+	}
 
 	// Hand ownership to the frame context
 	xrt_frame_context_add(xfctx, &wct->node);
