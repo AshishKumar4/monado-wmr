@@ -31,6 +31,7 @@
 #define DUMP_FULL_DEBUG 0
 #define DUMP_FULL_LOG 0
 #define DUMP_TIMING 0
+#define CHECK_ALL_PROJECTIONS 0
 
 #define MAX_LED_SEARCH_DEPTH 8
 
@@ -113,6 +114,19 @@ undistort_blob_points(struct blob *blobs, int num_blobs, struct xrt_vec2 *out_po
 	}
 }
 
+#if CHECK_ALL_PROJECTIONS
+static void
+project_led_point(struct xrt_vec3 *led_pos,
+                  struct xrt_pose *pose,
+                  struct camera_model *calib,
+                  struct xrt_vec2 *out_point)
+{
+	struct xrt_vec3 tmp;
+	math_pose_transform_point(pose, led_pos, &tmp);
+	t_camera_models_project(&calib->calib, tmp.x, tmp.y, tmp.z, &out_point->x, &out_point->y);
+}
+#endif
+
 void
 correspondence_search_set_blobs(struct correspondence_search *cs, struct blob *blobs, int num_blobs)
 {
@@ -145,14 +159,17 @@ correspondence_search_set_blobs(struct correspondence_search *cs, struct blob *b
 
 		p->size[0] = b->width / cs->calib->calib.fx;
 		p->size[1] = b->height / cs->calib->calib.fy;
-		p->max_size = MAX(p->size[0], p->size[1]);
+		p->max_dist = sqrt(p->size[0] * p->size[9] + p->size[1] * p->size[1]);
 
 		p->blob = b;
 		blob_list[i] = p;
 
 #if DUMP_BLOBS
-		printf("Blob %u = (%f,%f %ux%u) -> (%f, %f) %f x %f (LED id %d)\n", i, b->x, b->y, b->width, b->height,
-		       p->point_homog[0], p->point_homog[1], p->size[0], p->size[1], b->led_id);
+		printf("Blob %u = (%f,%f %ux%u) -> (%f, %f) %f x %f (homog (%f, %f) %f x %f) (LED id %d)\n", i, b->x,
+		       b->y, b->width, b->height, p->point_homog[0] * cs->calib->calib.fx,
+		       p->point_homog[1] * cs->calib->calib.fy, p->size[0] * cs->calib->calib.fx,
+		       p->size[1] * cs->calib->calib.fy, p->point_homog[0], p->point_homog[1], p->size[0], p->size[1],
+		       b->led_id);
 #endif
 	}
 
@@ -315,8 +332,8 @@ correspondence_search_project_pose(struct correspondence_search *cs,
 				    "# Found at LED depth %d blob depth %d after %f ms. Anchor indices: LED %d blob "
 				    "%d\n",
 				    mi->best_pose_led_depth, mi->best_pose_blob_depth,
-				    (mi->best_pose_found_time - mi->search_start_time) * 1000.0, mi->led_index,
-				    mi->blob_index);
+				    (float)(mi->best_pose_found_time - mi->search_start_time) / 1000000.0,
+				    mi->led_index, mi->blob_index);
 				DEBUG_TIMING("# pose orient %f %f %f %f pos %f %f %f\n", mi->best_pose.orientation.x,
 				             mi->best_pose.orientation.y, mi->best_pose.orientation.z,
 				             mi->best_pose.orientation.w, mi->best_pose.position.x,
@@ -408,20 +425,10 @@ check_led_against_model_subset(struct correspondence_search *cs,
 	int i;
 	double *y1, *y2, *y3;
 	double Rs[4][9], Ts[4][3];
-	struct xrt_vec3 checkblob, blob0;
 
 	y1 = blobs[0]->point_homog;
 	y2 = blobs[1]->point_homog;
 	y3 = blobs[2]->point_homog;
-
-	blob0.x = blobs[0]->point_homog[0];
-	blob0.y = blobs[0]->point_homog[1];
-	blob0.z = blobs[0]->point_homog[2];
-
-	/* 4th point we'll check against */
-	checkblob.x = blobs[3]->point_homog[0];
-	checkblob.y = blobs[3]->point_homog[1];
-	checkblob.z = blobs[3]->point_homog[2];
 
 	cs->num_trials++;
 
@@ -436,39 +443,47 @@ check_led_against_model_subset(struct correspondence_search *cs,
 	 * then we wouldn't need to convert below */
 	int valid = lambdatwist_p3p(y1, y2, y3, x[0], x[1], x[2], Rs, Ts);
 
-	if (valid) {
-		for (i = 0; i < valid; i++) {
-			struct xrt_pose pose;
-			struct xrt_vec3 checkpos, checkdir;
-			float l;
+	if (!valid) {
+		return;
+	}
+	for (i = 0; i < valid; i++) {
+		struct xrt_pose pose;
+		struct xrt_vec3 checkpos, checkdir;
+		float l;
 
-			/* Construct quat and trans for this pose */
-			quat_from_rotation_matrix(&pose.orientation, Rs[i]);
+		/* Construct quat and trans for this pose */
+		quat_from_rotation_matrix(&pose.orientation, Rs[i]);
 
-			pose.position.x = Ts[i][0];
-			pose.position.y = Ts[i][1];
-			pose.position.z = Ts[i][2];
+		pose.position.x = Ts[i][0];
+		pose.position.y = Ts[i][1];
+		pose.position.z = Ts[i][2];
 
-			if (pose.position.z < 0.05 || pose.position.z > 15) {
-				/* The object is unlikely to be < 5cm or > 15m from the camera */
-				continue;
-			}
+		if (pose.position.z < 0.05 || pose.position.z > 15) {
+			/* The object is unlikely to be < 5cm or > 15m from the camera */
+			continue;
+		}
 
-			/* The quaternion produced should already be normalised, but sometimes it's not! */
+		/* The quaternion produced should already be normalised, but sometimes it's not! */
 #if 1
-			math_quat_normalize(&pose.orientation);
+		math_quat_normalize(&pose.orientation);
 #else
-			l = math_quat_len(&pose.orient);
-			assert(l > 0.9999 && l < 1.0001);
+		l = math_quat_len(&pose.orient);
+		assert(l > 0.9999 && l < 1.0001);
 #endif
+
+		bool checks_failed = false;
+		struct xrt_vec3 tmp;
+
+		for (int p = 0; p < 3; p++) {
+			struct xrt_vec3 tmpblob;
 
 			/* This pose must yield a projection of the anchor
 			 * point, or something is really wrong */
-			math_quat_rotate_vec3(&pose.orientation, &model_leds[0]->pos, &checkpos);
+			math_quat_rotate_vec3(&pose.orientation, &model_leds[p]->pos, &checkpos);
 			math_vec3_accum(&pose.position, &checkpos);
 
 			/* And should be camera facing in this pose */
-			math_quat_rotate_vec3(&pose.orientation, &model_leds[0]->dir, &checkdir);
+			math_quat_rotate_vec3(&pose.orientation, &model_leds[p]->dir, &checkdir);
 			math_vec3_normalize(&checkpos);
 
 			double facing_dot = m_vec3_dot(checkpos, checkdir);
@@ -477,49 +492,80 @@ check_led_against_model_subset(struct correspondence_search *cs,
 			 * the camera (that it's at worst perpendicular). Controller LEDs
 			 * can be visible at that angle */
 			if (facing_dot > 0.0) {
-				// Anchor LED not facing the camera -> invalid pose
-				continue;
+				// LED not facing the camera -> invalid pose
+				checks_failed = true;
+				break;
 			}
+
+			tmpblob.x = blobs[p]->point_homog[0];
+			tmpblob.y = blobs[p]->point_homog[1];
+			tmpblob.z = blobs[p]->point_homog[2];
 
 			/* Calculate the image plane projection of the anchor
 			 * LED position and check it's within 2.5mm of where it
 			 * should be, to catch spurious failures in lambdatwist */
-			struct xrt_vec3 tmp;
 			math_vec3_scalar_mul(1.0 / checkpos.z, &checkpos);
-			tmp = m_vec3_sub(checkpos, blob0);
+			tmp = m_vec3_sub(checkpos, tmpblob);
 			l = m_vec3_len(tmp);
 			if (!(l <= 0.0025)) {
 				printf(
 				    "Error pose candidate orient %f %f %f %f pos %f %f %f "
-				    "Anchor LED %f %f %f projected to %f %f %f (err %f)\n",
+				    "LED %d @ %f %f %f projected to %f %f %f (err %f)\n",
 				    pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w,
-				    pose.position.x, pose.position.y, pose.position.z, blob0.x, blob0.y, blob0.z,
-				    checkpos.x, checkpos.y, checkpos.z, l);
-				continue; /* FIXME: Figure out why this happened */
+				    pose.position.x, pose.position.y, pose.position.z, p, tmpblob.x, tmpblob.y,
+				    tmpblob.z, checkpos.x, checkpos.y, checkpos.z, l);
+				checks_failed = true;
+				break; /* FIXME: Figure out why this happened */
 			}
+#if !CHECK_ALL_PROJECTIONS
+			break;
+#else
+			struct xrt_vec2 reprojected;
 
-			/* check against the 4th point to check the proposed P3P solution */
-			math_quat_rotate_vec3(&pose.orientation, xcheck, &checkpos);
-			math_vec3_accum(&pose.position, &checkpos);
-			math_vec3_scalar_mul(1.0 / checkpos.z, &checkpos);
+			project_led_point(&model_leds[p]->pos, &pose, cs->calib, &reprojected);
+			double xdiff = reprojected.x - blobs[p]->blob->x;
+			double ydiff = reprojected.y - blobs[p]->blob->y;
 
-			/* Subtract projected point from reference point to check error */
-			tmp = m_vec3_sub(checkpos, checkblob);
-			float distance = m_vec3_len(tmp);
-
-			/* Check that the 4th point projected to within its blob */
-			if (distance <= blobs[3]->max_size) {
-#if 0
-        /* Convert back to pixels for the debug output */
-        ovec3f_multiply_scalar (&checkpos, cs->camera_matrix->m[0], &checkpos);
-
-  	    printf ("model %u pose candidate orient %f %f %f %f pos %f %f %f\n",
-            mi->id, pose.orient.x, pose.orient.y, pose.orient.z, pose.orient.w,
-            pose.pos.x, pose.pos.y, pose.pos.z);
-        printf ("4th point @ %f %f offset %f pixels\n",
-            checkpos.x, checkpos.y, distance * cs->camera_matrix->m[0]);
+			printf("Blob %d @ %f,%f should match LED %d projection %f %f (err %f)\n", p, blobs[p]->blob->x,
+			       blobs[p]->blob->y, model_leds[p]->id, reprojected.x, reprojected.y,
+			       sqrt(xdiff * xdiff + ydiff * ydiff));
 #endif
-				if (correspondence_search_project_pose(cs, model, &pose, mi, depth)) {
+		}
+
+		if (checks_failed) {
+			continue;
+		}
+
+		/* check against the 4th point to check the proposed P3P solution */
+		math_quat_rotate_vec3(&pose.orientation, xcheck, &checkpos);
+		math_vec3_accum(&pose.position, &checkpos);
+		math_vec3_scalar_mul(1.0 / checkpos.z, &checkpos);
+
+		/* Subtract projected point from undistorted 4th reference point to check error */
+		struct xrt_vec3 checkblob;
+		checkblob.x = blobs[3]->point_homog[0];
+		checkblob.y = blobs[3]->point_homog[1];
+		checkblob.z = blobs[3]->point_homog[2];
+
+		tmp = m_vec3_sub(checkpos, checkblob);
+		float distance = m_vec3_len(tmp);
+
+#if 0
+		/* Convert back to pixels for the debug output */
+		math_vec3_scalar_mul(cs->calib->calib.fx, &checkpos);
+		math_vec3_scalar_mul(cs->calib->calib.fx, &checkblob);
+
+		printf ("model %u pose candidate orient %f %f %f %f pos %f %f %f\n",
+		    mi->id, pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w,
+		    pose.position.x, pose.position.y, pose.position.z);
+		printf ("4th point @ %f %f offset %f (undistorted) pixels from %f %f (blob_size %f)\n",
+		    checkpos.x, checkpos.y, distance * cs->calib->calib.fx,
+		    checkblob.x, checkblob.y, blobs[3]->max_dist * cs->calib->calib.fx);
+
+#endif
+		/* Check that the 4th point projected to within its blob */
+		if (distance <= blobs[3]->max_dist) {
+			if (correspondence_search_project_pose(cs, model, &pose, mi, depth) || 1) {
 #if 0
           printf ("  P4P points %f,%f,%f -> %f %f\n"
                   "         %f,%f,%f -> %f %f\n"
@@ -535,7 +581,6 @@ check_led_against_model_subset(struct correspondence_search *cs,
                 checkblob.x,
                 checkblob.y);
 #endif
-				}
 			}
 		}
 	}
@@ -854,8 +899,9 @@ correspondence_search_find_one_pose(struct correspondence_search *cs,
 		             (search_flags & CS_FLAG_MATCH_GRAVITY) ? "aligned" : "unaligned", mi.id,
 		             mi.best_score.matched_blobs, mi.best_score.visible_leds, mi.best_score.reprojection_error);
 		DEBUG_TIMING("# Found at LED depth %d blob depth %d after %f ms of %f ms\n", mi.best_pose_led_depth,
-		             mi.best_pose_blob_depth, (mi.best_pose_found_time - mi.search_start_time) * 1000.0,
-		             (os_monotonic_get_ns() - mi.search_start_time) * 1000.0);
+		             mi.best_pose_blob_depth,
+		             (float)(mi.best_pose_found_time - mi.search_start_time) / 1000000.0,
+		             (float)(os_monotonic_get_ns() - mi.search_start_time) / 1000000.0);
 		DEBUG_TIMING("# pose orient %f %f %f %f pos %f %f %f\n", mi.best_pose.orientation.x,
 		             mi.best_pose.orientation.y, mi.best_pose.orientation.z, mi.best_pose.orientation.w,
 		             mi.best_pose.position.x, mi.best_pose.position.y, mi.best_pose.position.z);

@@ -38,7 +38,7 @@ struct cs_image_point
 
 	double point_homog[3]; // Homogeneous version of the point
 	double size[2];        // w/h of the blob, in homogeneous coordinates
-	double max_size;       // Max of W/H
+	double max_dist;       // norm of (W/H) for distance checks
 
 	/* List of the nearest blobs, filtered for the active model */
 	int num_neighbours;
