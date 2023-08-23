@@ -793,7 +793,7 @@ search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi
 		struct cs_image_point **all_neighbours = cs->blob_neighbours[b];
 		struct cs_image_point *anchor = cs->points + b;
 		int out_index = 0, in_index;
-		int led_id = anchor->blob->led_id;
+		uint16_t led_id = anchor->blob->led_id;
 
 		if ((mi->search_flags & CS_FLAG_MATCH_ALL_BLOBS) || led_id == LED_INVALID_ID ||
 		    LED_OBJECT_ID(led_id) == mi->id) {

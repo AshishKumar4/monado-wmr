@@ -18,7 +18,7 @@
 struct constellation_led
 {
 	// LED
-	uint32_t id;
+	uint8_t id;
 	// position relative to the device model in micrometers
 	struct xrt_vec3 pos;
 	// Normal
@@ -30,14 +30,14 @@ struct constellation_led
 struct constellation_led_model
 {
 	// Device ID
-	uint32_t id;
+	uint8_t id;
 
 	struct constellation_led *leds;
 	uint8_t num_leds;
 };
 
 void
-constellation_led_model_init(uint32_t device_id, struct constellation_led_model *led_model, uint8_t num_leds);
+constellation_led_model_init(uint8_t device_id, struct constellation_led_model *led_model, uint8_t num_leds);
 void
 constellation_led_model_dump(struct constellation_led_model *led_model, const char *desc);
 void

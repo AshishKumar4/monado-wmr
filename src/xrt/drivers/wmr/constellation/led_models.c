@@ -16,7 +16,7 @@
 #endif
 
 void
-constellation_led_model_init(uint32_t device_id, struct constellation_led_model *led_model, uint8_t num_leds)
+constellation_led_model_init(uint8_t device_id, struct constellation_led_model *led_model, uint8_t num_leds)
 {
 	led_model->id = device_id;
 	led_model->leds = calloc(num_leds, sizeof(struct constellation_led));

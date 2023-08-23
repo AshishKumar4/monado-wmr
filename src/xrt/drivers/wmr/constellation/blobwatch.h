@@ -22,11 +22,11 @@ extern "C" {
 #endif
 
 #define MAX_BLOBS_PER_FRAME 100
-#define LED_INVALID_ID -1
-#define LED_NOISE_ID -2
-#define LED_LOCAL_ID(l) (((l) < 0) ? (l) : (l)&0xFF)
-#define LED_OBJECT_ID(l) (((l) < 0) ? (l) : (l) >> 8)
-#define LED_MAKE_ID(o, n) ((o) << 8 | (n))
+#define LED_INVALID_ID ((uint16_t)(-1))
+#define LED_NOISE_ID ((uint16_t)(-2))
+#define LED_LOCAL_ID(l) (((l) == LED_INVALID_ID) ? (l) : (l)&0xFF)
+#define LED_OBJECT_ID(l) (((l) == LED_INVALID_ID) ? (l) : (l) >> 8)
+#define LED_MAKE_ID(o, n) ((uint16_t)((uint16_t)(o)) << 8 | ((uint16_t)(n)))
 
 /* 0x24 works much better for Rift CV1, but the threshold needs
  * to be higher for DK2 which has more background bleed and bigger
@@ -63,8 +63,8 @@ struct blob
 	int16_t track_index;
 
 	uint32_t id_age;
-	int led_id;
-	int prev_led_id;
+	uint16_t led_id;
+	uint16_t prev_led_id;
 };
 
 /*
@@ -89,7 +89,7 @@ blobwatch_free(blobwatch *bw);
 void
 blobwatch_process(blobwatch *bw, struct xrt_frame *frame, blobservation **output);
 void
-blobwatch_update_labels(blobwatch *bw, blobservation *ob, int device_id);
+blobwatch_update_labels(blobwatch *bw, blobservation *ob, uint8_t device_id);
 void
 blobwatch_release_observation(blobwatch *bw, blobservation *ob);
 struct blob *

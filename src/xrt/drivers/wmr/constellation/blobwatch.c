@@ -588,7 +588,7 @@ blobwatch_find_blob_at(blobwatch *bw, int x, int y)
 }
 
 void
-blobwatch_update_labels(blobwatch *bw, blobservation *ob, int device_id)
+blobwatch_update_labels(blobwatch *bw, blobservation *ob, uint8_t device_id)
 {
 	/* Take the observation in ob and replace any labels for the given device in
 	 * the most recent observation with labels from this observation */

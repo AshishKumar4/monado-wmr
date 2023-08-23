@@ -256,7 +256,7 @@ pose_metrics_match_pose_to_blobs(struct xrt_pose *pose,
 
 	for (int i = 0; i < num_blobs; i++) {
 		struct blob *b = blobs + i;
-		int led_object_id = LED_OBJECT_ID(b->led_id);
+		uint32_t led_object_id = LED_OBJECT_ID(b->led_id);
 
 		/* Skip blobs which already have an ID not belonging to this device */
 		if (led_object_id != LED_INVALID_ID && led_object_id != led_model->id)
@@ -284,10 +284,10 @@ pose_metrics_match_pose_to_blobs(struct xrt_pose *pose,
 
 		if (b->led_id != LED_INVALID_ID) {
 			struct constellation_led *match_led = led_info->led;
-			int led_index = match_led->id;
-			if (b->led_id != LED_MAKE_ID(led_model->id, led_index)) {
-				printf("mismatched LED id %d/%d blob %d (@ %f,%f) has %d/%d\n", led_model->id,
-				       led_index, i, b->x, b->y, LED_OBJECT_ID(b->led_id), LED_LOCAL_ID(b->led_id));
+			uint8_t led_id = match_led->id;
+			if (b->led_id != LED_MAKE_ID(led_model->id, led_id)) {
+				printf("mismatched LED id %d/%d blob %d (@ %f,%f) has %d/%d\n", led_model->id, led_id,
+				       i, b->x, b->y, LED_OBJECT_ID(b->led_id), LED_LOCAL_ID(b->led_id));
 				all_led_ids_matched = false;
 			}
 		}
