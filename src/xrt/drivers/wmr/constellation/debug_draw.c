@@ -185,8 +185,14 @@ debug_draw_blobs(struct xrt_frame *rgb_out, struct blobservation *bwobs, struct 
 
 			/* Tint known blobs by their device ID in the image */
 			if (b->led_id != LED_INVALID_ID) {
-				int d = LED_OBJECT_ID(b->led_id);
-				assert(d < 3);
+				int dtype = LED_OBJECT_ID(b->led_id);
+				int d = -1;
+				switch (dtype) {
+				case XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER: d = 1; break;
+				case XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER: d = 2; break;
+				default: break;
+				}
+				assert(d != -1);
 
 				colour_rgb_rect(dest, width, out_stride, height, start_x, start_y, b->width, b->height,
 				                colours[d]);
