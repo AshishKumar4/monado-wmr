@@ -60,6 +60,37 @@ struct pose_metrics
 	struct xrt_vec3 pos_error;    /* Translation error (compared to a prior) */
 };
 
+struct pose_metrics_visible_led_info
+{
+	struct constellation_led *led;
+	double led_radius_px;   /* Expected max size of the LED in pixels at that distance */
+	struct xrt_vec2 pos_px; /* Projected position of the LED (pixels) */
+	struct xrt_vec3 pos_m;  /* Projected physical position of the LED (metres) */
+	double facing_dot;      /* Dot product between LED and camera */
+	struct blob *matched_blob;
+};
+
+struct pose_metrics_blob_match_info
+{
+	struct pose_metrics_visible_led_info visible_leds[MAX_OBJECT_LEDS];
+	int num_visible_leds;
+
+	bool all_led_ids_matched;
+	int matched_blobs;
+	int unmatched_blobs;
+
+	double reprojection_error;
+	struct pose_rect bounds;
+};
+
+void
+pose_metrics_match_pose_to_blobs(struct xrt_pose *pose,
+                                 struct blob *blobs,
+                                 int num_blobs,
+                                 struct constellation_led_model *led_model,
+                                 struct camera_model *calib,
+                                 struct pose_metrics_blob_match_info *match_info);
+
 void
 pose_metrics_evaluate_pose(struct pose_metrics *score,
                            struct xrt_pose *pose,

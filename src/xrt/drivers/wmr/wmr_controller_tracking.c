@@ -27,6 +27,8 @@
 
 DEBUG_GET_ONCE_LOG_OPTION(wmr_log, "WMR_LOG", U_LOGGING_INFO)
 
+#define RAD_TO_DEG(RAD) ((RAD)*180. / M_PI)
+
 #define WMR_TRACE(c, ...) U_LOG_IFL_T(c->log_level, __VA_ARGS__)
 #define WMR_DEBUG(c, ...) U_LOG_IFL_D(c->log_level, __VA_ARGS__)
 #define WMR_INFO(c, ...) U_LOG_IFL_I(c->log_level, __VA_ARGS__)
@@ -197,6 +199,52 @@ wmr_controller_tracker_node_break_apart(struct xrt_frame_node *node)
 	DRV_TRACE_MARKER();
 }
 
+static void
+mark_matching_blobs(struct wmr_controller_tracker *wct,
+                    struct xrt_pose *pose,
+                    struct blobservation *bwobs,
+                    struct constellation_led_model *led_model,
+                    struct camera_model *calib)
+{
+	/* First clear existing blob labels for this device */
+	int i;
+	for (i = 0; i < bwobs->num_blobs; i++) {
+		struct blob *b = bwobs->blobs + i;
+		uint32_t led_object_id = LED_OBJECT_ID(b->led_id);
+
+		/* Skip blobs which already have an ID not belonging to this device */
+		if (led_object_id != led_model->id) {
+			continue;
+		}
+
+		if (b->led_id != LED_INVALID_ID) {
+			b->prev_led_id = b->led_id;
+		}
+		b->led_id = LED_INVALID_ID;
+	}
+
+	struct pose_metrics_blob_match_info blob_match_info;
+	pose_metrics_match_pose_to_blobs(pose, bwobs->blobs, bwobs->num_blobs, led_model, calib, &blob_match_info);
+
+	/* Iterate the visible LEDs and mark matching blobs with this device ID and LED ID */
+	for (i = 0; i < blob_match_info.num_visible_leds; i++) {
+		struct pose_metrics_visible_led_info *led_info = blob_match_info.visible_leds + i;
+		struct constellation_led *led = led_info->led;
+
+		if (led_info->matched_blob != NULL) {
+			struct blob *b = led_info->matched_blob;
+
+			b->led_id = LED_MAKE_ID(led_model->id, led->id);
+			WMR_DEBUG(wct, "Marking LED %d/%d at %f,%f angle %f now %d (was %d)", led_model->id, led->id,
+			          b->x, b->y, RAD_TO_DEG(acosf(led_info->facing_dot)), b->led_id, b->prev_led_id);
+		} else {
+			WMR_DEBUG(wct, "No blob for device %d LED %d @ %f,%f size %f px angle %f", led_model->id,
+			          led->id, led_info->pos_px.x, led_info->pos_px.y, 2 * led_info->led_radius_px,
+			          RAD_TO_DEG(acosf(led_info->facing_dot)));
+		}
+	}
+}
+
 // Fast frame processing: blob extraction and match to existing predictions
 static void
 wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt_frame *xf)
@@ -286,6 +334,11 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 					         "blobs of %u visible LEDs",
 					         c, device->led_model.id, score.match_flags, score.matched_blobs,
 					         score.visible_leds);
+
+					mark_matching_blobs(wct, &obj_cam_pose, frames_bwobs[c], &device->led_model,
+					                    &cam->camera_model);
+
+					blobwatch_update_labels(cam->bw, frames_bwobs[c], device->led_model.id);
 				}
 			}
 		}

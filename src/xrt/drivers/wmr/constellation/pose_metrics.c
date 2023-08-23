@@ -30,7 +30,10 @@ expand_rect(struct pose_rect *bounds, double x, double y, double w, double h)
 }
 
 static int
-find_best_matching_led(struct visible_led_info *led_points, int num_leds, struct blob *blob, double *out_sqerror)
+find_best_matching_led(struct pose_metrics_visible_led_info *led_points,
+                       int num_leds,
+                       struct blob *blob,
+                       double *out_sqerror)
 {
 	double best_z;
 	int best_led_index = -1;
@@ -38,7 +41,7 @@ find_best_matching_led(struct visible_led_info *led_points, int num_leds, struct
 	int leds_within_range = 0;
 
 	for (int i = 0; i < num_leds; i++) {
-		struct visible_led_info *led_info = led_points + i;
+		struct pose_metrics_visible_led_info *led_info = led_points + i;
 		struct xrt_vec2 *pos_px = &led_info->pos_px;
 		double led_radius_px = led_info->led_radius_px;
 		double dx = fabs(pos_px->x - blob->x);
@@ -64,7 +67,7 @@ find_best_matching_led(struct visible_led_info *led_points, int num_leds, struct
 		U_LOG_T("Multiple LEDs match blob @ %f, %f. best_sqerror %f LED %d z %f", blob->x, blob->y,
 		        best_sqerror, best_led_index, led_points[best_led_index].pos_m.z);
 		for (int i = 0; i < num_leds; i++) {
-			struct visible_led_info *led_info = led_points + i;
+			struct pose_metrics_visible_led_info *led_info = led_points + i;
 			struct xrt_vec2 *pos_px = &led_info->pos_px;
 			struct xrt_vec3 *pos_m = &led_info->pos_m;
 			double led_radius_px = led_info->led_radius_px;
@@ -140,10 +143,9 @@ project_led_points(struct constellation_led_model *led_model,
 
 static void
 get_visible_leds_and_bounds(struct xrt_pose *pose,
-                            int device_id,
                             struct constellation_led_model *led_model,
                             struct camera_model *calib,
-                            struct visible_led_info *visible_led_points,
+                            struct pose_metrics_visible_led_info *visible_led_points,
                             int *num_visible_leds,
                             struct pose_rect *bounds)
 {
@@ -195,7 +197,7 @@ get_visible_leds_and_bounds(struct xrt_pose *pose,
 
 #if 0
 		printf ("device %d LED %u pos %f,%f,%f -> %f,%f (pos %f,%f,%f metres) dir %f %f %f dot %f visible %d\n",
-			device_id, i, leds[i].pos.x, leds[i].pos.y, leds[i].pos.z,
+			led_model->id, i, leds[i].pos.x, leds[i].pos.y, leds[i].pos.z,
 			led_pos_px->x, led_pos_px->y,
 			led_pos_m.x, led_pos_m.y, led_pos_m.z,
 			normal.x, normal.y, normal.z, facing_dot,
@@ -206,12 +208,12 @@ get_visible_leds_and_bounds(struct xrt_pose *pose,
 		 * to the LED, but the normal points toward the camera, so
 		 * we need to compare against 180 - LED_ANGLE here */
 		if (facing_dot < cos(DEG_TO_RAD(180.0 - LED_ANGLE))) {
-			struct visible_led_info *led_info = visible_led_points + (*num_visible_leds);
+			struct pose_metrics_visible_led_info *led_info = visible_led_points + (*num_visible_leds);
 			led_info->led = leds + i;
 			led_info->pos_px = *led_pos_px;
 			led_info->pos_m = led_pos_m;
 			led_info->led_radius_px = led_radius_px;
-			led_info->matched = false;
+			led_info->matched_blob = NULL;
 			led_info->facing_dot = facing_dot;
 			(*num_visible_leds)++;
 
@@ -231,6 +233,70 @@ get_visible_leds_and_bounds(struct xrt_pose *pose,
 }
 
 void
+pose_metrics_match_pose_to_blobs(struct xrt_pose *pose,
+                                 struct blob *blobs,
+                                 int num_blobs,
+                                 struct constellation_led_model *led_model,
+                                 struct camera_model *calib,
+                                 struct pose_metrics_blob_match_info *match_info)
+{
+	struct pose_rect *bounds = &match_info->bounds;
+
+	match_info->reprojection_error = 0.0;
+	match_info->matched_blobs = 0;
+	match_info->unmatched_blobs = 0;
+
+	get_visible_leds_and_bounds(pose, led_model, calib, match_info->visible_leds, &match_info->num_visible_leds,
+	                            &match_info->bounds);
+
+	// printf("Bounding box for pose is %f,%f -> %f,%f\n", bounds.left, bounds.top, bounds.right, bounds.bottom);
+
+	/* Iterate the blobs and see which ones are within the bounding box and have a matching LED */
+	bool all_led_ids_matched = true;
+
+	for (int i = 0; i < num_blobs; i++) {
+		struct blob *b = blobs + i;
+		int led_object_id = LED_OBJECT_ID(b->led_id);
+
+		/* Skip blobs which already have an ID not belonging to this device */
+		if (led_object_id != LED_INVALID_ID && led_object_id != led_model->id)
+			continue;
+
+		if (b->x < bounds->left || b->y < bounds->top || b->x > bounds->right || b->y > bounds->bottom) {
+			/* Ignore blobs that are outside the pose bounding box */
+			continue;
+		}
+
+		double sqerror;
+
+		int match_led_index =
+		    find_best_matching_led(match_info->visible_leds, match_info->num_visible_leds, b, &sqerror);
+		if (match_led_index < 0) {
+			match_info->unmatched_blobs++;
+			continue;
+		}
+
+		match_info->reprojection_error += sqerror;
+		match_info->matched_blobs++;
+
+		struct pose_metrics_visible_led_info *led_info = match_info->visible_leds + match_led_index;
+		led_info->matched_blob = b;
+
+		if (b->led_id != LED_INVALID_ID) {
+			struct constellation_led *match_led = led_info->led;
+			int led_index = match_led->id;
+			if (b->led_id != LED_MAKE_ID(led_model->id, led_index)) {
+				printf("mismatched LED id %d/%d blob %d (@ %f,%f) has %d/%d\n", led_model->id,
+				       led_index, i, b->x, b->y, LED_OBJECT_ID(b->led_id), LED_LOCAL_ID(b->led_id));
+				all_led_ids_matched = false;
+			}
+		}
+	}
+
+	match_info->all_led_ids_matched = all_led_ids_matched;
+}
+
+void
 pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
                                       struct xrt_pose *pose,
                                       bool prior_must_match,
@@ -240,7 +306,7 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
                                       struct blob *blobs,
                                       int num_blobs,
                                       int device_id,
-                                      struct constellation_led_model *leds_model,
+                                      struct constellation_led_model *led_model,
                                       struct camera_model *calib,
                                       struct pose_rect *out_bounds)
 {
@@ -250,78 +316,32 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 	 * 3. For blobs within the bounding box, see if they match a LED
 	 * 4. Count up the matched LED<->Blob correspondences, and the reprojection error
 	 */
-	struct visible_led_info visible_led_points[MAX_OBJECT_LEDS];
+	struct pose_metrics_blob_match_info blob_match_info;
 
-	struct pose_rect bounds = {
-	    0,
-	};
-	int i;
+	pose_metrics_match_pose_to_blobs(pose, blobs, num_blobs, led_model, calib, &blob_match_info);
 
-	assert(leds_model->num_leds > 0);
+	assert(led_model->num_leds > 0);
 	assert(num_blobs > 0);
 	assert(score != NULL);
 
 	score->match_flags = 0;
-	score->reprojection_error = 0.0;
-	score->matched_blobs = 0;
-	score->unmatched_blobs = 0;
-	score->visible_leds = 0;
+	score->reprojection_error = blob_match_info.reprojection_error;
+	score->matched_blobs = blob_match_info.matched_blobs;
+	score->unmatched_blobs = blob_match_info.unmatched_blobs;
+	score->visible_leds = blob_match_info.num_visible_leds;
 
-	get_visible_leds_and_bounds(pose, device_id, leds_model, calib, visible_led_points, &score->visible_leds,
-	                            &bounds);
-
-	if (score->visible_leds < 5) {
-		goto done;
-	}
-
-	// printf("Bounding box for pose is %f,%f -> %f,%f\n", bounds.left, bounds.top, bounds.right, bounds.bottom);
-
-	/* Iterate the blobs and see which ones are within the bounding box and have a matching LED */
-	bool all_led_ids_matched = true;
-
-	for (i = 0; i < num_blobs; i++) {
-		struct blob *b = blobs + i;
-		int led_object_id = LED_OBJECT_ID(b->led_id);
-
-		/* Skip blobs which already have an ID not belonging to this device */
-		if (led_object_id != LED_INVALID_ID && led_object_id != device_id)
-			continue;
-
-		if (b->x >= bounds.left && b->y >= bounds.top && b->x < bounds.right && b->y < bounds.bottom) {
-			double sqerror;
-
-			int match_led_index =
-			    find_best_matching_led(visible_led_points, score->visible_leds, b, &sqerror);
-			if (match_led_index >= 0) {
-				if (b->led_id != LED_INVALID_ID) {
-					struct visible_led_info *led_info = visible_led_points + match_led_index;
-					struct constellation_led *match_led = led_info->led;
-					int led_index = match_led->id;
-					if (b->led_id != LED_MAKE_ID(device_id, led_index)) {
-						printf("mismatched LED id %d/%d blob %d (@ %f,%f) has %d/%d\n",
-						       device_id, led_index, i, b->x, b->y, device_id,
-						       LED_LOCAL_ID(b->led_id));
-						all_led_ids_matched = false;
-					}
-				}
-
-				score->reprojection_error += sqerror;
-				score->matched_blobs++;
-			} else {
-				score->unmatched_blobs++;
-			}
-		}
-	}
-
-	if (score->matched_blobs < 5)
-		goto done;
-
-	if (all_led_ids_matched)
+	if (blob_match_info.all_led_ids_matched) {
 		score->match_flags |= POSE_MATCH_LED_IDS;
+	}
+
+	/* Don't add GOOD/STRONG flags if matched fewer than 3 blobs */
+	if (score->matched_blobs < 3) {
+		goto done;
+	}
 
 	double error_per_led = score->reprojection_error / score->matched_blobs;
 
-	/* At this point, we have at least 5 LEDs and their blobs matching */
+	/* At this point, we have at least 3 LEDs and their blobs matching */
 
 	/* If we have a pose prior, calculate the rotation and translation error and match flags as needed */
 	if (pose_prior) {
@@ -369,7 +389,7 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 
 done:
 	if (out_bounds)
-		*out_bounds = bounds;
+		*out_bounds = blob_match_info.bounds;
 }
 
 void
@@ -378,12 +398,12 @@ pose_metrics_evaluate_pose(struct pose_metrics *score,
                            struct blob *blobs,
                            int num_blobs,
                            int device_id,
-                           struct constellation_led_model *leds_model,
+                           struct constellation_led_model *led_model,
                            struct camera_model *calib,
                            struct pose_rect *out_bounds)
 {
 	pose_metrics_evaluate_pose_with_prior(score, pose, false, NULL, NULL, NULL, blobs, num_blobs, device_id,
-	                                      leds_model, calib, out_bounds);
+	                                      led_model, calib, out_bounds);
 }
 
 /* Return true if new_score is for a more likely pose than old_score */
