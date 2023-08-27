@@ -109,11 +109,15 @@ wmr_bt_connection_run_thread(void *ptr)
 	while (os_thread_helper_is_running_locked(&conn->controller_thread)) {
 		os_thread_helper_unlock(&conn->controller_thread);
 
-		// Does not block.
-		if (!read_packets(conn)) {
+		bool res = read_packets(conn);
+
+		os_thread_helper_lock(&conn->controller_thread);
+
+		if (!res) {
 			break;
 		}
 	}
+	os_thread_helper_unlock(&conn->controller_thread);
 
 	WMR_DEBUG(conn, "WMR Controller (Bluetooth): Exiting reading thread.");
 
