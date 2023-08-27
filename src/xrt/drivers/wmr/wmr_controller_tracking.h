@@ -11,6 +11,7 @@
 #include <stdint.h>
 
 #include "os/os_threading.h"
+#include "tracking/t_tracking.h"
 #include "util/u_sink.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_frame.h"
@@ -30,8 +31,9 @@ wmr_controller_tracker_connection_disconnect(struct wmr_controller_tracker_conne
 
 int
 wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
-                              struct xrt_device *reference_xdev,
+                              struct xrt_device *hmd_xdev,
                               struct wmr_hmd_config *hmd_cfg,
+                              struct t_slam_calibration *slam_calib,
                               struct wmr_controller_tracker **out_tracker,
                               struct xrt_frame_sink **out_sink);
 

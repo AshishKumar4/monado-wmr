@@ -1718,7 +1718,6 @@ wmr_hmd_setup_trackers(struct wmr_hmd *wh, struct xrt_slam_sinks *out_sinks, str
 	(void)snprintf(wh->gui.hand_status, sizeof(wh->gui.hand_status), "%s", hand_status);
 
 	struct t_stereo_camera_calibration *stereo_calib = wmr_hmd_create_stereo_camera_calib(wh);
-	wmr_hmd_fill_slam_calibration(wh);
 
 	// Initialize 3DoF tracker
 	m_imu_3dof_init(&wh->fusion.i3dof, M_IMU_3DOF_USE_GRAVITY_DUR_20MS);
@@ -1988,10 +1987,13 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 	// Switch on IMU on the HMD.
 	hololens_sensors_enable_imu(wh);
 
+	// Compute the slam calibration for SLAM or controller tracking
+	wmr_hmd_fill_slam_calibration(wh);
+
 	// Set up controller 6dof tracker
 	struct xrt_frame_sink *out_controller_sink = NULL;
-	if (wmr_controller_tracker_create(&wh->tracking.xfctx, &wh->base, &wh->config, &wh->controller_tracker,
-	                                  &out_controller_sink) != 0) {
+	if (wmr_controller_tracker_create(&wh->tracking.xfctx, &wh->base, &wh->config, &wh->tracking.slam_calib,
+	                                  &wh->controller_tracker, &out_controller_sink) != 0) {
 		WMR_WARN(wh, "Failed to create Controller Tracker. Controllers will not be 6dof");
 	}
 

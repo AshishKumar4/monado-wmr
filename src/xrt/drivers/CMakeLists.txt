@@ -547,6 +547,8 @@ if(XRT_BUILD_DRIVER_WMR)
 		wmr/constellation/led_models.h
 		wmr/constellation/pose_metrics.c
 		wmr/constellation/pose_metrics.h
+		wmr/constellation/sample.c
+		wmr/constellation/sample.h
 		)
 	target_link_libraries(
 		drv_wmr
