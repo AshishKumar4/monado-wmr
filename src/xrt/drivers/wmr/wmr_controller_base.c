@@ -646,14 +646,14 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	wcb->timesync_counter = 2;
 	wcb->timesync_led_intensity = 200;
 	wcb->timesync_val2 = 800;
-	wcb->timesync_time_offset = 0;
+	wcb->timesync_time_offset = 7;
 
 	wcb->timesync_led_intensity_uvar =
 	    (struct u_var_draggable_u16){.val = &wcb->timesync_led_intensity, .min = 1, .max = 399, .step = 1};
 	wcb->timesync_val2_uvar =
 	    (struct u_var_draggable_u16){.val = &wcb->timesync_val2, .min = 0, .max = 1023, .step = 1};
 	wcb->timesync_time_offset_uvar =
-	    (struct u_var_draggable_u16){.val = &wcb->timesync_time_offset, .min = 0, .max = 8, .step = 1};
+	    (struct u_var_draggable_u16){.val = &wcb->timesync_time_offset, .min = 0, .max = 7, .step = 1};
 
 	u_var_add_root(wcb, wcb->base.str, true);
 	u_var_add_gui_header(wcb, NULL, "IMU");
@@ -754,7 +754,8 @@ wmr_controller_base_send_timesync(struct wmr_controller_base *wcb)
 	os_mutex_lock(&wcb->conn_lock);
 	struct wmr_controller_connection *conn = wcb->wcc;
 	if (conn != NULL) {
-		uint64_t time_offset_us = wcb->timesync_time_offset * (U_TIME_1S_IN_NS / 360000);
+		/* Each timesync_time_offset step is 1/8th of a 90Hz frame */
+		uint64_t time_offset_us = wcb->timesync_time_offset * (U_TIME_1S_IN_NS / 720000);
 		uint8_t ts_ctr = wcb->timesync_counter++;
 		if (wcb->timesync_counter == 4) {
 			wcb->timesync_counter = 1;

@@ -117,11 +117,15 @@ struct wmr_controller_tracker
 	struct wmr_controller_tracker_camera cam[WMR_MAX_CAMERAS];
 	int cam_count;
 
+	//! Controller LED timesync tracking
+	uint64_t avg_frame_duration;
+	uint64_t next_slam_frame_ts;
+
 	/* Debug */
 	enum u_logging_level log_level;
 
-	uint64_t last_timestamp;
-	uint64_t last_sequence;
+	uint64_t last_frame_timestamp;
+	uint64_t last_frame_sequence;
 
 	uint64_t last_fast_analysis_ms;
 	uint64_t last_blob_analysis_ms;
@@ -191,22 +195,40 @@ wmr_controller_tracker_receive_frame(struct xrt_frame_sink *sink, struct xrt_fra
 	assert(xf->format == XRT_FORMAT_L8);
 
 	/* The frame cadence is SLAM/controller/controller, and we need to pass the
-	 * estimate of the next SLAM frame timestamp to the timesync */
-	bool is_second_frame = wct->last_sequence + 1 == xf->source_sequence;
-	wct->last_timestamp = xf->timestamp;
-	wct->last_sequence = xf->source_sequence;
+	 * estimate of the next SLAM frame timestamp to the timesync. Only
+	 * controller frames get passed to here, so the 2nd sequential controller
+	 * frame is the one right before the next SLAM frame */
+	bool is_second_frame = (wct->last_frame_sequence + 1) == xf->source_sequence;
 
 	os_mutex_lock(&wct->tracked_controller_lock);
 
 	// Update the controller timesync estimate
+	timepoint_ns next_slam_ts;
+	timepoint_ns frame_duration = 0;
 	if (is_second_frame) {
-		timepoint_ns next_slam_ts = (timepoint_ns)(xf->timestamp) + U_TIME_1S_IN_NS / 90;
+		frame_duration = xf->timestamp - wct->last_frame_timestamp;
+		next_slam_ts = (timepoint_ns)(xf->timestamp) + wct->avg_frame_duration;
+	} else if (wct->last_frame_sequence != 0) {
+		frame_duration = (xf->timestamp - wct->last_frame_timestamp) / 2;
+		next_slam_ts = (timepoint_ns)(xf->timestamp) + 2 * wct->avg_frame_duration;
+	}
+	if (wct->last_frame_timestamp != 0 && frame_duration > 0 && frame_duration < (2 * U_TIME_1S_IN_NS / 90)) {
+		wct->avg_frame_duration = (frame_duration + (29 * wct->avg_frame_duration)) / 30;
+	}
+
+	/* If the estimate of the next SLAM frame moves by more than 1ms, update the controllers */
+	int64_t slam_ts_diff = next_slam_ts - wct->next_slam_frame_ts;
+	if (llabs(slam_ts_diff) > U_TIME_1MS_IN_NS) {
 		for (int i = 0; i < wct->num_controllers; i++) {
 			wmr_controller_tracker_connection_notify_timesync(wct->controllers[i].connection, next_slam_ts);
 		}
 	}
+	wct->next_slam_frame_ts = next_slam_ts;
 
 	os_mutex_unlock(&wct->tracked_controller_lock);
+
+	wct->last_frame_timestamp = xf->timestamp;
+	wct->last_frame_sequence = xf->source_sequence;
 
 	xrt_sink_push_frame(wct->fast_q_sink, xf);
 }
@@ -560,6 +582,9 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 	wct->log_level = debug_get_log_option_wmr_log();
 	wct->hmd_xdev = hmd_xdev;
 
+	/* Init frame duration to 90fps */
+	wct->avg_frame_duration = U_TIME_1S_IN_NS / 90;
+
 	// Set up the per-camera constellation tracking pieces config and pose
 	wct->cam_count = slam_calib->cam_count;
 
@@ -627,7 +652,8 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 	u_var_add_root(wct, "WMR Controller Tracker", false);
 	u_var_add_log_level(wct, &wct->log_level, "Log Level");
 	u_var_add_ro_i32(wct, &wct->num_controllers, "Num Controllers");
-	u_var_add_ro_u64(wct, &wct->last_timestamp, "Last Frame Timestamp");
+	u_var_add_ro_u64(wct, &wct->last_frame_timestamp, "Last Frame Timestamp");
+	u_var_add_ro_u64(wct, &wct->avg_frame_duration, "Average frame duration (ns)");
 	u_var_add_ro_u64(wct, &wct->last_blob_analysis_ms, "Blob tracking time (ms)");
 	u_var_add_ro_u64(wct, &wct->last_fast_analysis_ms, "Fast analysis time (ms)");
 	u_var_add_ro_u64(wct, &wct->last_long_analysis_ms, "Long analysis time (ms)");
