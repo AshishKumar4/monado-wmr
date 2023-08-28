@@ -29,13 +29,17 @@ struct tracking_sample_device_state
 	int dev_index;
 
 	/* Predicted device pose and error bounds from fusion, in world space */
-	struct xrt_pose capture_cam_pose;
-	struct xrt_vec3 obj_cam_pos_error;
-	struct xrt_vec3 obj_cam_rot_error;
+	struct xrt_pose prior_pose;
+	struct xrt_vec3 prior_pos_error;
+	struct xrt_vec3 prior_rot_error;
 	float gravity_error_rad; /* Gravity vector uncertainty in radians 0..M_PI */
 
-	bool found_device_pose; /* Set to true when the device was found in this sample */
-	struct xrt_pose final_cam_pose;
+	/* Last observed pose, in world space */
+	bool have_last_seen_pose;
+	struct xrt_pose last_seen_pose;
+
+	bool found_device_pose;     /* Set to true when the device was found in this sample */
+	struct xrt_pose final_pose; /* Global pose that was detected */
 
 	struct pose_metrics score;
 	struct pose_metrics_blob_match_info blob_match_info;
@@ -49,6 +53,10 @@ struct tracking_sample_frame
 
 	/* The pose from which this view is observed */
 	struct xrt_pose pose;
+	/* Inverse of the pose from which this view is observed */
+	struct xrt_pose inv_pose;
+	/* Gravity vector as observed from this camera */
+	struct xrt_vec3 cam_gravity_vector;
 
 	/* blobs observation and the owning blobwatch */
 	blobwatch *bw;
@@ -57,6 +65,8 @@ struct tracking_sample_frame
 
 struct constellation_tracking_sample
 {
+	uint64_t timestamp; // Exposure timestamp
+
 	/* Device poses at capture time */
 	struct tracking_sample_device_state devices[CONSTELLATION_MAX_DEVICES];
 	uint8_t n_devices;
