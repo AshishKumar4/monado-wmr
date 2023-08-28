@@ -656,6 +656,7 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	    (struct u_var_draggable_u16){.val = &wcb->timesync_time_offset, .min = 0, .max = 7, .step = 1};
 
 	u_var_add_root(wcb, wcb->base.str, true);
+	u_var_add_log_level(wcb, &wcb->log_level, "Log Level");
 	u_var_add_gui_header(wcb, NULL, "IMU");
 	u_var_add_ro_vec3_f32(wcb, &wcb->last_imu.acc, "imu.accel");
 	u_var_add_ro_vec3_f32(wcb, &wcb->last_imu.gyro, "imu.gyro");
