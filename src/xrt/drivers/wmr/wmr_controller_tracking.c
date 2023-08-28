@@ -89,6 +89,7 @@ struct wmr_controller_tracker_camera
 
 	//! Debug output
 	struct u_sink_debug debug_sink;
+	struct xrt_pose debug_last_pose;
 };
 
 /*!
@@ -306,10 +307,10 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 	for (int i = 0; i < wct->cam_count; i++) {
 		struct wmr_controller_tracker_camera *cam = wct->cam + i;
 		struct tracking_sample_frame *view = sample->views + i;
-		blobservation *bwobs = NULL;
 
 		//! Calculate the view pose in this sample, from the HMD pose + IMU_camera pose
 		math_pose_transform(&xsr_base_pose.pose, &cam->imu_cam_pose, &view->pose);
+		cam->debug_last_pose = view->pose;
 
 		u_frame_create_roi(xf, cam->roi, &view->vframe);
 		view->bw = cam->bw;
@@ -318,11 +319,12 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 		blobwatch_process(cam->bw, view->vframe, &view->bwobs);
 		os_mutex_unlock(&cam->bw_lock);
 
-		if (bwobs == NULL) {
+		if (view->bwobs == NULL) {
 			cam->last_num_blobs = 0;
 			continue;
 		}
 
+		blobservation *bwobs = view->bwobs;
 		cam->last_num_blobs = bwobs->num_blobs;
 
 		printf("frame %" PRIu64 " TS %" PRIu64 " cam %d ROI %d,%d w/h %d,%d Blobs: %d\n", xf->source_sequence,
@@ -405,7 +407,7 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 		/* Send the sample for long analysis */
 		os_thread_helper_lock(&wct->long_analysis_thread);
 		if (wct->long_analysis_pending_sample != NULL) {
-			constellation_tracking_sample_free(sample);
+			constellation_tracking_sample_free(wct->long_analysis_pending_sample);
 		}
 		wct->long_analysis_pending_sample = sample;
 		os_thread_helper_signal_locked(&wct->long_analysis_thread);
@@ -534,6 +536,7 @@ wmr_controller_tracker_node_destroy(struct xrt_frame_node *node)
 	os_thread_helper_lock(&wct->long_analysis_thread);
 	if (wct->long_analysis_pending_sample != NULL) {
 		constellation_tracking_sample_free(wct->long_analysis_pending_sample);
+		wct->long_analysis_pending_sample = NULL;
 	}
 	os_thread_helper_unlock(&wct->long_analysis_thread);
 	/* Then release the thread helper */
@@ -662,6 +665,7 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 	for (int i = 0; i < wct->cam_count; i++) {
 		struct wmr_controller_tracker_camera *cam = wct->cam + i;
 		u_var_add_ro_i32(wct, &cam->last_num_blobs, "Num Blobs");
+		u_var_add_pose(wct, &cam->debug_last_pose, "Last view pose");
 
 		char cam_name[64];
 		sprintf(cam_name, "Cam %u", i);
