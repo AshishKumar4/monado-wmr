@@ -286,8 +286,10 @@ pose_metrics_match_pose_to_blobs(struct xrt_pose *pose,
 			struct constellation_led *match_led = led_info->led;
 			uint8_t led_id = match_led->id;
 			if (b->led_id != LED_MAKE_ID(led_model->id, led_id)) {
+#if 0
 				printf("mismatched LED id %d/%d blob %d (@ %f,%f) has %d/%d\n", led_model->id, led_id,
 				       i, b->x, b->y, LED_OBJECT_ID(b->led_id), LED_LOCAL_ID(b->led_id));
+#endif
 				all_led_ids_matched = false;
 			}
 		}
