@@ -23,7 +23,7 @@
 /* Keep enough history frames that the caller can keep hold
  * of a previous blobservation and pass it to the long term
  * tracker while we still have 2 left to ping-pong between */
-#define NUM_FRAMES_HISTORY 3
+#define NUM_FRAMES_HISTORY 5
 #define MAX_EXTENTS_PER_LINE 30
 
 /* Set to 1 to do extra array tracking consistency checks */
