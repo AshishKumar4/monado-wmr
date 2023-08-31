@@ -534,7 +534,7 @@ if(XRT_BUILD_DRIVER_WMR)
 		wmr/constellation/blobwatch.h
 		wmr/constellation/correspondence_search.c
 		wmr/constellation/correspondence_search.h
-		wmr/constellation/debug_draw.c
+		wmr/constellation/debug_draw.cpp
 		wmr/constellation/debug_draw.h
 		wmr/constellation/lambdatwist/cubic.h
 		wmr/constellation/lambdatwist/eig3x3known0.h
@@ -572,6 +572,13 @@ if(XRT_BUILD_DRIVER_WMR)
 	if(XRT_BUILD_DRIVER_HANDTRACKING)
 		target_link_libraries(drv_wmr PRIVATE drv_ht)
 		target_link_libraries(drv_wmr PRIVATE drv_cemu)
+	endif()
+
+	if(XRT_HAVE_OPENCV)
+	target_include_directories(drv_wmr PRIVATE ${OpenCV_INCLUDE_DIRS})
+	target_link_libraries(
+		drv_wmr PRIVATE ${OpenCV_LIBRARIES}
+		)
 	endif()
 endif()
 

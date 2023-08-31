@@ -11,15 +11,33 @@
  */
 #pragma once
 
+#include "xrt/xrt_defines.h"
 #include "xrt/xrt_frame.h"
-#include "blobwatch.h"
+#include "sample.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+enum debug_draw_flag
+{
+	DEBUG_DRAW_FLAG_NONE = 0,
+	DEBUG_DRAW_FLAG_BLOB_CIRCLE = 1,
+	DEBUG_DRAW_FLAG_BLOB_IDS = 2,
+	DEBUG_DRAW_FLAG_LEDS = 4,
+	DEBUG_DRAW_FLAG_POSE_BOUNDS = 8,
+	DEBUG_DRAW_FLAG_ALL = 0xff,
+};
+
+
 void
-debug_draw_blobs(struct xrt_frame *rgb_out, struct blobservation *bwobs, struct xrt_frame *gray_in);
+debug_draw_blobs_leds(struct xrt_frame *rgb_out,
+                      struct xrt_frame *gray_in,
+                      enum debug_draw_flag flags,
+                      struct tracking_sample_frame *view,
+                      struct camera_model *calib,
+                      struct tracking_sample_device_state *devices,
+                      uint8_t n_devices);
 
 #ifdef __cplusplus
 }

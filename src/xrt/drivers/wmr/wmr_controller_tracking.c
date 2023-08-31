@@ -77,6 +77,7 @@ struct wmr_controller_tracker_device
 	uint64_t last_seen_pose_ts;
 	struct xrt_pose last_seen_pose; // global pose
 	int last_matched_blobs;
+	int last_matched_cam;
 };
 
 struct wmr_controller_tracker_camera
@@ -134,6 +135,10 @@ struct wmr_controller_tracker
 
 	/* Debug */
 	enum u_logging_level log_level;
+	bool debug_draw_blob_circles;
+	bool debug_draw_blob_ids;
+	bool debug_draw_leds;
+	bool debug_draw_pose_bounds;
 
 	uint64_t last_frame_timestamp;
 	uint64_t last_frame_sequence;
@@ -306,10 +311,10 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 	struct wmr_controller_tracker_device *device = wct->controllers + dev_state->dev_index;
 
 	struct pose_metrics *score = &dev_state->score;
-	WMR_INFO(wct,
-	         "Found a pose on cam %u device %d score match_flags 0x%x matched %u "
-	         "blobs of %u visible LEDs",
-	         view_id, device->led_model.id, score->match_flags, score->matched_blobs, score->visible_leds);
+	WMR_DEBUG(wct,
+	          "Found a pose on cam %u device %d score match_flags 0x%x matched %u "
+	          "blobs of %u visible LEDs",
+	          view_id, device->led_model.id, score->match_flags, score->matched_blobs, score->visible_leds);
 
 	pose_metrics_match_pose_to_blobs(obj_cam_pose, view->bwobs->blobs, view->bwobs->num_blobs, &device->led_model,
 	                                 &cam->camera_model, &dev_state->blob_match_info);
@@ -321,6 +326,7 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 
 	math_pose_transform(&view->pose, obj_cam_pose, &dev_state->final_pose);
 	dev_state->found_device_pose = true;
+	dev_state->found_pose_view_id = view_id;
 
 	os_mutex_lock(&wct->tracked_controller_lock);
 	if (device->have_last_seen_pose == false || sample->timestamp > device->last_seen_pose_ts) {
@@ -328,6 +334,7 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 		device->last_seen_pose_ts = sample->timestamp;
 		device->last_seen_pose = dev_state->final_pose;
 		device->last_matched_blobs = score->matched_blobs;
+		device->last_matched_cam = view_id;
 	}
 	/* @todo: Submit this pose observation to the fusion / real device */
 	os_mutex_unlock(&wct->tracked_controller_lock);
@@ -362,7 +369,6 @@ device_try_global_pose(struct wmr_controller_tracker *wct,
 		                                      &device->led_model, &cam->camera_model, NULL);
 
 		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD | POSE_MATCH_LED_IDS)) {
-			WMR_DEBUG(wct, "Found a fast match pose on cam %u device %d", view_id, device->led_model.id);
 			submit_device_pose(wct, dev_state, sample, view_id, &obj_cam_pose);
 			return true;
 		}
@@ -475,6 +481,8 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 		}
 
 		dev_state->dev_index = d;
+		dev_state->led_model = &device->led_model;
+
 		sample->n_devices++;
 	}
 	os_mutex_unlock(&wct->tracked_controller_lock);
@@ -494,10 +502,14 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 		WMR_DEBUG(wct, "Doing fast match search for device %d", device->led_model.id);
 
 		if (device_try_global_pose(wct, dev_state, sample, &dev_state->prior_pose)) {
+			WMR_DEBUG(wct, "Found fast match search for device %d in view %d from prior pose",
+			          device->led_model.id, dev_state->found_pose_view_id);
 			continue;
 		}
 		if (dev_state->have_last_seen_pose &&
 		    device_try_global_pose(wct, dev_state, sample, &dev_state->last_seen_pose)) {
+			WMR_DEBUG(wct, "Found fast match search for device %d in view %d from last_seen pose",
+			          device->led_model.id, dev_state->found_pose_view_id);
 			continue;
 		}
 		if (!dev_state->found_device_pose) {
@@ -509,6 +521,16 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 	wct->last_fast_analysis_ms = (fast_analysis_finish_ts - fast_analysis_start_ts) / U_TIME_1MS_IN_NS;
 
 	/* Send analysis results to debug view if needed */
+	enum debug_draw_flag debug_flags = DEBUG_DRAW_FLAG_NONE;
+	if (wct->debug_draw_blob_circles)
+		debug_flags |= DEBUG_DRAW_FLAG_BLOB_CIRCLE;
+	if (wct->debug_draw_blob_ids)
+		debug_flags |= DEBUG_DRAW_FLAG_BLOB_IDS;
+	if (wct->debug_draw_leds)
+		debug_flags |= DEBUG_DRAW_FLAG_LEDS;
+	if (wct->debug_draw_pose_bounds)
+		debug_flags |= DEBUG_DRAW_FLAG_POSE_BOUNDS;
+
 	for (int i = 0; i < sample->n_views; i++) {
 		struct wmr_controller_tracker_camera *cam = wct->cam + i;
 		struct tracking_sample_frame *view = sample->views + i;
@@ -524,7 +546,8 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 			xf_dbg->timestamp = xf_src->timestamp;
 
 			if (view->bwobs != NULL) {
-				debug_draw_blobs(xf_dbg, view->bwobs, xf_src);
+				debug_draw_blobs_leds(xf_dbg, xf_src, debug_flags, view, &cam->camera_model,
+				                      sample->devices, sample->n_devices);
 			}
 
 			u_sink_debug_push_frame(&cam->debug_sink, xf_dbg);
@@ -576,7 +599,7 @@ wmr_controller_tracker_process_frame_long(struct wmr_controller_tracker *wct,
 			if (dev_state->found_device_pose)
 				continue; /* This device was already found. No need for a long search */
 
-			WMR_INFO(wct, "Doing full search for device %d in view %d", device->led_model.id, view_id);
+			WMR_DEBUG(wct, "Doing full search for device %d in view %d", device->led_model.id, view_id);
 
 			for (int pass = 0; pass < 2; pass++) {
 
@@ -808,6 +831,10 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 	u_var_add_ro_u64(wct, &wct->last_fast_analysis_ms, "Fast analysis time (ms)");
 	u_var_add_ro_u64(wct, &wct->last_long_analysis_ms, "Long analysis time (ms)");
 	u_var_add_button(wct, &wct->full_search_button, "Trigger ab-initio search");
+	u_var_add_bool(wct, &wct->debug_draw_blob_circles, "Debug: Draw circles around blobs");
+	u_var_add_bool(wct, &wct->debug_draw_blob_ids, "Debug: Draw LED id labels for blobs");
+	u_var_add_bool(wct, &wct->debug_draw_leds, "Debug: Draw LED position markers for found poses");
+	u_var_add_bool(wct, &wct->debug_draw_pose_bounds, "Debug: Draw bounds rect for found poses");
 
 	for (int i = 0; i < wct->cam_count; i++) {
 		struct wmr_controller_tracker_camera *cam = wct->cam + i;
@@ -881,6 +908,7 @@ wmr_controller_tracker_add_controller(struct wmr_controller_tracker *wct, struct
 	if (wctc != NULL) {
 		struct wmr_controller_tracker_device *device = wct->controllers + wct->num_controllers;
 		device->connection = wctc;
+		device->last_matched_cam = -1;
 		wct->num_controllers++;
 
 		char dev_name[64];
@@ -890,6 +918,7 @@ wmr_controller_tracker_add_controller(struct wmr_controller_tracker *wct, struct
 		u_var_add_pose(wct, &device->last_seen_pose, "Last observed pose");
 		u_var_add_u64(wct, &device->last_seen_pose_ts, "Last observed pose");
 		u_var_add_ro_i32(wct, &device->last_matched_blobs, "Last matched Blobs");
+		u_var_add_ro_i32(wct, &device->last_matched_cam, "Last observed camera #");
 	}
 
 	os_mutex_unlock(&wct->tracked_controller_lock);

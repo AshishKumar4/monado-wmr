@@ -28,6 +28,8 @@ struct tracking_sample_device_state
 	/* Index into the devices array for this state info */
 	int dev_index;
 
+	struct constellation_led_model *led_model;
+
 	/* Predicted device pose and error bounds from fusion, in world space */
 	struct xrt_pose prior_pose;
 	struct xrt_vec3 prior_pos_error;
@@ -39,6 +41,7 @@ struct tracking_sample_device_state
 	struct xrt_pose last_seen_pose;
 
 	bool found_device_pose;     /* Set to true when the device was found in this sample */
+	int found_pose_view_id;     /* Set to the camera ID where the device was found */
 	struct xrt_pose final_pose; /* Global pose that was detected */
 
 	struct pose_metrics score;
