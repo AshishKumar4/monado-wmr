@@ -227,14 +227,40 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 	cv::Mat rgbOutMat = cv::Mat(rgb_out->height, rgb_out->width, CV_8UC3, dest, out_stride);
 #endif
 
+	uint8_t equalise_map[256];
+
+	if (flags & DEBUG_DRAW_FLAG_NORMALISE) {
+		uint8_t min_pix = 255, max_pix = 0;
+		src = gray_in->data;
+		for (y = 0; y < height; y++) {
+			for (x = 0; x < width; x++) {
+				if (src[x] < min_pix)
+					min_pix = src[x];
+				if (src[x] > max_pix)
+					max_pix = src[x];
+			}
+			src += in_stride;
+		}
+		uint8_t delta = max_pix - min_pix;
+		for (int i = 0; i < 256; i++) {
+			equalise_map[i] = ((i - min_pix) * 255 + delta / 2) / delta;
+		}
+	} else {
+		/* identity map */
+		for (int i = 0; i < 256; i++) {
+			equalise_map[i] = i;
+		}
+	}
+
 	uint8_t *dest_line = dest;
+	src = gray_in->data;
 	for (y = 0; y < height; y++) {
 		/* Expand to RGB and copy the source to the dest, then
 		 * paint blob markers */
 		uint8_t *d = dest_line;
 		for (x = 0; x < width; x++) {
 			/* Expand GRAY8 to RGB */
-			d[0] = d[1] = d[2] = src[x];
+			d[0] = d[1] = d[2] = equalise_map[src[x]];
 			d += 3;
 		}
 
@@ -257,12 +283,15 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 			clamp_rect(&start_x, &start_y, &w, &h, width, height);
 
 			uint32_t c = 0xFF80FF;
-			/* Tint known blobs by their device ID in the image. Purple for unknown */
 			if (b->led_id != LED_INVALID_ID) {
 				c = object_id_to_colour(LED_OBJECT_ID(b->led_id));
 			}
 
-			colour_rgb_rect(dest, width, out_stride, height, start_x, start_y, b->width, b->height, c);
+			if (flags & DEBUG_DRAW_FLAG_BLOB_TINT) {
+				/* Tint known blobs by their device ID in the image. Purple for unknown */
+				colour_rgb_rect(dest, width, out_stride, height, start_x, start_y, b->width, b->height,
+				                c);
+			}
 
 			if (b->led_id != LED_INVALID_ID) {
 				/* Draw a dot at the weighted center for known blobs */
@@ -273,8 +302,9 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 			cv::Scalar cvCol = cv::Scalar((c >> 24) & 0xff, (c >> 16) & 0xff, c & 0xff);
 
 			if (flags & DEBUG_DRAW_FLAG_BLOB_CIRCLE) {
-				cv::RotatedRect rect = cv::RotatedRect(
-				    cv::Point2f(start_x + (w + 1) / 2, start_y + (h + 1) / 2), cv::Size2f(w, h), 0);
+				cv::RotatedRect rect =
+				    cv::RotatedRect(cv::Point2f(start_x - 1 + (w + 1) / 2, start_y - 1 + (h + 1) / 2),
+				                    cv::Size2f(w + 2, h + 2), 0);
 				cv::ellipse(rgbOutMat, rect, cvCol);
 			}
 
@@ -288,20 +318,20 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 		}
 	}
 
-	if (flags & (DEBUG_DRAW_FLAG_LEDS | DEBUG_DRAW_FLAG_POSE_BOUNDS)) {
-		for (int d = 0; d < n_devices; d++) {
-			struct tracking_sample_device_state *dev_state = devices + d;
-			uint8_t object_id = dev_state->led_model->id;
-			int dev_id = object_id_to_index(object_id);
+	for (int d = 0; d < n_devices; d++) {
+		struct tracking_sample_device_state *dev_state = devices + d;
+		uint8_t object_id = dev_state->led_model->id;
+		int dev_id = object_id_to_index(object_id);
 
-			if (dev_id < 0 || !dev_state->found_device_pose) {
-				continue;
-			}
+		if (dev_id < 0 || !dev_state->found_device_pose) {
+			continue;
+		}
 
-			uint32_t dev_colour = object_id_to_colour(object_id);
-			/* Draw a marker in the top-left of the frame for which devices we found a pose for */
-			draw_rgb_filled_rect(dest, width, out_stride, height, 16 * dev_id, 0, 16, 16, dev_colour);
+		uint32_t dev_colour = object_id_to_colour(object_id);
+		/* Draw a marker in the top-left of the frame for which devices we found a pose for */
+		draw_rgb_filled_rect(dest, width, out_stride, height, 16 * dev_id, 0, 16, 16, dev_colour);
 
+		if (flags & (DEBUG_DRAW_FLAG_LEDS | DEBUG_DRAW_FLAG_POSE_BOUNDS)) {
 			struct xrt_pose obj_cam_pose;
 			math_pose_transform(&view->inv_pose, &dev_state->final_pose, &obj_cam_pose);
 

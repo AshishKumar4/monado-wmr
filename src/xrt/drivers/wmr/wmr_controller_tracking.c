@@ -135,6 +135,8 @@ struct wmr_controller_tracker
 
 	/* Debug */
 	enum u_logging_level log_level;
+	bool debug_draw_normalise;
+	bool debug_draw_blob_tint;
 	bool debug_draw_blob_circles;
 	bool debug_draw_blob_ids;
 	bool debug_draw_leds;
@@ -522,6 +524,10 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 
 	/* Send analysis results to debug view if needed */
 	enum debug_draw_flag debug_flags = DEBUG_DRAW_FLAG_NONE;
+	if (wct->debug_draw_normalise)
+		debug_flags |= DEBUG_DRAW_FLAG_NORMALISE;
+	if (wct->debug_draw_blob_tint)
+		debug_flags |= DEBUG_DRAW_FLAG_BLOB_TINT;
 	if (wct->debug_draw_blob_circles)
 		debug_flags |= DEBUG_DRAW_FLAG_BLOB_CIRCLE;
 	if (wct->debug_draw_blob_ids)
@@ -753,6 +759,8 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 	struct wmr_controller_tracker *wct = calloc(1, sizeof(struct wmr_controller_tracker));
 
 	wct->log_level = debug_get_log_option_wmr_log();
+	wct->debug_draw_blob_tint = true;
+	wct->debug_draw_blob_ids = true;
 	wct->hmd_xdev = hmd_xdev;
 
 	/* Init frame duration to 90fps */
@@ -831,6 +839,8 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 	u_var_add_ro_u64(wct, &wct->last_fast_analysis_ms, "Fast analysis time (ms)");
 	u_var_add_ro_u64(wct, &wct->last_long_analysis_ms, "Long analysis time (ms)");
 	u_var_add_button(wct, &wct->full_search_button, "Trigger ab-initio search");
+	u_var_add_bool(wct, &wct->debug_draw_normalise, "Debug: Normalise source frame");
+	u_var_add_bool(wct, &wct->debug_draw_blob_tint, "Debug: Tint blobs by device assignment");
 	u_var_add_bool(wct, &wct->debug_draw_blob_circles, "Debug: Draw circles around blobs");
 	u_var_add_bool(wct, &wct->debug_draw_blob_ids, "Debug: Draw LED id labels for blobs");
 	u_var_add_bool(wct, &wct->debug_draw_leds, "Debug: Draw LED position markers for found poses");
