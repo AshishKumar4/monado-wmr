@@ -304,10 +304,10 @@ correspondence_search_project_pose(struct correspondence_search *cs,
 	 * blob points */
 	if (mi->search_flags & CS_FLAG_HAVE_POSE_PRIOR) {
 		pose_metrics_evaluate_pose_with_prior(&score, pose, false, &mi->pose_prior, mi->pos_error_thresh,
-		                                      mi->rot_error_thresh, cs->blobs, cs->num_points, mi->id, leds,
-		                                      cs->calib, NULL);
+		                                      mi->rot_error_thresh, cs->blobs, cs->num_points, leds, cs->calib,
+		                                      NULL);
 	} else {
-		pose_metrics_evaluate_pose(&score, pose, cs->blobs, cs->num_points, mi->id, leds, cs->calib, NULL);
+		pose_metrics_evaluate_pose(&score, pose, cs->blobs, cs->num_points, leds, cs->calib, NULL);
 	}
 
 	/* If this pose is any good, test it further */

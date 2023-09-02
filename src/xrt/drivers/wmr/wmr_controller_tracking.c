@@ -367,8 +367,8 @@ device_try_global_pose(struct wmr_controller_tracker *wct,
 
 		pose_metrics_evaluate_pose_with_prior(&dev_state->score, &obj_cam_pose, false, &obj_prior_cam_pose,
 		                                      &dev_state->prior_pos_error, &dev_state->prior_rot_error,
-		                                      bwobs->blobs, bwobs->num_blobs, device->led_model.id,
-		                                      &device->led_model, &cam->camera_model, NULL);
+		                                      bwobs->blobs, bwobs->num_blobs, &device->led_model,
+		                                      &cam->camera_model, NULL);
 
 		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD | POSE_MATCH_LED_IDS)) {
 			submit_device_pose(wct, dev_state, sample, view_id, &obj_cam_pose);

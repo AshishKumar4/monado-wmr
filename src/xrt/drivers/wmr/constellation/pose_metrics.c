@@ -312,7 +312,6 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
                                       const struct xrt_vec3 *rot_error_thresh,
                                       struct blob *blobs,
                                       int num_blobs,
-                                      int device_id,
                                       struct constellation_led_model *led_model,
                                       struct camera_model *calib,
                                       struct pose_rect *out_bounds)
@@ -404,13 +403,12 @@ pose_metrics_evaluate_pose(struct pose_metrics *score,
                            struct xrt_pose *pose,
                            struct blob *blobs,
                            int num_blobs,
-                           int device_id,
                            struct constellation_led_model *led_model,
                            struct camera_model *calib,
                            struct pose_rect *out_bounds)
 {
-	pose_metrics_evaluate_pose_with_prior(score, pose, false, NULL, NULL, NULL, blobs, num_blobs, device_id,
-	                                      led_model, calib, out_bounds);
+	pose_metrics_evaluate_pose_with_prior(score, pose, false, NULL, NULL, NULL, blobs, num_blobs, led_model, calib,
+	                                      out_bounds);
 }
 
 /* Return true if new_score is for a more likely pose than old_score */
