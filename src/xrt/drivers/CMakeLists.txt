@@ -547,6 +547,8 @@ if(XRT_BUILD_DRIVER_WMR)
 		wmr/constellation/led_models.h
 		wmr/constellation/pose_metrics.c
 		wmr/constellation/pose_metrics.h
+		wmr/constellation/ransac_pnp.cpp
+		wmr/constellation/ransac_pnp.h
 		wmr/constellation/sample.c
 		wmr/constellation/sample.h
 		)

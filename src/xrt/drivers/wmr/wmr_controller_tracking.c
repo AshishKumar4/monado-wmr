@@ -22,6 +22,7 @@
 #include "constellation/correspondence_search.h"
 #include "constellation/debug_draw.h"
 #include "constellation/led_models.h"
+#include "constellation/ransac_pnp.h"
 #include "constellation/sample.h"
 
 #include "wmr_controller_tracking.h"
@@ -342,6 +343,7 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 	os_mutex_unlock(&wct->tracked_controller_lock);
 }
 
+/* Fast matching test based on hypothesised pose */
 static bool
 device_try_global_pose(struct wmr_controller_tracker *wct,
                        struct tracking_sample_device_state *dev_state,
@@ -374,6 +376,79 @@ device_try_global_pose(struct wmr_controller_tracker *wct,
 			submit_device_pose(wct, dev_state, sample, view_id, &obj_cam_pose);
 			return true;
 		}
+	}
+
+	return false;
+}
+
+/* Try and recover the pose from labelled blobs */
+static bool
+device_try_recover_pose(struct wmr_controller_tracker *wct,
+                        struct tracking_sample_device_state *dev_state,
+                        struct constellation_tracking_sample *sample)
+{
+	struct wmr_controller_tracker_device *device = wct->controllers + dev_state->dev_index;
+	struct constellation_led_model *leds_model = &device->led_model;
+
+	for (int view_id = 0; view_id < sample->n_views; view_id++) {
+		struct tracking_sample_frame *view = sample->views + view_id;
+		struct wmr_controller_tracker_camera *cam = wct->cam + view_id;
+
+		if (view->bwobs == NULL || view->bwobs->num_blobs == 0) {
+			continue;
+		}
+
+		struct wmr_controller_tracker_device *device = wct->controllers + dev_state->dev_index;
+		blobservation *bwobs = view->bwobs;
+
+		/* See if we still have enough labelled blobs to try to re-acquire the pose without a
+		 * full search */
+		int num_blobs = 0;
+		for (int index = 0; index < bwobs->num_blobs; index++) {
+			struct blob *b = bwobs->blobs + index;
+			if (LED_OBJECT_ID(b->led_id) == leds_model->id) {
+				num_blobs++;
+			}
+		}
+		if (num_blobs < 4) {
+			continue;
+		}
+
+		WMR_DEBUG(wct, "Camera %d trying to reacquire device %d from %u blobs", view_id, leds_model->id,
+		          num_blobs);
+		struct xrt_pose obj_prior_cam_pose;
+
+		math_pose_transform(&view->inv_pose, &dev_state->prior_pose, &obj_prior_cam_pose);
+		/* Use the prior as a starting point for the RANSAC PnP */
+		struct xrt_pose obj_cam_pose = obj_prior_cam_pose;
+
+		if (!ransac_pnp_pose(&obj_cam_pose, bwobs->blobs, bwobs->num_blobs, leds_model, &cam->camera_model,
+		                     NULL, NULL)) {
+			WMR_DEBUG(wct, "Camera %d RANSAC-PnP for device %d from %u blobs failed", view_id,
+			          leds_model->id, num_blobs);
+			continue;
+		}
+
+		pose_metrics_evaluate_pose_with_prior(&dev_state->score, &obj_cam_pose, true, &obj_prior_cam_pose,
+		                                      &dev_state->prior_pos_error, &dev_state->prior_rot_error,
+		                                      bwobs->blobs, bwobs->num_blobs, &device->led_model,
+		                                      &cam->camera_model, NULL);
+
+		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD)) {
+			submit_device_pose(wct, dev_state, sample, view_id, &obj_cam_pose);
+			return true;
+		}
+		WMR_DEBUG(wct,
+		          "Camera %d device %d had %d prior blobs, but failed match with flags 0x%x. "
+		          "Yielded pose %f %f %f %f pos %f %f %f (match %d of %d visible) rot_error %f %f %f pos_error "
+		          "%f %f %f",
+		          view_id, leds_model->id, num_blobs, dev_state->score.match_flags, obj_cam_pose.orientation.x,
+		          obj_cam_pose.orientation.y, obj_cam_pose.orientation.z, obj_cam_pose.orientation.w,
+		          obj_cam_pose.position.x, obj_cam_pose.position.y, obj_cam_pose.position.z,
+		          dev_state->score.matched_blobs, dev_state->score.visible_leds,
+		          dev_state->score.orient_error.x, dev_state->score.orient_error.y,
+		          dev_state->score.orient_error.z, dev_state->score.pos_error.x, dev_state->score.pos_error.y,
+		          dev_state->score.pos_error.z);
 	}
 
 	return false;
@@ -511,6 +586,11 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 		if (dev_state->have_last_seen_pose &&
 		    device_try_global_pose(wct, dev_state, sample, &dev_state->last_seen_pose)) {
 			WMR_DEBUG(wct, "Found fast match search for device %d in view %d from last_seen pose",
+			          device->led_model.id, dev_state->found_pose_view_id);
+			continue;
+		}
+		if (device_try_recover_pose(wct, dev_state, sample)) {
+			WMR_DEBUG(wct, "Found fast match search for device %d in view %d from labelled blobs",
 			          device->led_model.id, dev_state->found_pose_view_id);
 			continue;
 		}
