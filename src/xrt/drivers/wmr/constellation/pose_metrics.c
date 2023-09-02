@@ -132,12 +132,13 @@ static void
 project_led_points(struct constellation_led_model *led_model,
                    struct camera_model *calib,
                    struct xrt_pose *pose,
+                   struct xrt_vec3 *out_positions,
                    struct xrt_vec2 *out_points)
 {
 	for (int i = 0; i < led_model->num_leds; i++) {
-		struct xrt_vec3 tmp;
-		math_pose_transform_point(pose, &led_model->leds[i].pos, &tmp);
-		t_camera_models_project(&calib->calib, tmp.x, tmp.y, tmp.z, &out_points[i].x, &out_points[i].y);
+		struct xrt_vec3 *tmp = out_positions + i;
+		math_pose_transform_point(pose, &led_model->leds[i].pos, tmp);
+		t_camera_models_project(&calib->calib, tmp->x, tmp->y, tmp->z, &out_points[i].x, &out_points[i].y);
 	}
 }
 
@@ -149,6 +150,7 @@ get_visible_leds_and_bounds(struct xrt_pose *pose,
                             int *num_visible_leds,
                             struct pose_rect *bounds)
 {
+	struct xrt_vec3 led_out_positions[MAX_OBJECT_LEDS];
 	struct xrt_vec2 led_out_points[MAX_OBJECT_LEDS];
 	bool first_visible = true;
 	int i;
@@ -156,7 +158,7 @@ get_visible_leds_and_bounds(struct xrt_pose *pose,
 	const int num_leds = led_model->num_leds;
 
 	/* Project HMD LEDs into the distorted image space */
-	project_led_points(led_model, calib, pose, led_out_points);
+	project_led_points(led_model, calib, pose, led_out_positions, led_out_points);
 
 	/* Compute LED pixel size based on model distance below
 	 * using the larger X/Y focal length and LED's Z value */
@@ -166,28 +168,29 @@ get_visible_leds_and_bounds(struct xrt_pose *pose,
 	*num_visible_leds = 0;
 	for (i = 0; i < num_leds; i++) {
 		struct xrt_vec2 *led_pos_px = led_out_points + i;
+		struct xrt_vec3 *led_pos_m = led_out_positions + i;
+
+		/* LEDs behind the camera are not visible */
+		if (led_pos_m->z <= 0.0) {
+			continue;
+		}
 
 		if (led_pos_px->x < 0 || led_pos_px->y < 0 || led_pos_px->x >= calib->width ||
 		    led_pos_px->y >= calib->height)
 			continue; // Outside the visible screen space
 
-		struct xrt_vec3 led_pos_m;
-		math_pose_transform_point(pose, &leds[i].pos, &led_pos_m);
-
 		/* Calculate the expected size of an LED at this distance */
 		double led_radius_px = 4.0;
-		if (led_pos_m.z > 0.0) {
-			const double led_radius_mm = leds[i].radius_mm;
-			led_radius_px = focal_length * led_radius_mm / led_pos_m.z / 1000.0;
+		const double led_radius_mm = leds[i].radius_mm;
+		led_radius_px = focal_length * led_radius_mm / led_pos_m->z / 1000.0;
 #if 0
-			printf ("LED id %d led_radius_px %f = focal length %f led_radius %f Z = %f m\n",
-          led_model->leds[i].id, led_radius_px,
-			    focal_length, led_radius_mm, led_pos_m.z);
+		printf("LED id %d led_radius_px %f = focal length %f led_radius %f Z = %f m\n",
+		       led_model->leds[i].id, led_radius_px,
+		       focal_length, led_radius_mm, led_pos_m->z);
 #endif
-		}
 
 		/* Convert the position to a unit vector for dot product comparison */
-		struct xrt_vec3 view_vec = led_pos_m;
+		struct xrt_vec3 view_vec = *led_pos_m;
 		struct xrt_vec3 normal;
 
 		math_vec3_normalize(&view_vec);
@@ -207,27 +210,29 @@ get_visible_leds_and_bounds(struct xrt_pose *pose,
 		/* The vector to the LED position points out from the camera
 		 * to the LED, but the normal points toward the camera, so
 		 * we need to compare against 180 - LED_ANGLE here */
-		if (facing_dot < cos(DEG_TO_RAD(180.0 - LED_ANGLE))) {
-			struct pose_metrics_visible_led_info *led_info = visible_led_points + (*num_visible_leds);
-			led_info->led = leds + i;
-			led_info->pos_px = *led_pos_px;
-			led_info->pos_m = led_pos_m;
-			led_info->led_radius_px = led_radius_px;
-			led_info->matched_blob = NULL;
-			led_info->facing_dot = facing_dot;
-			(*num_visible_leds)++;
+		if (facing_dot > cos(DEG_TO_RAD(180.0 - LED_ANGLE))) {
+			continue;
+		}
 
-			/* Expand the bounding box */
-			if (first_visible) {
-				bounds->left = led_pos_px->x - led_radius_px;
-				bounds->top = led_pos_px->y - led_radius_px;
-				bounds->right = led_pos_px->x + 2 * led_radius_px;
-				bounds->bottom = led_pos_px->y + 2 * led_radius_px;
-				first_visible = false;
-			} else {
-				expand_rect(bounds, led_pos_px->x - led_radius_px, led_pos_px->y - led_radius_px,
-				            2 * led_radius_px, 2 * led_radius_px);
-			}
+		struct pose_metrics_visible_led_info *led_info = visible_led_points + (*num_visible_leds);
+		led_info->led = leds + i;
+		led_info->pos_px = *led_pos_px;
+		led_info->pos_m = *led_pos_m;
+		led_info->led_radius_px = led_radius_px;
+		led_info->matched_blob = NULL;
+		led_info->facing_dot = facing_dot;
+		(*num_visible_leds)++;
+
+		/* Expand the bounding box */
+		if (first_visible) {
+			bounds->left = led_pos_px->x - led_radius_px;
+			bounds->top = led_pos_px->y - led_radius_px;
+			bounds->right = led_pos_px->x + 2 * led_radius_px;
+			bounds->bottom = led_pos_px->y + 2 * led_radius_px;
+			first_visible = false;
+		} else {
+			expand_rect(bounds, led_pos_px->x - led_radius_px, led_pos_px->y - led_radius_px,
+			            2 * led_radius_px, 2 * led_radius_px);
 		}
 	}
 }
