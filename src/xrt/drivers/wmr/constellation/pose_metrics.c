@@ -340,14 +340,7 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 		score->match_flags |= POSE_MATCH_LED_IDS;
 	}
 
-	/* Don't add GOOD/STRONG flags if matched fewer than 3 blobs */
-	if (score->matched_blobs < 3) {
-		goto done;
-	}
-
 	double error_per_led = score->reprojection_error / score->matched_blobs;
-
-	/* At this point, we have at least 3 LEDs and their blobs matching */
 
 	/* If we have a pose prior, calculate the rotation and translation error and match flags as needed */
 	if (pose_prior) {
@@ -358,6 +351,12 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 		check_pose_prior(score, pose, pose_prior, pos_error_thresh, rot_error_thresh);
 	}
 
+	/* Don't add GOOD/STRONG flags if matched fewer than 3 blobs */
+	if (score->matched_blobs < 3) {
+		goto done;
+	}
+
+	/* At this point, we have at least 3 LEDs and their blobs matching */
 	if (POSE_HAS_FLAGS(score, POSE_MATCH_POSITION | POSE_MATCH_ORIENT)) {
 		if (error_per_led < 2.0 && (score->unmatched_blobs * 4 <= score->matched_blobs ||
 		                            (2 * score->visible_leds <= 3 * score->matched_blobs))) {

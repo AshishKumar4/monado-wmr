@@ -414,11 +414,14 @@ device_try_recover_pose(struct wmr_controller_tracker *wct,
 			continue;
 		}
 
-		WMR_DEBUG(wct, "Camera %d trying to reacquire device %d from %u blobs", view_id, leds_model->id,
-		          num_blobs);
 		struct xrt_pose obj_prior_cam_pose;
-
 		math_pose_transform(&view->inv_pose, &dev_state->prior_pose, &obj_prior_cam_pose);
+
+		WMR_DEBUG(wct, "Camera %d trying to reacquire device %d from %u blobs and prior pose %f %f %f %f pos %f %f %f",
+						  view_id, leds_model->id, num_blobs, obj_prior_cam_pose.orientation.x,
+		          obj_prior_cam_pose.orientation.y, obj_prior_cam_pose.orientation.z, obj_prior_cam_pose.orientation.w,
+		          obj_prior_cam_pose.position.x, obj_prior_cam_pose.position.y, obj_prior_cam_pose.position.z);
+
 		/* Use the prior as a starting point for the RANSAC PnP */
 		struct xrt_pose obj_cam_pose = obj_prior_cam_pose;
 
