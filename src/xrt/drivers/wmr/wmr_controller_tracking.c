@@ -140,6 +140,7 @@ struct wmr_controller_tracker
 	bool debug_draw_blob_tint;
 	bool debug_draw_blob_circles;
 	bool debug_draw_blob_ids;
+	bool debug_draw_blob_unique_ids;
 	bool debug_draw_leds;
 	bool debug_draw_pose_bounds;
 
@@ -417,10 +418,13 @@ device_try_recover_pose(struct wmr_controller_tracker *wct,
 		struct xrt_pose obj_prior_cam_pose;
 		math_pose_transform(&view->inv_pose, &dev_state->prior_pose, &obj_prior_cam_pose);
 
-		WMR_DEBUG(wct, "Camera %d trying to reacquire device %d from %u blobs and prior pose %f %f %f %f pos %f %f %f",
-						  view_id, leds_model->id, num_blobs, obj_prior_cam_pose.orientation.x,
-		          obj_prior_cam_pose.orientation.y, obj_prior_cam_pose.orientation.z, obj_prior_cam_pose.orientation.w,
-		          obj_prior_cam_pose.position.x, obj_prior_cam_pose.position.y, obj_prior_cam_pose.position.z);
+		WMR_DEBUG(
+		    wct,
+		    "Camera %d trying to reacquire device %d from %u blobs and prior pose %f %f %f %f pos %f %f %f",
+		    view_id, leds_model->id, num_blobs, obj_prior_cam_pose.orientation.x,
+		    obj_prior_cam_pose.orientation.y, obj_prior_cam_pose.orientation.z,
+		    obj_prior_cam_pose.orientation.w, obj_prior_cam_pose.position.x, obj_prior_cam_pose.position.y,
+		    obj_prior_cam_pose.position.z);
 
 		/* Use the prior as a starting point for the RANSAC PnP */
 		struct xrt_pose obj_cam_pose = obj_prior_cam_pose;
@@ -615,6 +619,8 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 		debug_flags |= DEBUG_DRAW_FLAG_BLOB_CIRCLE;
 	if (wct->debug_draw_blob_ids)
 		debug_flags |= DEBUG_DRAW_FLAG_BLOB_IDS;
+	if (wct->debug_draw_blob_unique_ids)
+		debug_flags |= DEBUG_DRAW_FLAG_BLOB_UNIQUE_IDS;
 	if (wct->debug_draw_leds)
 		debug_flags |= DEBUG_DRAW_FLAG_LEDS;
 	if (wct->debug_draw_pose_bounds)
@@ -926,6 +932,7 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 	u_var_add_bool(wct, &wct->debug_draw_blob_tint, "Debug: Tint blobs by device assignment");
 	u_var_add_bool(wct, &wct->debug_draw_blob_circles, "Debug: Draw circles around blobs");
 	u_var_add_bool(wct, &wct->debug_draw_blob_ids, "Debug: Draw LED id labels for blobs");
+	u_var_add_bool(wct, &wct->debug_draw_blob_unique_ids, "Debug: Draw blobs tracking ID");
 	u_var_add_bool(wct, &wct->debug_draw_leds, "Debug: Draw LED position markers for found poses");
 	u_var_add_bool(wct, &wct->debug_draw_pose_bounds, "Debug: Draw bounds rect for found poses");
 
