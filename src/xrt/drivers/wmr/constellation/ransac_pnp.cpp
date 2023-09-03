@@ -141,7 +141,7 @@ ransac_pnp_pose(struct xrt_pose *pose,
 	/* 3 pixel reprojection threshold */
 	float reprojectionError = 3.0 / calib->calib.fx;
 
-	cv::solvePnPRansac(list_points3d, list_points2d_undistorted, dummyK, dummyD, rvec, tvec, true, iterationsCount,
+	cv::solvePnPRansac(list_points3d, list_points2d_undistorted, dummyK, dummyD, rvec, tvec, false, iterationsCount,
 	                   reprojectionError, confidence, inliers, flags);
 
 	if (num_inliers)

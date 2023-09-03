@@ -43,8 +43,8 @@ DEBUG_GET_ONCE_LOG_OPTION(wmr_log, "WMR_LOG", U_LOGGING_INFO)
 #define WMR_ERROR(c, ...) U_LOG_IFL_E(c->log_level, __VA_ARGS__)
 
 /* WMR thresholds for min brightness and min-blob-required magnitude */
-#define BLOB_PIXEL_THRESHOLD_WMR 0x8
-#define BLOB_THRESHOLD_MIN_WMR 0x10
+#define BLOB_PIXEL_THRESHOLD_WMR 0x4
+#define BLOB_THRESHOLD_MIN_WMR 0x8
 
 /* Maximum number of frames to permit waiting in the fast-processing queue */
 #define MAX_FAST_QUEUE_SIZE 2
@@ -315,10 +315,6 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 	struct wmr_controller_tracker_device *device = wct->controllers + dev_state->dev_index;
 
 	struct pose_metrics *score = &dev_state->score;
-	WMR_DEBUG(wct,
-	          "Found a pose on cam %u device %d score match_flags 0x%x matched %u "
-	          "blobs of %u visible LEDs",
-	          view_id, device->led_model.id, score->match_flags, score->matched_blobs, score->visible_leds);
 
 	pose_metrics_match_pose_to_blobs(obj_cam_pose, view->bwobs->blobs, view->bwobs->num_blobs, &device->led_model,
 	                                 &cam->camera_model, &dev_state->blob_match_info);
@@ -331,6 +327,15 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 	math_pose_transform(&view->pose, obj_cam_pose, &dev_state->final_pose);
 	dev_state->found_device_pose = true;
 	dev_state->found_pose_view_id = view_id;
+
+	WMR_DEBUG(wct,
+	         "Found a pose on cam %u device %d score match_flags 0x%x matched %u "
+	          "blobs of %u visible LEDs. Global pose %f %f %f %f pos %f %f %f",
+	          view_id, device->led_model.id, score->match_flags, score->matched_blobs, score->visible_leds,
+						dev_state->final_pose.orientation.x, dev_state->final_pose.orientation.y,
+						dev_state->final_pose.orientation.z, dev_state->final_pose.orientation.w,
+						dev_state->final_pose.position.x, dev_state->final_pose.orientation.y,
+						dev_state->final_pose.position.z);
 
 	os_mutex_lock(&wct->tracked_controller_lock);
 	if (device->have_last_seen_pose == false || sample->timestamp > device->last_seen_pose_ts) {
@@ -421,13 +426,12 @@ device_try_recover_pose(struct wmr_controller_tracker *wct,
 		WMR_DEBUG(
 		    wct,
 		    "Camera %d trying to reacquire device %d from %u blobs and prior pose %f %f %f %f pos %f %f %f",
-		    view_id, leds_model->id, num_blobs, obj_prior_cam_pose.orientation.x,
-		    obj_prior_cam_pose.orientation.y, obj_prior_cam_pose.orientation.z,
-		    obj_prior_cam_pose.orientation.w, obj_prior_cam_pose.position.x, obj_prior_cam_pose.position.y,
-		    obj_prior_cam_pose.position.z);
+		    view_id, leds_model->id, num_blobs, dev_state->prior_pose.orientation.x,
+		    dev_state->prior_pose.orientation.y, dev_state->prior_pose.orientation.z,
+		    dev_state->prior_pose.orientation.w, dev_state->prior_pose.position.x, dev_state->prior_pose.position.y,
+		    dev_state->prior_pose.position.z);
 
-		/* Use the prior as a starting point for the RANSAC PnP */
-		struct xrt_pose obj_cam_pose = obj_prior_cam_pose;
+		struct xrt_pose obj_cam_pose;
 
 		if (!ransac_pnp_pose(&obj_cam_pose, bwobs->blobs, bwobs->num_blobs, leds_model, &cam->camera_model,
 		                     NULL, NULL)) {
@@ -471,6 +475,8 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 	/* Allocate a tracking sample for everything we're about to process */
 	struct constellation_tracking_sample *sample = constellation_tracking_sample_new();
 	uint64_t fast_analysis_start_ts = os_monotonic_get_ns();
+
+	WMR_DEBUG(wct, "Starting analysis of frame %" PRIu64 " TS %" PRIu64, xf->source_sequence, xf->timestamp);
 
 	/* Get the HMD's pose so we can calculate the camera view poses */
 	xrt_device_get_tracked_pose(wct->hmd_xdev, XRT_INPUT_GENERIC_HEAD_POSE, xf->timestamp, &xsr_base_pose);
@@ -573,8 +579,8 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 
 	/* Try pose recovery strategies:
 	 * 	Check the predicted pose
-	 * 	@todo: Try recovery from labelled blobs
 	 * 	Check the last seen pose
+	 * 	Try recovery from labelled blobs
 	 * 	@todo: Check the predicted orientation, but at the last seen position
 	 * 	@todo: Try for a translational match with prior orientation
 	 */
@@ -673,6 +679,8 @@ static void
 wmr_controller_tracker_process_frame_long(struct wmr_controller_tracker *wct,
                                           struct constellation_tracking_sample *sample)
 {
+	WMR_DEBUG(wct, "Starting long analysis of frame TS %" PRIu64, sample->timestamp);
+
 	for (int view_id = 0; view_id < sample->n_views; view_id++) {
 		struct tracking_sample_frame *view = sample->views + view_id;
 		struct wmr_controller_tracker_camera *cam = wct->cam + view_id;
