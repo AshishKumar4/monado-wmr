@@ -329,13 +329,13 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 	dev_state->found_pose_view_id = view_id;
 
 	WMR_DEBUG(wct,
-	         "Found a pose on cam %u device %d score match_flags 0x%x matched %u "
+	          "Found a pose on cam %u device %d score match_flags 0x%x matched %u "
 	          "blobs of %u visible LEDs. Global pose %f %f %f %f pos %f %f %f",
 	          view_id, device->led_model.id, score->match_flags, score->matched_blobs, score->visible_leds,
-						dev_state->final_pose.orientation.x, dev_state->final_pose.orientation.y,
-						dev_state->final_pose.orientation.z, dev_state->final_pose.orientation.w,
-						dev_state->final_pose.position.x, dev_state->final_pose.orientation.y,
-						dev_state->final_pose.position.z);
+	          dev_state->final_pose.orientation.x, dev_state->final_pose.orientation.y,
+	          dev_state->final_pose.orientation.z, dev_state->final_pose.orientation.w,
+	          dev_state->final_pose.position.x, dev_state->final_pose.orientation.y,
+	          dev_state->final_pose.position.z);
 
 	os_mutex_lock(&wct->tracked_controller_lock);
 	if (device->have_last_seen_pose == false || sample->timestamp > device->last_seen_pose_ts) {
@@ -428,8 +428,8 @@ device_try_recover_pose(struct wmr_controller_tracker *wct,
 		    "Camera %d trying to reacquire device %d from %u blobs and prior pose %f %f %f %f pos %f %f %f",
 		    view_id, leds_model->id, num_blobs, dev_state->prior_pose.orientation.x,
 		    dev_state->prior_pose.orientation.y, dev_state->prior_pose.orientation.z,
-		    dev_state->prior_pose.orientation.w, dev_state->prior_pose.position.x, dev_state->prior_pose.position.y,
-		    dev_state->prior_pose.position.z);
+		    dev_state->prior_pose.orientation.w, dev_state->prior_pose.position.x,
+		    dev_state->prior_pose.position.y, dev_state->prior_pose.position.z);
 
 		struct xrt_pose obj_cam_pose;
 
