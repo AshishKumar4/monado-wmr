@@ -132,7 +132,7 @@ struct wmr_controller_tracker
 
 	//! Controller LED timesync tracking
 	uint64_t avg_frame_duration;
-	uint64_t next_slam_frame_ts;
+	uint64_t next_timesync_frame_ts;
 
 	/* Debug */
 	enum u_logging_level log_level;
@@ -214,36 +214,33 @@ wmr_controller_tracker_receive_frame(struct xrt_frame_sink *sink, struct xrt_fra
 
 	assert(xf->format == XRT_FORMAT_L8);
 
-	/* The frame cadence is SLAM/controller/controller, and we need to pass the
-	 * estimate of the next SLAM frame timestamp to the timesync. Only
-	 * controller frames get passed to here, so the 2nd sequential controller
+	/* The frame cadence is SLAM/controller/controller. Only controller frames are received
+	 * here. On the 2nd controller frame, we need to pass the estimate of the time of the next
+	 * *1st controller frame* to the controller timesync methods.
+	 * Since only controller frames get passed to here, the 2nd sequential controller
 	 * frame is the one right before the next SLAM frame */
 	bool is_second_frame = (wct->last_frame_sequence + 1) == xf->source_sequence;
 
 	os_mutex_lock(&wct->tracked_controller_lock);
 
 	// Update the controller timesync estimate
-	timepoint_ns next_slam_ts;
-	timepoint_ns frame_duration = 0;
 	if (is_second_frame) {
-		frame_duration = xf->timestamp - wct->last_frame_timestamp;
-		next_slam_ts = (timepoint_ns)(xf->timestamp) + wct->avg_frame_duration;
-	} else if (wct->last_frame_sequence != 0) {
-		frame_duration = (xf->timestamp - wct->last_frame_timestamp) / 2;
-		next_slam_ts = (timepoint_ns)(xf->timestamp) + 2 * wct->avg_frame_duration;
-	}
-	if (wct->last_frame_timestamp != 0 && frame_duration > 0 && frame_duration < (2 * U_TIME_1S_IN_NS / 90)) {
-		wct->avg_frame_duration = (frame_duration + (29 * wct->avg_frame_duration)) / 30;
-	}
+		timepoint_ns frame_duration = xf->timestamp - wct->last_frame_timestamp;
+		timepoint_ns next_timesync_ts = (timepoint_ns)(xf->timestamp) + 2 * wct->avg_frame_duration;
 
-	/* If the estimate of the next SLAM frame moves by more than 1ms, update the controllers */
-	int64_t slam_ts_diff = next_slam_ts - wct->next_slam_frame_ts;
-	if (llabs(slam_ts_diff) > U_TIME_1MS_IN_NS) {
-		for (int i = 0; i < wct->num_controllers; i++) {
-			wmr_controller_tracker_connection_notify_timesync(wct->controllers[i].connection, next_slam_ts);
+		if (wct->last_frame_timestamp != 0 && frame_duration > 0 && frame_duration < (2 * U_TIME_1S_IN_NS / 90)) {
+			wct->avg_frame_duration = (frame_duration + (29 * wct->avg_frame_duration)) / 30;
+		}
+
+		/* If the estimate of the next timesync frame moves by more than 1ms, update the controllers */
+		int64_t timesync_ts_diff = next_timesync_ts - wct->next_timesync_frame_ts;
+		if (llabs(timesync_ts_diff) > U_TIME_1MS_IN_NS) {
+			for (int i = 0; i < wct->num_controllers; i++) {
+				wmr_controller_tracker_connection_notify_timesync(wct->controllers[i].connection, next_timesync_ts);
+			}
+			wct->next_timesync_frame_ts = next_timesync_ts;
 		}
 	}
-	wct->next_slam_frame_ts = next_slam_ts;
 
 	os_mutex_unlock(&wct->tracked_controller_lock);
 

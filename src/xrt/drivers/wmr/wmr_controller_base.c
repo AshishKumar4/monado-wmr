@@ -646,7 +646,7 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	wcb->timesync_counter = 2;
 	wcb->timesync_led_intensity = 200;
 	wcb->timesync_val2 = 800;
-	wcb->timesync_time_offset = 7;
+	wcb->timesync_time_offset = 0;
 
 	wcb->timesync_led_intensity_uvar =
 	    (struct u_var_draggable_u16){.val = &wcb->timesync_led_intensity, .min = 1, .max = 399, .step = 1};
