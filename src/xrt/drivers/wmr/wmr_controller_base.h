@@ -15,6 +15,7 @@
 #pragma once
 
 #include "os/os_threading.h"
+#include "math/m_clock_tracking.h"
 #include "math/m_imu_3dof.h"
 #include "util/u_device.h"
 #include "util/u_logging.h"
@@ -144,6 +145,8 @@ struct wmr_controller_base
 	uint64_t last_imu_device_timestamp_ns;
 	//!< Estimated offset from IMU to monotonic clock. Protected by data_lock
 	time_duration_ns hw2mono;
+	//!< Min-Skew estimator for IMU to monotonic clock. Protected by data_lock
+	struct m_clock_windowed_skew_tracker *hw2mono_clock;
 	//!< Last IMU sample received
 	struct wmr_controller_base_imu_sample last_imu;
 

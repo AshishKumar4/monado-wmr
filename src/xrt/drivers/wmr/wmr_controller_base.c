@@ -14,7 +14,6 @@
 
 #include "math/m_mathinclude.h"
 #include "math/m_api.h"
-#include "math/m_clock_tracking.h"
 #include "math/m_vec2.h"
 #include "math/m_vec3.h"
 #include "math/m_predict.h"
@@ -61,6 +60,7 @@ wmr_controller_base(struct xrt_device *p)
 	return (struct wmr_controller_base *)p;
 }
 
+/* Called from subclasses' handle_input_packet method, with data_lock */
 void
 wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
                                struct wmr_controller_base_imu_sample *imu_sample,
@@ -74,7 +74,18 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 
 	// Convert hardware timestamp into monotonic clock. Update offset estimate hw2mono.
 	const float IMU_FREQ = 500.f;
-	timepoint_ns mono_time_ns = m_clock_offset_a2b(IMU_FREQ, now_hw_ns, rx_mono_ns, &wcb->hw2mono);
+	m_clock_offset_a2b(IMU_FREQ, now_hw_ns, rx_mono_ns, &wcb->hw2mono);
+
+	/* Update windowed min-skew estimator */
+	m_clock_windowed_skew_tracker_push(wcb->hw2mono_clock, rx_mono_ns, now_hw_ns);
+
+	timepoint_ns mono_time_ns;
+	if (!m_clock_windowed_skew_tracker_to_local(wcb->hw2mono_clock, now_hw_ns, &mono_time_ns)) {
+		WMR_DEBUG(wcb,
+		          "Dropping IMU sample until clock estimator synchronises. Rcv ts %" PRIu64 " hw ts %" PRIu64,
+		          rx_mono_ns, now_hw_ns);
+		return;
+	}
 
 	/*
 	 * Check if the timepoint does time travel, we get one or two
@@ -560,6 +571,8 @@ wmr_controller_base_deinit(struct wmr_controller_base *wcb)
 		wcb->tracking_connection = NULL;
 	}
 
+	m_clock_windowed_skew_tracker_destroy(wcb->hw2mono_clock);
+
 	os_mutex_destroy(&wcb->conn_lock);
 	os_mutex_destroy(&wcb->data_lock);
 
@@ -585,6 +598,11 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	wcb->log_level = log_level;
 	wcb->wcc = conn;
 	wcb->receive_bytes = receive_bytes;
+
+	// IMU samples arrive every 5ms on average
+	// 1 second seems to be enough to smooth things
+	const int IMU_ARRIVAL_FREQ = 200;
+	wcb->hw2mono_clock = m_clock_windowed_skew_tracker_alloc(IMU_ARRIVAL_FREQ);
 
 	if (controller_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
 		snprintf(wcb->base.str, ARRAY_SIZE(wcb->base.str), "WMR Left Controller");
@@ -732,16 +750,18 @@ void
 wmr_controller_base_notify_timesync(struct wmr_controller_base *wcb, timepoint_ns next_slam_mono_ns)
 {
 	os_mutex_lock(&wcb->data_lock);
-	uint64_t next_device_slam_time_ns = (uint64_t)(next_slam_mono_ns - wcb->hw2mono);
-	uint64_t next_device_slam_time_us = next_device_slam_time_ns / 1000;
+	timepoint_ns next_device_slam_time_ns;
+	if (m_clock_windowed_skew_tracker_to_remote(wcb->hw2mono_clock, next_slam_mono_ns, &next_device_slam_time_ns)) {
+		uint64_t next_device_slam_time_us = next_device_slam_time_ns / 1000;
 
-	if (next_device_slam_time_us != wcb->timesync_device_slam_time_us) {
-		wcb->timesync_device_slam_time_us = next_device_slam_time_us;
-		wcb->timesync_updated = true;
+		if (next_device_slam_time_us != wcb->timesync_device_slam_time_us) {
+			wcb->timesync_device_slam_time_us = next_device_slam_time_us;
+			wcb->timesync_updated = true;
+		}
+
+		wcb->last_timesync_device_timestamp_ns = next_device_slam_time_ns;
+		wcb->last_timesync_timestamp_ns = next_slam_mono_ns;
 	}
-
-	wcb->last_timesync_device_timestamp_ns = next_device_slam_time_ns;
-	wcb->last_timesync_timestamp_ns = next_slam_mono_ns;
 	os_mutex_unlock(&wcb->data_lock);
 }
 
@@ -757,10 +777,13 @@ wmr_controller_base_send_timesync(struct wmr_controller_base *wcb)
 	if (conn != NULL) {
 		/* Each timesync_time_offset step is 1/8th of a 90Hz frame */
 		uint64_t time_offset_us = wcb->timesync_time_offset * (U_TIME_1S_IN_NS / 720000);
+
+		/* Timesync counter counts 1/2/3 in a loop per packet */
 		uint8_t ts_ctr = wcb->timesync_counter++;
 		if (wcb->timesync_counter == 4) {
 			wcb->timesync_counter = 1;
 		}
+
 		int led_intensity = wcb->timesync_led_intensity;
 		uint64_t slam_time_us = wcb->timesync_device_slam_time_us + time_offset_us;
 		int val2 = wcb->timesync_val2;
