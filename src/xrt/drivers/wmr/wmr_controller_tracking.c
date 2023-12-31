@@ -216,7 +216,12 @@ wmr_controller_tracker_receive_frame(struct xrt_frame_sink *sink, struct xrt_fra
 
 	/* The frame cadence is SLAM/controller/controller. Only controller frames are received
 	 * here. On the 2nd controller frame, we need to pass the estimate of the time of the next
-	 * *1st controller frame* to the controller timesync methods.
+	 * *1st controller frame* minus 1/3 of a frame duration to the controller timesync methods.
+	 * That is 2/90 + 1/270 = 5/270 or 5/3rds of the average frame duration.
+	 * @todo: Also calculate how many full 3-frame cycles have passed since the last
+	 * '2nd Controller frame' to add to our estimate in case of scheduling delays.
+	 * @todo: Move the 'next frame' estimate into the controller timesync code so it's
+	 * calculated when the led control packet is actually about to be sent.
 	 * Since only controller frames get passed to here, the 2nd sequential controller
 	 * frame is the one right before the next SLAM frame */
 	bool is_second_frame = (wct->last_frame_sequence + 1) == xf->source_sequence;
@@ -225,18 +230,22 @@ wmr_controller_tracker_receive_frame(struct xrt_frame_sink *sink, struct xrt_fra
 
 	// Update the controller timesync estimate
 	if (is_second_frame) {
-		timepoint_ns frame_duration = xf->timestamp - wct->last_frame_timestamp;
-		timepoint_ns next_timesync_ts = (timepoint_ns)(xf->timestamp) + 2 * wct->avg_frame_duration;
-
-		if (wct->last_frame_timestamp != 0 && frame_duration > 0 && frame_duration < (2 * U_TIME_1S_IN_NS / 90)) {
+		// Use the spacing between the 1st and 2nd controller frames to update the
+		// average frame duration
+		time_duration_ns frame_duration = xf->timestamp - wct->last_frame_timestamp;
+		if (wct->last_frame_timestamp != 0 && frame_duration > 0 &&
+		    frame_duration < (2 * U_TIME_1S_IN_NS / 90)) {
 			wct->avg_frame_duration = (frame_duration + (29 * wct->avg_frame_duration)) / 30;
 		}
+
+		timepoint_ns next_timesync_ts = (timepoint_ns)(xf->timestamp) + 5 * wct->avg_frame_duration / 3;
 
 		/* If the estimate of the next timesync frame moves by more than 1ms, update the controllers */
 		int64_t timesync_ts_diff = next_timesync_ts - wct->next_timesync_frame_ts;
 		if (llabs(timesync_ts_diff) > U_TIME_1MS_IN_NS) {
 			for (int i = 0; i < wct->num_controllers; i++) {
-				wmr_controller_tracker_connection_notify_timesync(wct->controllers[i].connection, next_timesync_ts);
+				wmr_controller_tracker_connection_notify_timesync(wct->controllers[i].connection,
+				                                                  next_timesync_ts);
 			}
 			wct->next_timesync_frame_ts = next_timesync_ts;
 		}
