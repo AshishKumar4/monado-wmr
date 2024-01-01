@@ -655,9 +655,16 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 
 	wmr_config_precompute_transforms(&wcb->config.sensors, NULL);
 
+	/* Reset device time before controller outputs */
+	fw_cmd = WMR_CONTROLLER_FW_CMD_INIT(0x06, 0x21, 0x00, 0x00);
+	if (wmr_controller_send_fw_cmd(wcb, &fw_cmd, 0x06, &fw_cmd_response) < 0) {
+		return false;
+	}
+
 	/* Enable the status reports, IMU and control status reports */
 	const unsigned char wmr_controller_status_enable_cmd[64] = {0x06, 0x03, 0x01, 0x00, 0x02};
 	wmr_controller_send_bytes(wcb, wmr_controller_status_enable_cmd, sizeof(wmr_controller_status_enable_cmd));
+	os_nanosleep(U_TIME_1MS_IN_NS * 20); // Sleep 20ms
 	const unsigned char wmr_controller_imu_on_cmd[64] = {0x06, 0x03, 0x02, 0xe1, 0x02};
 	wmr_controller_send_bytes(wcb, wmr_controller_imu_on_cmd, sizeof(wmr_controller_imu_on_cmd));
 
@@ -775,7 +782,7 @@ wmr_controller_base_send_timesync(struct wmr_controller_base *wcb)
 	os_mutex_lock(&wcb->conn_lock);
 	struct wmr_controller_connection *conn = wcb->wcc;
 	if (conn != NULL) {
-		/* Each timesync_time_offset step is 1/8th of a 90Hz frame */
+		/* Each timesync_time_offset step is 1/8th of a 90Hz frame = 1/(8*90) */
 		uint64_t time_offset_us = wcb->timesync_time_offset * (U_TIME_1S_IN_NS / 720000);
 
 		/* Timesync counter counts 1/2/3 in a loop per packet */
