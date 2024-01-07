@@ -108,6 +108,8 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 
 static void
 wmr_controller_base_send_timesync(struct wmr_controller_base *wcb);
+static void
+wmr_controller_base_send_keepalive(struct wmr_controller_base *wcb, uint64_t time_ns);
 
 static void
 receive_bytes(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *buffer, uint32_t buf_size)
@@ -125,6 +127,8 @@ receive_bytes(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *buffer
 			wmr_controller_base_send_timesync(wcb);
 			wcb->timesync_updated = false;
 		}
+
+		wmr_controller_base_send_keepalive(wcb, time_ns);
 
 		// Note: skipping msg type byte
 		bool b = wcb->handle_input_packet(wcb, time_ns, &buffer[1], (size_t)buf_size - 1);
@@ -689,6 +693,8 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	u_var_add_ro_u64(wcb, &wcb->last_imu_timestamp_ns, "Last CPU IMU TS");
 	u_var_add_ro_u64(wcb, &wcb->last_imu_device_timestamp_ns, "Last device IMU TS");
 
+	u_var_add_ro_u64(wcb, &wcb->next_keepalive_timestamp_ns, "Next keepalive TS");
+
 	u_var_add_gui_header(wcb, NULL, "LED Sync");
 	u_var_add_draggable_u16(wcb, &wcb->timesync_led_intensity_uvar, "LED intensity");
 	u_var_add_draggable_u16(wcb, &wcb->timesync_val2_uvar, "U2");
@@ -809,6 +815,41 @@ wmr_controller_base_send_timesync(struct wmr_controller_base *wcb)
 		WMR_TRACE_HEX(wcb, timesync_pkt, sizeof(timesync_pkt));
 	} else {
 		os_mutex_unlock(&wcb->conn_lock);
+	}
+}
+
+/* Called with data_lock held */
+static void
+wmr_controller_base_send_keepalive(struct wmr_controller_base *wcb, uint64_t now_ns)
+{
+	const uint64_t KEEPALIVE_DURATION = 125 * U_TIME_1MS_IN_NS;
+
+	if (wcb->next_keepalive_timestamp_ns > now_ns) {
+		/* Too soon to send the Keepalive */
+		return;
+	}
+
+
+	os_mutex_lock(&wcb->conn_lock);
+	struct wmr_controller_connection *conn = wcb->wcc;
+	if (conn != NULL) {
+		uint8_t keepalive_pkt[2];
+
+		keepalive_pkt[0] = WMR_MOTION_CONTROLLER_KEEPALIVE;
+		keepalive_pkt[1] = wcb->cmd_counter++;
+
+		os_mutex_unlock(&wcb->data_lock);
+		wmr_controller_connection_send_bytes(conn, keepalive_pkt, sizeof(keepalive_pkt));
+
+		os_mutex_unlock(&wcb->conn_lock);
+		os_mutex_lock(&wcb->data_lock);
+	}
+
+	/* Calculate the next timeout */
+	if (wcb->next_keepalive_timestamp_ns == 0) {
+		wcb->next_keepalive_timestamp_ns = now_ns + KEEPALIVE_DURATION;
+	} else {
+		wcb->next_keepalive_timestamp_ns += KEEPALIVE_DURATION;
 	}
 }
 

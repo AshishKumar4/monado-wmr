@@ -152,8 +152,8 @@ struct wmr_controller_base
 
 	//!< Command counter for timesync and keep-alives. conn_lock
 	uint8_t cmd_counter;
-	//!< Last keepalive timestamp. conn_lock
-	timepoint_ns last_keepalive_timestamp_ns;
+	//!< Next (local mono) time to send keepalive. conn_lock
+	uint64_t next_keepalive_timestamp_ns;
 	//!< Last timesync counter. 0, 1 or 2 then loops. Starts @ 1. conn_lock
 	uint8_t timesync_counter;
 	//!< Variable in the timesync packet. valid values: 1..399.
