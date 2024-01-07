@@ -14,6 +14,10 @@
 
 #include "util/u_trace_marker.h"
 
+#ifdef XRT_OS_LINUX
+#include "util/u_linux.h"
+#endif
+
 #include "wmr_common.h"
 #include "wmr_bt_controller.h"
 #include "wmr_controller.h"
@@ -104,6 +108,11 @@ wmr_bt_connection_run_thread(void *ptr)
 	U_TRACE_SET_THREAD_NAME("WMR: BT-Controller");
 
 	struct wmr_bt_connection *conn = wmr_bt_connection(ptr);
+
+#ifdef XRT_OS_LINUX
+	// Try to raise priority of this thread.
+	u_linux_try_to_set_realtime_priority_on_thread(conn->log_level, "WMR: BT-Controller");
+#endif
 
 	os_thread_helper_lock(&conn->controller_thread);
 	while (os_thread_helper_is_running_locked(&conn->controller_thread)) {
