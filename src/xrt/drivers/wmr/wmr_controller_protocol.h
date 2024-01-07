@@ -39,6 +39,11 @@ extern "C" {
 
 // Messages types for WMR motion controllers
 #define WMR_MOTION_CONTROLLER_STATUS_MSG 0x01
+#define WMR_MOTION_CONTROLLER_FW_TASK 0x02     /* FW replies, but also sent for FW writes */
+#define WMR_MOTION_CONTROLLER_LED_CONTROL 0x03 /* Sent to control LED brightness / timing */
+#define WMR_MOTION_CONTROLLER_HAPTIC_BUZZ 0x04 /* Turn on / off haptic motors */
+#define WMR_MOTION_CONTROLLER_KEEPALIVE 0x05   /* Regularly sent Keepalives */
+#define WMR_MOTION_CONTROLLER_CONTROL 0x06     /* Various control: FW read, telemetry enable, clock reset */
 
 struct wmr_controller_fw_cmd
 {
