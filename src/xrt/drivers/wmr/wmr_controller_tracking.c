@@ -130,10 +130,6 @@ struct wmr_controller_tracker
 	struct wmr_controller_tracker_camera cam[WMR_MAX_CAMERAS];
 	int cam_count;
 
-	//! Controller LED timesync tracking
-	uint64_t avg_frame_duration;
-	uint64_t next_timesync_frame_ts;
-
 	/* Debug */
 	enum u_logging_level log_level;
 	bool debug_draw_normalise;
@@ -230,24 +226,10 @@ wmr_controller_tracker_receive_frame(struct xrt_frame_sink *sink, struct xrt_fra
 
 	// Update the controller timesync estimate
 	if (is_second_frame) {
-		// Use the spacing between the 1st and 2nd controller frames to update the
-		// average frame duration
-		time_duration_ns frame_duration = xf->timestamp - wct->last_frame_timestamp;
-		if (wct->last_frame_timestamp != 0 && frame_duration > 0 &&
-		    frame_duration < (2 * U_TIME_1S_IN_NS / 90)) {
-			wct->avg_frame_duration = (frame_duration + (29 * wct->avg_frame_duration)) / 30;
-		}
+		timepoint_ns next_timesync_ts = (timepoint_ns)(xf->timestamp) + U_TIME_1MS_IN_NS * 18;
 
-		timepoint_ns next_timesync_ts = (timepoint_ns)(xf->timestamp) + 5 * wct->avg_frame_duration / 3;
-
-		/* If the estimate of the next timesync frame moves by more than 1ms, update the controllers */
-		int64_t timesync_ts_diff = next_timesync_ts - wct->next_timesync_frame_ts;
-		if (llabs(timesync_ts_diff) > U_TIME_1MS_IN_NS) {
-			for (int i = 0; i < wct->num_controllers; i++) {
-				wmr_controller_tracker_connection_notify_timesync(wct->controllers[i].connection,
-				                                                  next_timesync_ts);
-			}
-			wct->next_timesync_frame_ts = next_timesync_ts;
+		for (int i = 0; i < wct->num_controllers; i++) {
+			wmr_controller_tracker_connection_notify_timesync(wct->controllers[i].connection, next_timesync_ts);
 		}
 	}
 
@@ -866,9 +848,6 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 	wct->debug_draw_blob_ids = true;
 	wct->hmd_xdev = hmd_xdev;
 
-	/* Init frame duration to 90fps */
-	wct->avg_frame_duration = U_TIME_1S_IN_NS / 90;
-
 	// Set up the per-camera constellation tracking pieces config and pose
 	wct->cam_count = slam_calib->cam_count;
 
@@ -937,7 +916,6 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 	u_var_add_log_level(wct, &wct->log_level, "Log Level");
 	u_var_add_ro_i32(wct, &wct->num_controllers, "Num Controllers");
 	u_var_add_ro_u64(wct, &wct->last_frame_timestamp, "Last Frame Timestamp");
-	u_var_add_ro_u64(wct, &wct->avg_frame_duration, "Average frame duration (ns)");
 	u_var_add_ro_u64(wct, &wct->last_blob_analysis_ms, "Blob tracking time (ms)");
 	u_var_add_ro_u64(wct, &wct->last_fast_analysis_ms, "Fast analysis time (ms)");
 	u_var_add_ro_u64(wct, &wct->last_long_analysis_ms, "Long analysis time (ms)");
