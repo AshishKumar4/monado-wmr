@@ -396,7 +396,14 @@ img_xfer_cb(struct libusb_transfer *xfer)
 	              cam->frame_sequence, exposure);
 
 	xf->source_sequence = cam->frame_sequence;
-	xf->timestamp = frame_start_ts + delta / 2;
+	/* Pass a mid-point timestamp for SLAM (why?). Pass
+	 * the start timestamp for the controller tracking though,
+	 * as those frames have really short exposures */
+	if (slam_tracking_frame) {
+		xf->timestamp = frame_start_ts + delta / 2;
+	} else {
+		xf->timestamp = frame_start_ts;
+	}
 	xf->source_timestamp = frame_start_ts;
 
 	cam->last_frame_ts = frame_start_ts;
