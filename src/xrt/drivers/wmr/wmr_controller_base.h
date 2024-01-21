@@ -150,6 +150,11 @@ struct wmr_controller_base
 	//!< Last IMU sample received
 	struct wmr_controller_base_imu_sample last_imu;
 
+	//! Last timestamp of tracked pose from optical controller tracking
+	timepoint_ns last_tracked_pose_ts;
+	//! Last tracked pose from optical controller tracking
+	struct xrt_pose last_tracked_pose;
+
 	//!< Command counter for timesync and keep-alives. conn_lock
 	uint8_t cmd_counter;
 	//!< Next (local mono) time to send keepalive. conn_lock
@@ -196,6 +201,11 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 
 void
 wmr_controller_base_notify_timesync(struct wmr_controller_base *wcb, timepoint_ns next_slam_mono_ns);
+
+void
+wmr_controller_base_push_observed_pose(struct wmr_controller_base *wcb,
+                                       timepoint_ns frame_mono_ns,
+                                       const struct xrt_pose *pose);
 
 static inline void
 wmr_controller_connection_receive_bytes(struct wmr_controller_connection *wcc,

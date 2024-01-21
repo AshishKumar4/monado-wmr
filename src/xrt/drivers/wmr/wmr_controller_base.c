@@ -519,8 +519,8 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	struct xrt_space_relation relation = {0};
 	relation.relation_flags = (enum xrt_space_relation_flags)(
 	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+	    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
 	    XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT);
-
 
 	struct xrt_pose pose = {{0, 0, 0, 1}, {0, 1.2, -0.5}};
 	if (xdev->device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
@@ -535,6 +535,10 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	relation.pose.orientation = wcb->fusion.rot;
 	relation.angular_velocity = wcb->last_angular_velocity;
 	last_imu_timestamp_ns = wcb->last_imu_timestamp_ns;
+
+	if (wcb->last_tracked_pose_ts != 0) {
+		relation.pose = wcb->last_tracked_pose;
+	}
 	os_mutex_unlock(&wcb->data_lock);
 
 	// No prediction needed.
@@ -878,4 +882,15 @@ wmr_controller_base_get_led_model(struct wmr_controller_base *wcb, struct conste
 	}
 
 	return true;
+}
+
+void
+wmr_controller_base_push_observed_pose(struct wmr_controller_base *wcb,
+                                       timepoint_ns frame_mono_ns,
+                                       const struct xrt_pose *pose)
+{
+	os_mutex_lock(&wcb->data_lock);
+	wcb->last_tracked_pose_ts = frame_mono_ns;
+	wcb->last_tracked_pose = *pose;
+	os_mutex_unlock(&wcb->data_lock);
 }

@@ -170,6 +170,18 @@ wmr_controller_tracker_connection_notify_timesync(struct wmr_controller_tracker_
 	os_mutex_unlock(&wctc->lock);
 }
 
+static void
+wmr_controller_tracker_connection_notify_pose(struct wmr_controller_tracker_connection *wctc,
+                                              timepoint_ns frame_mono_ns,
+                                              const struct xrt_pose *pose)
+{
+	os_mutex_lock(&wctc->lock);
+	if (!wctc->disconnected) {
+		wmr_controller_base_push_observed_pose(wctc->wcb, frame_mono_ns, pose);
+	}
+	os_mutex_unlock(&wctc->lock);
+}
+
 static bool
 wmr_controller_tracker_connection_get_led_model(struct wmr_controller_tracker_connection *wctc,
                                                 struct constellation_led_model *led_model)
@@ -229,7 +241,8 @@ wmr_controller_tracker_receive_frame(struct xrt_frame_sink *sink, struct xrt_fra
 		timepoint_ns next_timesync_ts = (timepoint_ns)(xf->timestamp) + U_TIME_1MS_IN_NS * 18;
 
 		for (int i = 0; i < wct->num_controllers; i++) {
-			wmr_controller_tracker_connection_notify_timesync(wct->controllers[i].connection, next_timesync_ts);
+			wmr_controller_tracker_connection_notify_timesync(wct->controllers[i].connection,
+			                                                  next_timesync_ts);
 		}
 	}
 
@@ -332,8 +345,11 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 		device->last_seen_pose = dev_state->final_pose;
 		device->last_matched_blobs = score->matched_blobs;
 		device->last_matched_cam = view_id;
+
+		/* Submit this pose observation to the fusion / real device */
+		wmr_controller_tracker_connection_notify_pose(device->connection, device->last_seen_pose_ts,
+		                                              &device->last_seen_pose);
 	}
-	/* @todo: Submit this pose observation to the fusion / real device */
 	os_mutex_unlock(&wct->tracked_controller_lock);
 }
 
