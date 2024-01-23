@@ -1085,11 +1085,6 @@ wmr_hmd_get_3dof_tracked_pose(struct xrt_device *xdev,
 
 	struct wmr_hmd *wh = wmr_hmd(xdev);
 
-	if (name != XRT_INPUT_GENERIC_HEAD_POSE) {
-		U_LOG_XDEV_UNSUPPORTED_INPUT(&wh->base, wh->log_level, name);
-		return XRT_ERROR_INPUT_UNSUPPORTED;
-	}
-
 	// Variables needed for prediction.
 	uint64_t last_imu_timestamp_ns = 0;
 	struct xrt_space_relation relation = {0};
@@ -1104,16 +1099,16 @@ wmr_hmd_get_3dof_tracked_pose(struct xrt_device *xdev,
 	last_imu_timestamp_ns = wh->fusion.last_imu_timestamp_ns;
 	os_mutex_unlock(&wh->fusion.mutex);
 
-	// No prediction needed.
-	if (at_timestamp_ns < last_imu_timestamp_ns) {
+	// prediction needed.
+	if (at_timestamp_ns > last_imu_timestamp_ns) {
+		uint64_t prediction_ns = at_timestamp_ns - last_imu_timestamp_ns;
+		double prediction_s = time_ns_to_s(prediction_ns);
+
+		m_predict_relation(&relation, prediction_s, out_relation);
+	} else {
 		*out_relation = relation;
-		return XRT_SUCCESS;
 	}
 
-	uint64_t prediction_ns = at_timestamp_ns - last_imu_timestamp_ns;
-	double prediction_s = time_ns_to_s(prediction_ns);
-
-	m_predict_relation(&relation, prediction_s, out_relation);
 	wh->pose = out_relation->pose;
 
 	return XRT_SUCCESS;
@@ -1159,7 +1154,8 @@ wmr_hmd_get_slam_tracked_pose(struct xrt_device *xdev,
 #endif
 	}
 
-	if (wh->tracking.imu2me) {
+	if (name == XRT_INPUT_GENERIC_HEAD_POSE && wh->tracking.imu2me) {
+		/* Move the pose to the middle-eye position for generic head pose, bit not for generic tracker pose */
 		math_pose_transform(&wh->pose, &wh->config.sensors.transforms.P_imu_me, &wh->pose);
 	}
 
@@ -1178,6 +1174,12 @@ wmr_hmd_get_tracked_pose(struct xrt_device *xdev,
 	DRV_TRACE_MARKER();
 
 	struct wmr_hmd *wh = wmr_hmd(xdev);
+
+	if (name != XRT_INPUT_GENERIC_HEAD_POSE && name != XRT_INPUT_GENERIC_TRACKER_POSE) {
+		out_relation->pose = (struct xrt_pose)XRT_POSE_IDENTITY;
+		U_LOG_XDEV_UNSUPPORTED_INPUT(&wh->base, wh->log_level, name);
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
 
 	at_timestamp_ns += (int64_t)(wh->tracked_offset_ms.val * (double)U_TIME_1MS_IN_NS);
 
