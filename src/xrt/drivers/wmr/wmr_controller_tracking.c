@@ -87,7 +87,7 @@ struct wmr_controller_tracker_camera
 	struct camera_model camera_model;
 	//! ROI in the full frame mosaic
 	struct xrt_rect roi;
-	//! Camera's pose relative to the HMD GENERIC_HEAD_POSE
+	//! Camera's pose relative to the HMD GENERIC_TRACKER_POSE (IMU)
 	struct xrt_pose imu_cam_pose;
 
 	//! Constellation tracking - fast tracking thread
@@ -325,7 +325,9 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 	blobwatch_update_labels(cam->bw, view->bwobs, device->led_model.id);
 	os_mutex_unlock(&cam->bw_lock);
 
-	math_pose_transform(&view->pose, obj_cam_pose, &dev_state->final_pose);
+	struct xrt_pose cam_obj_pose;
+	math_pose_invert(obj_cam_pose, &cam_obj_pose);
+	math_pose_transform(&view->pose, &cam_obj_pose, &dev_state->final_pose);
 	dev_state->found_device_pose = true;
 	dev_state->found_pose_view_id = view_id;
 
@@ -483,7 +485,7 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 	WMR_DEBUG(wct, "Starting analysis of frame %" PRIu64 " TS %" PRIu64, xf->source_sequence, xf->timestamp);
 
 	/* Get the HMD's pose so we can calculate the camera view poses */
-	xrt_device_get_tracked_pose(wct->hmd_xdev, XRT_INPUT_GENERIC_HEAD_POSE, xf->timestamp, &xsr_base_pose);
+	xrt_device_get_tracked_pose(wct->hmd_xdev, XRT_INPUT_GENERIC_TRACKER_POSE, xf->timestamp, &xsr_base_pose);
 
 	/* Split out camera views and collect blobs across all cameras */
 	assert(wct->cam_count <= CONSTELLATION_MAX_CAMERAS);
