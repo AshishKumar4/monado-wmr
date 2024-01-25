@@ -325,9 +325,9 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 	blobwatch_update_labels(cam->bw, view->bwobs, device->led_model.id);
 	os_mutex_unlock(&cam->bw_lock);
 
-	struct xrt_pose cam_obj_pose;
-	math_pose_invert(obj_cam_pose, &cam_obj_pose);
-	math_pose_transform(&view->pose, &cam_obj_pose, &dev_state->final_pose);
+	/* We have object relative to camera = P_cam_object and want P_world_object
+	 * so, P_world_cam * P_cam_object */
+	math_pose_transform(&view->pose, obj_cam_pose, &dev_state->final_pose);
 	dev_state->found_device_pose = true;
 	dev_state->found_pose_view_id = view_id;
 

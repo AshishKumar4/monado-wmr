@@ -655,6 +655,7 @@ wmr_config_precompute_transforms(struct wmr_inertial_sensors_config *sensors,
 	math_pose_transform(&P_oxr_wmr, &P_oxr_ht0_me, &P_oxr_ht0_me);
 
 	// Save transforms
+	sensors->transforms.P_oxr_wmr = P_oxr_wmr;
 	math_pose_transform(&P_oxr_wmr, &P_me_acc, &sensors->transforms.P_oxr_acc);
 	math_pose_transform(&P_oxr_wmr, &P_me_gyr, &sensors->transforms.P_oxr_gyr);
 	sensors->transforms.P_ht0_me = P_oxr_ht0_me;

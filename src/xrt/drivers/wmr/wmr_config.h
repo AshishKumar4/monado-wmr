@@ -126,6 +126,7 @@ struct wmr_inertial_sensor_config
 /* Precomputed transforms to convert between OpenXR and WMR coordinate systems */
 struct wmr_sensor_transforms_config
 {
+	struct xrt_pose P_oxr_wmr; //!< Generic transform from WMR coord to OpenXR
 	struct xrt_pose P_oxr_acc; //!< Converts accel samples into OpenXR coordinates
 	struct xrt_pose P_oxr_gyr; //!< Converts gyro samples into OpenXR coordinates
 	struct xrt_pose P_ht0_me;  //!< ME="middle of the eyes". HT0-to-ME transform but in OpenXR coordinates
