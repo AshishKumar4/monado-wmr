@@ -693,11 +693,14 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	u_var_add_gui_header(wcb, NULL, "IMU");
 	u_var_add_ro_vec3_f32(wcb, &wcb->last_imu.acc, "imu.accel");
 	u_var_add_ro_vec3_f32(wcb, &wcb->last_imu.gyro, "imu.gyro");
+	u_var_add_ro_quat_f32(wcb, &wcb->fusion.rot, "fusion.rot");
 	u_var_add_i32(wcb, &wcb->last_imu.temperature, "imu.temperature");
 	u_var_add_ro_u64(wcb, &wcb->last_imu_timestamp_ns, "Last CPU IMU TS");
 	u_var_add_ro_u64(wcb, &wcb->last_imu_device_timestamp_ns, "Last device IMU TS");
 
-	u_var_add_ro_u64(wcb, &wcb->next_keepalive_timestamp_ns, "Next keepalive TS");
+	u_var_add_gui_header(wcb, NULL, "Optical Tracking");
+	u_var_add_pose(wcb, &wcb->last_tracked_pose, "Last observed pose");
+	u_var_add_ro_i64(wcb, &wcb->last_tracked_pose_ts, "Last observed pose TS");
 
 	u_var_add_gui_header(wcb, NULL, "LED Sync");
 	u_var_add_draggable_u16(wcb, &wcb->timesync_led_intensity_uvar, "LED intensity");
@@ -705,6 +708,10 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	u_var_add_draggable_u16(wcb, &wcb->timesync_time_offset_uvar, "time offset (0.5ms increment)");
 	u_var_add_ro_u64(wcb, &wcb->last_timesync_timestamp_ns, "Last CPU timesync TS");
 	u_var_add_ro_u64(wcb, &wcb->last_timesync_device_timestamp_ns, "Last device timesync TS");
+
+	u_var_add_gui_header(wcb, NULL, "Misc");
+	u_var_add_ro_u64(wcb, &wcb->next_keepalive_timestamp_ns, "Next keepalive TS");
+
 	return true;
 }
 
