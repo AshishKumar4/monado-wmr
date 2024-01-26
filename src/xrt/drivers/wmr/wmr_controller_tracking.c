@@ -138,6 +138,8 @@ struct wmr_controller_tracker
 	bool debug_draw_blob_ids;
 	bool debug_draw_blob_unique_ids;
 	bool debug_draw_leds;
+	bool debug_draw_prior_leds;
+	bool debug_draw_last_leds;
 	bool debug_draw_pose_bounds;
 
 	uint64_t last_frame_timestamp;
@@ -571,10 +573,8 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 		    MIN_ROT_ERROR;
 		dev_state->gravity_error_rad = MIN_ROT_ERROR;
 
-		if (device->have_last_seen_pose) {
-			dev_state->have_last_seen_pose = true;
-			dev_state->last_seen_pose = device->last_seen_pose;
-		}
+		dev_state->have_last_seen_pose = device->have_last_seen_pose;
+		dev_state->last_seen_pose = device->last_seen_pose;
 
 		dev_state->dev_index = d;
 		dev_state->led_model = &device->led_model;
@@ -635,6 +635,10 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 		debug_flags |= DEBUG_DRAW_FLAG_BLOB_UNIQUE_IDS;
 	if (wct->debug_draw_leds)
 		debug_flags |= DEBUG_DRAW_FLAG_LEDS;
+	if (wct->debug_draw_prior_leds)
+		debug_flags |= DEBUG_DRAW_FLAG_PRIOR_LEDS;
+	if (wct->debug_draw_last_leds)
+		debug_flags |= DEBUG_DRAW_FLAG_LAST_SEEN_LEDS;
 	if (wct->debug_draw_pose_bounds)
 		debug_flags |= DEBUG_DRAW_FLAG_POSE_BOUNDS;
 
@@ -944,6 +948,8 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 	u_var_add_bool(wct, &wct->debug_draw_blob_ids, "Debug: Draw LED id labels for blobs");
 	u_var_add_bool(wct, &wct->debug_draw_blob_unique_ids, "Debug: Draw blobs tracking ID");
 	u_var_add_bool(wct, &wct->debug_draw_leds, "Debug: Draw LED position markers for found poses");
+	u_var_add_bool(wct, &wct->debug_draw_prior_leds, "Debug: Draw LED markers for prior poses");
+	u_var_add_bool(wct, &wct->debug_draw_last_leds, "Debug: Draw LED markers for last observed poses");
 	u_var_add_bool(wct, &wct->debug_draw_pose_bounds, "Debug: Draw bounds rect for found poses");
 
 	for (int i = 0; i < wct->cam_count; i++) {
