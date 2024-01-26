@@ -537,7 +537,7 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	last_imu_timestamp_ns = wcb->last_imu_timestamp_ns;
 
 	if (wcb->last_tracked_pose_ts != 0) {
-		relation.pose = wcb->last_tracked_pose;
+		relation.pose.position = wcb->last_tracked_pose.position;
 	}
 	os_mutex_unlock(&wcb->data_lock);
 
@@ -892,5 +892,13 @@ wmr_controller_base_push_observed_pose(struct wmr_controller_base *wcb,
 	os_mutex_lock(&wcb->data_lock);
 	wcb->last_tracked_pose_ts = frame_mono_ns;
 	wcb->last_tracked_pose = *pose;
+
+	// Apply 5% of observed orientation to 3dof fusion
+	// FIXME: Do better
+	struct xrt_pose tmp = (struct xrt_pose)XRT_POSE_IDENTITY;
+	tmp.orientation = wcb->fusion.rot;
+	math_pose_interpolate(&tmp, pose, 0.05, &tmp);
+	wcb->fusion.rot = tmp.orientation; // Update the 3dof pose a bit too. Could just do the yaw?
+
 	os_mutex_unlock(&wcb->data_lock);
 }
