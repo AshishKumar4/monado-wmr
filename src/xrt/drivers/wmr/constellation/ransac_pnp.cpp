@@ -66,7 +66,7 @@ ransac_pnp_pose(struct xrt_pose *pose,
 	int i, j;
 	int num_leds = 0;
 	uint64_t taken = 0;
-	int flags = cv::SOLVEPNP_ITERATIVE;
+	int flags = cv::SOLVEPNP_SQPNP;
 	cv::Mat inliers;
 	int iterationsCount = 100;
 	float confidence = 0.99;
