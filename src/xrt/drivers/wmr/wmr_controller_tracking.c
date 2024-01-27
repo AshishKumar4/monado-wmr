@@ -89,7 +89,7 @@ struct wmr_controller_tracker_camera
 	//! ROI in the full frame mosaic
 	struct xrt_rect roi;
 	//! Camera's pose relative to the HMD GENERIC_TRACKER_POSE (IMU)
-	struct xrt_pose imu_cam_pose;
+	struct xrt_pose P_imu_cam;
 
 	//! Constellation tracking - fast tracking thread
 	struct os_mutex bw_lock; /* Protects blobwatch process vs release from long thread */
@@ -312,7 +312,7 @@ submit_device_pose(struct wmr_controller_tracker *wct,
                    struct tracking_sample_device_state *dev_state,
                    struct constellation_tracking_sample *sample,
                    int view_id,
-                   struct xrt_pose *obj_cam_pose)
+                   struct xrt_pose *P_cam_obj)
 {
 	struct wmr_controller_tracker_camera *cam = wct->cam + view_id;
 	struct tracking_sample_frame *view = sample->views + view_id;
@@ -320,9 +320,9 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 
 	struct pose_metrics *score = &dev_state->score;
 
-	pose_metrics_match_pose_to_blobs(obj_cam_pose, view->bwobs->blobs, view->bwobs->num_blobs, &device->led_model,
+	pose_metrics_match_pose_to_blobs(P_cam_obj, view->bwobs->blobs, view->bwobs->num_blobs, &device->led_model,
 	                                 &cam->camera_model, &dev_state->blob_match_info);
-	mark_matching_blobs(wct, obj_cam_pose, view->bwobs, &device->led_model, &dev_state->blob_match_info);
+	mark_matching_blobs(wct, P_cam_obj, view->bwobs, &device->led_model, &dev_state->blob_match_info);
 
 	os_mutex_lock(&cam->bw_lock);
 	blobwatch_update_labels(cam->bw, view->bwobs, device->led_model.id);
@@ -330,18 +330,20 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 
 	/* We have object relative to camera = P_cam_object and want P_world_object
 	 * so, P_world_cam * P_cam_object */
-	math_pose_transform(&view->pose, obj_cam_pose, &dev_state->final_pose);
+	math_pose_transform(&view->P_world_cam, P_cam_obj, &dev_state->final_pose);
 	dev_state->found_device_pose = true;
 	dev_state->found_pose_view_id = view_id;
 
 	WMR_DEBUG(wct,
 	          "Found a pose on cam %u device %d score match_flags 0x%x matched %u "
-	          "blobs of %u visible LEDs. Global pose %f %f %f %f pos %f %f %f",
+	          "blobs of %u visible LEDs. Global pose %f,%f,%f,%f pos %f,%f,%f "
+	          "cam-relative pose was %f,%f,%f,%f pos %f,%f,%f",
 	          view_id, device->led_model.id, score->match_flags, score->matched_blobs, score->visible_leds,
 	          dev_state->final_pose.orientation.x, dev_state->final_pose.orientation.y,
 	          dev_state->final_pose.orientation.z, dev_state->final_pose.orientation.w,
-	          dev_state->final_pose.position.x, dev_state->final_pose.orientation.y,
-	          dev_state->final_pose.position.z);
+	          dev_state->final_pose.position.x, dev_state->final_pose.position.y, dev_state->final_pose.position.z,
+	          P_cam_obj->orientation.x, P_cam_obj->orientation.y, P_cam_obj->orientation.z,
+	          P_cam_obj->orientation.w, P_cam_obj->position.x, P_cam_obj->position.y, P_cam_obj->position.z);
 
 	os_mutex_lock(&wct->tracked_controller_lock);
 	if (device->have_last_seen_pose == false || sample->timestamp > device->last_seen_pose_ts) {
@@ -350,7 +352,7 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 		device->last_seen_pose = dev_state->final_pose;
 		device->last_matched_blobs = score->matched_blobs;
 		device->last_matched_cam = view_id;
-		device->last_matched_cam_pose = *obj_cam_pose;
+		device->last_matched_cam_pose = *P_cam_obj;
 
 		/* Submit this pose observation to the fusion / real device */
 		wmr_controller_tracker_connection_notify_pose(device->connection, device->last_seen_pose_ts,
@@ -364,7 +366,7 @@ static bool
 device_try_global_pose(struct wmr_controller_tracker *wct,
                        struct tracking_sample_device_state *dev_state,
                        struct constellation_tracking_sample *sample,
-                       struct xrt_pose *global_pose)
+                       struct xrt_pose *P_world_obj_candidate)
 {
 	for (int view_id = 0; view_id < sample->n_views; view_id++) {
 		struct tracking_sample_frame *view = sample->views + view_id;
@@ -377,19 +379,19 @@ device_try_global_pose(struct wmr_controller_tracker *wct,
 		struct wmr_controller_tracker_device *device = wct->controllers + dev_state->dev_index;
 		blobservation *bwobs = view->bwobs;
 
-		struct xrt_pose obj_cam_pose;
-		math_pose_transform(&view->inv_pose, global_pose, &obj_cam_pose);
+		struct xrt_pose P_cam_obj_candidate;
+		math_pose_transform(&view->P_cam_world, P_world_obj_candidate, &P_cam_obj_candidate);
 
-		struct xrt_pose obj_prior_cam_pose;
-		math_pose_transform(&view->inv_pose, &dev_state->prior_pose, &obj_prior_cam_pose);
+		struct xrt_pose P_cam_obj_prior;
+		math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
 
-		pose_metrics_evaluate_pose_with_prior(&dev_state->score, &obj_cam_pose, false, &obj_prior_cam_pose,
+		pose_metrics_evaluate_pose_with_prior(&dev_state->score, &P_cam_obj_candidate, false, &P_cam_obj_prior,
 		                                      &dev_state->prior_pos_error, &dev_state->prior_rot_error,
 		                                      bwobs->blobs, bwobs->num_blobs, &device->led_model,
 		                                      &cam->camera_model, NULL);
 
 		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD | POSE_MATCH_LED_IDS)) {
-			submit_device_pose(wct, dev_state, sample, view_id, &obj_cam_pose);
+			submit_device_pose(wct, dev_state, sample, view_id, &P_cam_obj_candidate);
 			return true;
 		}
 	}
@@ -430,42 +432,46 @@ device_try_recover_pose(struct wmr_controller_tracker *wct,
 			continue;
 		}
 
-		struct xrt_pose obj_prior_cam_pose;
-		math_pose_transform(&view->inv_pose, &dev_state->prior_pose, &obj_prior_cam_pose);
+		struct xrt_pose P_cam_obj_prior;
+		math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
 
-		WMR_DEBUG(
-		    wct,
-		    "Camera %d trying to reacquire device %d from %u blobs and prior pose %f %f %f %f pos %f %f %f",
-		    view_id, leds_model->id, num_blobs, dev_state->prior_pose.orientation.x,
-		    dev_state->prior_pose.orientation.y, dev_state->prior_pose.orientation.z,
-		    dev_state->prior_pose.orientation.w, dev_state->prior_pose.position.x,
-		    dev_state->prior_pose.position.y, dev_state->prior_pose.position.z);
+		WMR_DEBUG(wct,
+		          "Camera %d trying to reacquire device %d from %u blobs and cam-relative pose %f %f %f %f pos "
+		          "%f %f %f "
+		          "global prior pose %f %f %f %f pos %f %f %f",
+		          view_id, leds_model->id, num_blobs, P_cam_obj_prior.orientation.x,
+		          P_cam_obj_prior.orientation.y, P_cam_obj_prior.orientation.z, P_cam_obj_prior.orientation.w,
+		          P_cam_obj_prior.position.x, P_cam_obj_prior.position.y, P_cam_obj_prior.position.z,
+		          dev_state->P_world_obj_prior.orientation.x, dev_state->P_world_obj_prior.orientation.y,
+		          dev_state->P_world_obj_prior.orientation.z, dev_state->P_world_obj_prior.orientation.w,
+		          dev_state->P_world_obj_prior.position.x, dev_state->P_world_obj_prior.position.y,
+		          dev_state->P_world_obj_prior.position.z);
 
-		struct xrt_pose obj_cam_pose;
+		struct xrt_pose P_cam_obj;
 
-		if (!ransac_pnp_pose(&obj_cam_pose, bwobs->blobs, bwobs->num_blobs, leds_model, &cam->camera_model,
-		                     NULL, NULL)) {
+		if (!ransac_pnp_pose(&P_cam_obj, bwobs->blobs, bwobs->num_blobs, leds_model, &cam->camera_model, NULL,
+		                     NULL)) {
 			WMR_DEBUG(wct, "Camera %d RANSAC-PnP for device %d from %u blobs failed", view_id,
 			          leds_model->id, num_blobs);
 			continue;
 		}
 
-		pose_metrics_evaluate_pose_with_prior(&dev_state->score, &obj_cam_pose, true, &obj_prior_cam_pose,
+		pose_metrics_evaluate_pose_with_prior(&dev_state->score, &P_cam_obj, true, &P_cam_obj_prior,
 		                                      &dev_state->prior_pos_error, &dev_state->prior_rot_error,
 		                                      bwobs->blobs, bwobs->num_blobs, &device->led_model,
 		                                      &cam->camera_model, NULL);
 
 		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD)) {
-			submit_device_pose(wct, dev_state, sample, view_id, &obj_cam_pose);
+			submit_device_pose(wct, dev_state, sample, view_id, &P_cam_obj);
 			return true;
 		}
 		WMR_DEBUG(wct,
 		          "Camera %d device %d had %d prior blobs, but failed match with flags 0x%x. "
 		          "Yielded pose %f %f %f %f pos %f %f %f (match %d of %d visible) rot_error %f %f %f pos_error "
 		          "%f %f %f",
-		          view_id, leds_model->id, num_blobs, dev_state->score.match_flags, obj_cam_pose.orientation.x,
-		          obj_cam_pose.orientation.y, obj_cam_pose.orientation.z, obj_cam_pose.orientation.w,
-		          obj_cam_pose.position.x, obj_cam_pose.position.y, obj_cam_pose.position.z,
+		          view_id, leds_model->id, num_blobs, dev_state->score.match_flags, P_cam_obj.orientation.x,
+		          P_cam_obj.orientation.y, P_cam_obj.orientation.z, P_cam_obj.orientation.w,
+		          P_cam_obj.position.x, P_cam_obj.position.y, P_cam_obj.position.z,
 		          dev_state->score.matched_blobs, dev_state->score.visible_leds,
 		          dev_state->score.orient_error.x, dev_state->score.orient_error.y,
 		          dev_state->score.orient_error.z, dev_state->score.pos_error.x, dev_state->score.pos_error.y,
@@ -501,12 +507,12 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 		struct tracking_sample_frame *view = sample->views + i;
 
 		//! Calculate the view pose in this sample, from the HMD pose + IMU_camera pose
-		math_pose_transform(&xsr_base_pose.pose, &cam->imu_cam_pose, &view->pose);
-		math_pose_invert(&view->pose, &view->inv_pose);
+		math_pose_transform(&xsr_base_pose.pose, &cam->P_imu_cam, &view->P_world_cam);
+		math_pose_invert(&view->P_world_cam, &view->P_cam_world);
 
 		const struct xrt_vec3 gravity_vector = {0.0, 1.0, 0.0};
 
-		math_quat_rotate_vec3(&view->inv_pose.orientation, &gravity_vector, &view->cam_gravity_vector);
+		math_quat_rotate_vec3(&view->P_cam_world.orientation, &gravity_vector, &view->cam_gravity_vector);
 
 		u_frame_create_roi(xf, cam->roi, &view->vframe);
 		view->bw = cam->bw;
@@ -523,7 +529,7 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 		blobservation *bwobs = view->bwobs;
 		cam->last_num_blobs = bwobs->num_blobs;
 
-		WMR_TRACE(wct, "frame %" PRIu64 " TS %" PRIu64 " cam %d ROI %d,%d w/h %d,%d Blobs: %d\n",
+		WMR_TRACE(wct, "frame %" PRIu64 " TS %" PRIu64 " cam %d ROI %d,%d w/h %d,%d Blobs: %d",
 		          xf->source_sequence, xf->timestamp, i, cam->roi.offset.w, cam->roi.offset.h,
 		          cam->roi.extent.w, cam->roi.extent.h, bwobs->num_blobs);
 
@@ -567,7 +573,7 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 			continue; // Can't retrieve the pose: means the device was disconnected
 		}
 
-		dev_state->prior_pose = xsr.pose;
+		dev_state->P_world_obj_prior = xsr.pose;
 		//! @todo: Get actual error bounds from fusion
 		dev_state->prior_pos_error.x = dev_state->prior_pos_error.y = dev_state->prior_pos_error.z =
 		    MIN_POS_ERROR;
@@ -599,7 +605,7 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 
 		WMR_DEBUG(wct, "Doing fast match search for device %d", device->led_model.id);
 
-		if (device_try_global_pose(wct, dev_state, sample, &dev_state->prior_pose)) {
+		if (device_try_global_pose(wct, dev_state, sample, &dev_state->P_world_obj_prior)) {
 			WMR_DEBUG(wct, "Found fast match search for device %d in view %d from prior pose",
 			          device->led_model.id, dev_state->found_pose_view_id);
 			continue;
@@ -648,7 +654,7 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 		struct wmr_controller_tracker_camera *cam = wct->cam + i;
 		struct tracking_sample_frame *view = sample->views + i;
 
-		cam->debug_last_pose = view->pose;
+		cam->debug_last_pose = view->P_world_cam;
 		cam->debug_last_gravity_vector = view->cam_gravity_vector;
 
 		if (u_sink_debug_is_active(&cam->debug_sink)) {
@@ -733,7 +739,7 @@ wmr_controller_tracker_process_frame_long(struct wmr_controller_tracker *wct,
 				}
 
 				struct xrt_pose obj_cam_pose;
-				math_pose_transform(&view->inv_pose, &dev_state->prior_pose, &obj_cam_pose);
+				math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &obj_cam_pose);
 
 				if (correspondence_search_find_one_pose(
 				        cam->cs, device->search_led_model, search_flags, &obj_cam_pose,
@@ -881,7 +887,7 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 		struct t_slam_camera_calibration *cam_slam_cfg = slam_calib->cams + i;
 
 		cam->roi = cam_cfg->roi;
-		math_pose_from_isometry(&cam_slam_cfg->T_imu_cam, &cam->imu_cam_pose);
+		math_pose_from_isometry(&cam_slam_cfg->T_imu_cam, &cam->P_imu_cam);
 
 		/* Init the camera model with size and distortion */
 		cam->camera_model.width = cam_cfg->roi.extent.w;

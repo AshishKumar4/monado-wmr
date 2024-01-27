@@ -340,12 +340,12 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 		draw_rgb_filled_rect(dest, width, out_stride, height, 16 * dev_id, 0, 16, 16, dev_colour);
 
 		if (flags & (DEBUG_DRAW_FLAG_LEDS | DEBUG_DRAW_FLAG_POSE_BOUNDS)) {
-			struct xrt_pose obj_cam_pose;
-			math_pose_transform(&view->inv_pose, &dev_state->final_pose, &obj_cam_pose);
+			struct xrt_pose P_cam_obj;
+			math_pose_transform(&view->P_cam_world, &dev_state->final_pose, &P_cam_obj);
 
 			struct pose_metrics_blob_match_info blob_match_info;
 
-			pose_metrics_match_pose_to_blobs(&obj_cam_pose, view->bwobs->blobs, view->bwobs->num_blobs,
+			pose_metrics_match_pose_to_blobs(&P_cam_obj, view->bwobs->blobs, view->bwobs->num_blobs,
 			                                 dev_state->led_model, calib, &blob_match_info);
 
 			if (flags & DEBUG_DRAW_FLAG_POSE_BOUNDS) {
@@ -372,37 +372,35 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 			}
 		}
 		if (flags & DEBUG_DRAW_FLAG_PRIOR_LEDS) {
-			struct xrt_pose obj_cam_pose;
-			math_pose_transform(&view->inv_pose, &dev_state->prior_pose, &obj_cam_pose);
+			struct xrt_pose P_cam_obj;
+			math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj);
 
 			struct pose_metrics_blob_match_info blob_match_info;
 
-			pose_metrics_match_pose_to_blobs(&obj_cam_pose, NULL, 0, dev_state->led_model, calib, &blob_match_info);
+			pose_metrics_match_pose_to_blobs(&P_cam_obj, NULL, 0, dev_state->led_model, calib,
+			                                 &blob_match_info);
 			for (int l = 0; l < blob_match_info.num_visible_leds; l++) {
-				struct pose_metrics_visible_led_info *led_info =
-				    blob_match_info.visible_leds + l;
+				struct pose_metrics_visible_led_info *led_info = blob_match_info.visible_leds + l;
 				uint32_t c = dev_colour | 0x400000; // Tint with red
 
-				draw_rgb_marker(dest, width, out_stride, height, led_info->pos_px.x,
-				                led_info->pos_px.y, ceil(led_info->led_radius_px),
-				                ceil(led_info->led_radius_px), c);
+				draw_rgb_marker(dest, width, out_stride, height, led_info->pos_px.x, led_info->pos_px.y,
+				                ceil(led_info->led_radius_px), ceil(led_info->led_radius_px), c);
 			}
 		}
 		if (dev_state->have_last_seen_pose && (flags & DEBUG_DRAW_FLAG_LAST_SEEN_LEDS)) {
-			struct xrt_pose obj_cam_pose;
-			math_pose_transform(&view->inv_pose, &dev_state->last_seen_pose, &obj_cam_pose);
+			struct xrt_pose P_cam_obj;
+			math_pose_transform(&view->P_cam_world, &dev_state->last_seen_pose, &P_cam_obj);
 
 			struct pose_metrics_blob_match_info blob_match_info;
 
-			pose_metrics_match_pose_to_blobs(&obj_cam_pose, NULL, 0, dev_state->led_model, calib, &blob_match_info);
+			pose_metrics_match_pose_to_blobs(&P_cam_obj, NULL, 0, dev_state->led_model, calib,
+			                                 &blob_match_info);
 			for (int l = 0; l < blob_match_info.num_visible_leds; l++) {
-				struct pose_metrics_visible_led_info *led_info =
-				    blob_match_info.visible_leds + l;
+				struct pose_metrics_visible_led_info *led_info = blob_match_info.visible_leds + l;
 				uint32_t c = dev_colour | 0x404040; // Tint with some yellow
 
-				draw_rgb_marker(dest, width, out_stride, height, led_info->pos_px.x,
-				                led_info->pos_px.y, ceil(led_info->led_radius_px),
-				                ceil(led_info->led_radius_px), c);
+				draw_rgb_marker(dest, width, out_stride, height, led_info->pos_px.x, led_info->pos_px.y,
+				                ceil(led_info->led_radius_px), ceil(led_info->led_radius_px), c);
 			}
 		}
 	}

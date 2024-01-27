@@ -31,7 +31,7 @@ struct tracking_sample_device_state
 	struct constellation_led_model *led_model;
 
 	/* Predicted device pose and error bounds from fusion, in world space */
-	struct xrt_pose prior_pose;
+	struct xrt_pose P_world_obj_prior;
 	struct xrt_vec3 prior_pos_error;
 	struct xrt_vec3 prior_rot_error;
 	float gravity_error_rad; /* Gravity vector uncertainty in radians 0..M_PI */
@@ -54,10 +54,10 @@ struct tracking_sample_frame
 	/* Video frame data we are analysing */
 	struct xrt_frame *vframe;
 
-	/* The pose from which this view is observed */
-	struct xrt_pose pose;
-	/* Inverse of the pose from which this view is observed */
-	struct xrt_pose inv_pose;
+	/* The pose from which this view is observed (cam wrt world) */
+	struct xrt_pose P_world_cam;
+	/* Inverse of the pose from which this view is observed (world wrt camera) */
+	struct xrt_pose P_cam_world;
 	/* Gravity vector as observed from this camera */
 	struct xrt_vec3 cam_gravity_vector;
 
