@@ -79,6 +79,7 @@ struct wmr_controller_tracker_device
 	struct xrt_pose last_seen_pose; // global pose
 	int last_matched_blobs;
 	int last_matched_cam;
+	struct xrt_pose last_matched_cam_pose; // Camera-relative pose
 };
 
 struct wmr_controller_tracker_camera
@@ -349,6 +350,7 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 		device->last_seen_pose = dev_state->final_pose;
 		device->last_matched_blobs = score->matched_blobs;
 		device->last_matched_cam = view_id;
+		device->last_matched_cam_pose = *obj_cam_pose;
 
 		/* Submit this pose observation to the fusion / real device */
 		wmr_controller_tracker_connection_notify_pose(device->connection, device->last_seen_pose_ts,
@@ -1031,10 +1033,11 @@ wmr_controller_tracker_add_controller(struct wmr_controller_tracker *wct, struct
 		sprintf(dev_name, "Controller %u - %s", wct->num_controllers,
 		        wcb->base.device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER ? "Left" : "Right");
 		u_var_add_ro_text(wct, "Device", dev_name);
-		u_var_add_pose(wct, &device->last_seen_pose, "Last observed pose");
+		u_var_add_pose(wct, &device->last_seen_pose, "Last observed global pose");
 		u_var_add_u64(wct, &device->last_seen_pose_ts, "Last observed pose");
 		u_var_add_ro_i32(wct, &device->last_matched_blobs, "Last matched Blobs");
 		u_var_add_ro_i32(wct, &device->last_matched_cam, "Last observed camera #");
+		u_var_add_pose(wct, &device->last_matched_cam_pose, "Last observed camera pose");
 	}
 
 	os_mutex_unlock(&wct->tracked_controller_lock);
