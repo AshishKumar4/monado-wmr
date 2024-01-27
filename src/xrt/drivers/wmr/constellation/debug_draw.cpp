@@ -331,43 +331,47 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 		uint8_t object_id = dev_state->led_model->id;
 		int dev_id = object_id_to_index(object_id);
 
-		if (dev_id < 0 || !dev_state->found_device_pose) {
+		if (dev_id < 0) {
 			continue;
 		}
 
 		uint32_t dev_colour = object_id_to_colour(object_id);
-		/* Draw a marker in the top-left of the frame for which devices we found a pose for */
-		draw_rgb_filled_rect(dest, width, out_stride, height, 16 * dev_id, 0, 16, 16, dev_colour);
 
-		if (flags & (DEBUG_DRAW_FLAG_LEDS | DEBUG_DRAW_FLAG_POSE_BOUNDS)) {
-			struct xrt_pose P_cam_obj;
-			math_pose_transform(&view->P_cam_world, &dev_state->final_pose, &P_cam_obj);
+		if (dev_state->found_device_pose) {
+			/* Draw a marker in the top-left of the frame for which devices we found a pose for */
+			draw_rgb_filled_rect(dest, width, out_stride, height, 16 * dev_id, 0, 16, 16, dev_colour);
 
-			struct pose_metrics_blob_match_info blob_match_info;
+			if (flags & (DEBUG_DRAW_FLAG_LEDS | DEBUG_DRAW_FLAG_POSE_BOUNDS)) {
+				struct xrt_pose P_cam_obj;
+				math_pose_transform(&view->P_cam_world, &dev_state->final_pose, &P_cam_obj);
 
-			pose_metrics_match_pose_to_blobs(&P_cam_obj, view->bwobs->blobs, view->bwobs->num_blobs,
-			                                 dev_state->led_model, calib, &blob_match_info);
+				struct pose_metrics_blob_match_info blob_match_info;
 
-			if (flags & DEBUG_DRAW_FLAG_POSE_BOUNDS) {
-				draw_rgb_rect(dest, width, out_stride, height, blob_match_info.bounds.left,
-				              blob_match_info.bounds.top,
-				              blob_match_info.bounds.right - blob_match_info.bounds.left,
-				              blob_match_info.bounds.bottom - blob_match_info.bounds.top, dev_colour);
-			}
+				pose_metrics_match_pose_to_blobs(&P_cam_obj, view->bwobs->blobs, view->bwobs->num_blobs,
+				                                 dev_state->led_model, calib, &blob_match_info);
 
-			if (flags & DEBUG_DRAW_FLAG_LEDS) {
-				for (int l = 0; l < blob_match_info.num_visible_leds; l++) {
-					struct pose_metrics_visible_led_info *led_info =
-					    blob_match_info.visible_leds + l;
-					uint32_t c = dev_colour;
+				if (flags & DEBUG_DRAW_FLAG_POSE_BOUNDS) {
+					draw_rgb_rect(dest, width, out_stride, height, blob_match_info.bounds.left,
+					              blob_match_info.bounds.top,
+					              blob_match_info.bounds.right - blob_match_info.bounds.left,
+					              blob_match_info.bounds.bottom - blob_match_info.bounds.top,
+					              dev_colour);
+				}
 
-					if (led_info->matched_blob == NULL) {
-						c = 0x808080; /* Draw LEDs with no matched blob in grey */
+				if (flags & DEBUG_DRAW_FLAG_LEDS) {
+					for (int l = 0; l < blob_match_info.num_visible_leds; l++) {
+						struct pose_metrics_visible_led_info *led_info =
+						    blob_match_info.visible_leds + l;
+						uint32_t c = dev_colour;
+
+						if (led_info->matched_blob == NULL) {
+							c = 0x808080; /* Draw LEDs with no matched blob in grey */
+						}
+
+						draw_rgb_marker(dest, width, out_stride, height, led_info->pos_px.x,
+						                led_info->pos_px.y, ceil(led_info->led_radius_px),
+						                ceil(led_info->led_radius_px), c);
 					}
-
-					draw_rgb_marker(dest, width, out_stride, height, led_info->pos_px.x,
-					                led_info->pos_px.y, ceil(led_info->led_radius_px),
-					                ceil(led_info->led_radius_px), c);
 				}
 			}
 		}
