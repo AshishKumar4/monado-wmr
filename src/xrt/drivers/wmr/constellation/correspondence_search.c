@@ -281,7 +281,8 @@ correspondence_search_project_pose(struct correspondence_search *cs,
 		math_quat_decompose_swing_twist(&pose->orientation, &mi->gravity_vector, &pose_gravity_swing,
 		                                &pose_gravity_twist);
 
-		float pose_angle = acosf(math_quat_dot(&pose_gravity_swing, &mi->gravity_swing));
+		// Calculate the difference between the amount of gravity swing, ignoring axis
+		float pose_angle = fabs(acosf(pose_gravity_swing.w)) - fabs(acosf(mi->gravity_swing.w));
 		if (pose_angle > mi->gravity_tolerance_rad) {
 			DEBUG(
 			    "model %d failed pose match - orientation was not within tolerance (error %f deg > %f "
