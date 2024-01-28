@@ -347,13 +347,14 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 		math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
 
 #ifdef XRT_HAVE_OPENCV
-		// Draw prior orientation arrow
-		struct xrt_quat pose_gravity_swing, pose_gravity_twist;
-
-		math_quat_decompose_swing_twist(&P_cam_obj_prior.orientation, &view->cam_gravity_vector, &pose_gravity_swing,
-		                                &pose_gravity_twist);
-		struct xrt_vec3 dev_cam_gravity_vector;
-		math_quat_rotate_vec3(&pose_gravity_swing, &view->cam_gravity_vector, &dev_cam_gravity_vector);
+		// Draw prior orientation arrow by calculating gravity in the real world, then bringing it into
+		// the camera frame.
+		const struct xrt_vec3 gravity_vector = {0.0, 1.0, 0.0};
+		struct xrt_vec3 dev_gravity_vector, dev_cam_gravity_vector;
+		struct xrt_quat Q_obj_world;
+		math_quat_inverse(&dev_state->P_world_obj_prior.orientation, &Q_obj_world);
+		math_quat_rotate_vec3(&Q_obj_world, &gravity_vector, &dev_gravity_vector);
+		math_quat_rotate_vec3(&view->P_cam_world.orientation, &dev_gravity_vector, &dev_cam_gravity_vector);
 
 		cv::Scalar cvCol = cv::Scalar((dev_colour >> 24) & 0xff, (dev_colour >> 16) & 0xff, dev_colour & 0xff);
 		cv::Point from(30 -30*dev_cam_gravity_vector.x, 46 -30*dev_cam_gravity_vector.y);
