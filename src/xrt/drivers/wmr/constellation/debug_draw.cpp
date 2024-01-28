@@ -269,6 +269,13 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 		src += in_stride;
 	}
 
+#ifdef XRT_HAVE_OPENCV
+	// Draw view's gravity vector
+	cv::Point from(30 -30*view->cam_gravity_vector.x, 46 -30*view->cam_gravity_vector.y);
+	cv::Point to(30 + 30*view->cam_gravity_vector.x, 46 + 30*view->cam_gravity_vector.y);
+	cv::arrowedLine(rgbOutMat, from, to, cv::Scalar(0x80, 0x80, 0x80));
+#endif
+
 	if (view->bwobs) {
 		struct blobservation *bwobs = view->bwobs;
 
