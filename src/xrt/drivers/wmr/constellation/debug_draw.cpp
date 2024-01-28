@@ -343,6 +343,23 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 		}
 
 		uint32_t dev_colour = object_id_to_colour(object_id);
+		struct xrt_pose P_cam_obj_prior;
+		math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
+
+#ifdef XRT_HAVE_OPENCV
+		// Draw prior orientation arrow
+		struct xrt_quat pose_gravity_swing, pose_gravity_twist;
+
+		math_quat_decompose_swing_twist(&P_cam_obj_prior.orientation, &view->cam_gravity_vector, &pose_gravity_swing,
+		                                &pose_gravity_twist);
+		struct xrt_vec3 dev_cam_gravity_vector;
+		math_quat_rotate_vec3(&pose_gravity_swing, &view->cam_gravity_vector, &dev_cam_gravity_vector);
+
+		cv::Scalar cvCol = cv::Scalar((dev_colour >> 24) & 0xff, (dev_colour >> 16) & 0xff, dev_colour & 0xff);
+		cv::Point from(30 -30*dev_cam_gravity_vector.x, 46 -30*dev_cam_gravity_vector.y);
+		cv::Point to(30 + 30*dev_cam_gravity_vector.x, 46 + 30*dev_cam_gravity_vector.y);
+		cv::arrowedLine(rgbOutMat, from, to, cvCol);
+#endif
 
 		if (dev_state->found_device_pose) {
 			/* Draw a marker in the top-left of the frame for which devices we found a pose for */
@@ -383,12 +400,9 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 			}
 		}
 		if (flags & DEBUG_DRAW_FLAG_PRIOR_LEDS) {
-			struct xrt_pose P_cam_obj;
-			math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj);
-
 			struct pose_metrics_blob_match_info blob_match_info;
 
-			pose_metrics_match_pose_to_blobs(&P_cam_obj, NULL, 0, dev_state->led_model, calib,
+			pose_metrics_match_pose_to_blobs(&P_cam_obj_prior, NULL, 0, dev_state->led_model, calib,
 			                                 &blob_match_info);
 			for (int l = 0; l < blob_match_info.num_visible_leds; l++) {
 				struct pose_metrics_visible_led_info *led_info = blob_match_info.visible_leds + l;
