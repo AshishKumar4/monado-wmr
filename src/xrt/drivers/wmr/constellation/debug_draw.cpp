@@ -345,15 +345,8 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 
 		uint32_t dev_colour = object_id_to_colour(object_id);
 
-		const struct xrt_pose P_cam_camspace = {
-		    {1.0, 0.0, 0.0, 0.0},
-		    {0.0, 0.0, 0.0},
-		};
-
-		struct xrt_pose P_camspace_obj_prior;
-		math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_camspace_obj_prior);
-		// flip around X for drawing
-		math_pose_transform(&P_cam_camspace, &P_camspace_obj_prior, &P_camspace_obj_prior);
+		struct xrt_pose P_cam_obj_prior;
+		math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
 
 #ifdef XRT_HAVE_OPENCV
 		// Draw prior orientation arrow by calculating gravity in the real world, then bringing it into
@@ -367,14 +360,6 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 		cv::Point from(30 - 30 * dev_cam_gravity_vector.x, 46 - 30 * dev_cam_gravity_vector.y);
 		cv::Point to(30 + 30 * dev_cam_gravity_vector.x, 46 + 30 * dev_cam_gravity_vector.y);
 		cv::arrowedLine(rgbOutMat, from, to, cvCol);
-
-#if 0
-		fprintf(stderr, "cam %d cam_gravity %f,%f,%f prior orient %f,%f,%f,%f dev_gravity %f,%f,%f\n", view_id,
-		        view->cam_gravity_vector.x, view->cam_gravity_vector.y, view->cam_gravity_vector.z,
-		        P_camspace_obj_prior.orientation.x, P_camspace_obj_prior.orientation.y,
-		        P_camspace_obj_prior.orientation.z, P_camspace_obj_prior.orientation.w,
-		        dev_cam_gravity_vector.x, dev_cam_gravity_vector.y, dev_cam_gravity_vector.z);
-#endif
 #endif
 
 		if (dev_state->found_device_pose) {
@@ -382,13 +367,12 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 			draw_rgb_filled_rect(dest, width, out_stride, height, 16 * dev_id, 0, 16, 16, dev_colour);
 
 			if (flags & (DEBUG_DRAW_FLAG_LEDS | DEBUG_DRAW_FLAG_POSE_BOUNDS)) {
-				struct xrt_pose P_camspace_obj;
-				math_pose_transform(&view->P_cam_world, &dev_state->final_pose, &P_camspace_obj);
-				math_pose_transform(&P_cam_camspace, &P_camspace_obj, &P_camspace_obj);
+				struct xrt_pose P_cam_obj;
+				math_pose_transform(&view->P_cam_world, &dev_state->final_pose, &P_cam_obj);
 
 				struct pose_metrics_blob_match_info blob_match_info;
 
-				pose_metrics_match_pose_to_blobs(&P_camspace_obj, view->bwobs->blobs,
+				pose_metrics_match_pose_to_blobs(&P_cam_obj, view->bwobs->blobs,
 				                                 view->bwobs->num_blobs, dev_state->led_model, calib,
 				                                 &blob_match_info);
 
@@ -418,30 +402,44 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 			}
 		}
 		if (flags & DEBUG_DRAW_FLAG_PRIOR_LEDS) {
+			const uint32_t c = dev_colour | 0x400000; // Tint with red
 			struct pose_metrics_blob_match_info blob_match_info;
 
-			pose_metrics_match_pose_to_blobs(&P_camspace_obj_prior, NULL, 0, dev_state->led_model, calib,
+			// Draw cross at pose center
+			struct xrt_vec2 pose_center;
+			t_camera_models_project(&calib->calib,
+				P_cam_obj_prior.position.x, P_cam_obj_prior.position.y, P_cam_obj_prior.position.z,
+				&pose_center.x, &pose_center.y);
+			draw_rgb_marker(dest, width, out_stride, height, pose_center.x, pose_center.y, 5, 5, c);
+
+			pose_metrics_match_pose_to_blobs(&P_cam_obj_prior, NULL, 0, dev_state->led_model, calib,
 			                                 &blob_match_info);
 			for (int l = 0; l < blob_match_info.num_visible_leds; l++) {
 				struct pose_metrics_visible_led_info *led_info = blob_match_info.visible_leds + l;
-				uint32_t c = dev_colour | 0x400000; // Tint with red
 
 				draw_rgb_marker(dest, width, out_stride, height, led_info->pos_px.x, led_info->pos_px.y,
 				                ceil(led_info->led_radius_px), ceil(led_info->led_radius_px), c);
 			}
 		}
 		if (dev_state->have_last_seen_pose && (flags & DEBUG_DRAW_FLAG_LAST_SEEN_LEDS)) {
-			struct xrt_pose P_camspace_obj;
-			math_pose_transform(&view->P_cam_world, &dev_state->last_seen_pose, &P_camspace_obj);
-			math_pose_transform(&P_cam_camspace, &P_camspace_obj, &P_camspace_obj);
+			const uint32_t c = dev_colour | 0x404040; // Tint with some yellow
+
+			struct xrt_pose P_cam_obj;
+			math_pose_transform(&view->P_cam_world, &dev_state->last_seen_pose, &P_cam_obj);
+
+			// Draw cross at pose center
+			struct xrt_vec2 pose_center;
+			t_camera_models_project(&calib->calib,
+				P_cam_obj.position.x, P_cam_obj.position.y, P_cam_obj.position.z,
+				&pose_center.x, &pose_center.y);
+			draw_rgb_marker(dest, width, out_stride, height, pose_center.x, pose_center.y, 5, 5, c);
 
 			struct pose_metrics_blob_match_info blob_match_info;
 
-			pose_metrics_match_pose_to_blobs(&P_camspace_obj, NULL, 0, dev_state->led_model, calib,
+			pose_metrics_match_pose_to_blobs(&P_cam_obj, NULL, 0, dev_state->led_model, calib,
 			                                 &blob_match_info);
 			for (int l = 0; l < blob_match_info.num_visible_leds; l++) {
 				struct pose_metrics_visible_led_info *led_info = blob_match_info.visible_leds + l;
-				uint32_t c = dev_colour | 0x404040; // Tint with some yellow
 
 				draw_rgb_marker(dest, width, out_stride, height, led_info->pos_px.x, led_info->pos_px.y,
 				                ceil(led_info->led_radius_px), ceil(led_info->led_radius_px), c);

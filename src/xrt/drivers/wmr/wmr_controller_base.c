@@ -893,12 +893,17 @@ wmr_controller_base_get_led_model(struct wmr_controller_base *wcb, struct conste
 	os_mutex_unlock(&wcb->data_lock);
 
 	constellation_led_model_init((int)wcb->base.device_type, led_model, wcb->config.led_count);
+
+	// Note: This LED model is in OpenCV/WMR coordinates with
+	// XYZ = Right/Down/Forward
 	for (int i = 0; i < wcb->config.led_count; i++) {
 		struct constellation_led *led = led_model->leds + i;
 
 		led->id = i;
+
 		led->pos = wcb->config.leds[i].pos;
 		led->dir = wcb->config.leds[i].norm;
+
 		led->radius_mm = 3.5;
 	}
 

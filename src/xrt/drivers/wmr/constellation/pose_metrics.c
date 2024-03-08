@@ -128,7 +128,7 @@ check_pose_prior(struct pose_metrics *score,
 	}
 }
 
-static void
+static bool
 project_led_points(struct constellation_led_model *led_model,
                    struct camera_model *calib,
                    struct xrt_pose *pose,
@@ -138,8 +138,10 @@ project_led_points(struct constellation_led_model *led_model,
 	for (int i = 0; i < led_model->num_leds; i++) {
 		struct xrt_vec3 *tmp = out_positions + i;
 		math_pose_transform_point(pose, &led_model->leds[i].pos, tmp);
-		t_camera_models_project(&calib->calib, tmp->x, tmp->y, tmp->z, &out_points[i].x, &out_points[i].y);
+		if (!t_camera_models_project(&calib->calib, tmp->x, tmp->y, tmp->z, &out_points[i].x, &out_points[i].y))
+			return false;
 	}
+	return true;
 }
 
 static void
@@ -158,7 +160,10 @@ get_visible_leds_and_bounds(struct xrt_pose *pose,
 	const int num_leds = led_model->num_leds;
 
 	/* Project HMD LEDs into the distorted image space */
-	project_led_points(led_model, calib, pose, led_out_positions, led_out_points);
+	if (!project_led_points(led_model, calib, pose, led_out_positions, led_out_points)) {
+		*num_visible_leds = 0;
+		return;
+	}
 
 	/* Compute LED pixel size based on model distance below
 	 * using the larger X/Y focal length and LED's Z value */

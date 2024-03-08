@@ -1155,7 +1155,7 @@ wmr_hmd_get_slam_tracked_pose(struct xrt_device *xdev,
 	}
 
 	if (name == XRT_INPUT_GENERIC_HEAD_POSE && wh->tracking.imu2me) {
-		/* Move the pose to the middle-eye position for generic head pose, bit not for generic tracker pose */
+		/* Move the pose to the middle-eye position for generic head pose, but not for generic tracker pose */
 		math_pose_transform(&wh->pose, &wh->config.sensors.transforms.P_imu_me, &wh->pose);
 	}
 
@@ -1252,7 +1252,7 @@ wmr_hmd_destroy(struct xrt_device *xdev)
 XRT_MAYBE_UNUSED static struct t_camera_calibration
 wmr_hmd_get_cam_calib(struct wmr_hmd *wh, int cam_index)
 {
-	struct t_camera_calibration res;
+	struct t_camera_calibration res = { 0, };
 	struct wmr_camera_config *wcalib = wh->config.tcams[cam_index];
 	struct wmr_distortion_6KT *intr = &wcalib->distortion6KT;
 

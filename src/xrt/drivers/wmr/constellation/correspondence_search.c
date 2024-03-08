@@ -85,7 +85,7 @@ correspondence_search_new(struct camera_model *camera_calib)
 }
 
 #if DUMP_FULL_DEBUG
-#define DEBUG(s, ...) printf(s, __VA_ARGS__)
+#define DEBUG(s, ...) fprintf(stderr, s, __VA_ARGS__)
 #else
 #define DEBUG(s, ...)
 #endif
@@ -98,7 +98,7 @@ correspondence_search_new(struct camera_model *camera_calib)
 
 #undef LOG
 #if DUMP_FULL_LOG
-#define LOG(s, ...) printf(s, __VA_ARGS__)
+#define LOG(s, ...) fprintf(stderr, s, __VA_ARGS__)
 #else
 #define LOG(s, ...)
 #endif
