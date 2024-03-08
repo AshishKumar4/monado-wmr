@@ -209,6 +209,7 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
                       struct xrt_frame *gray_in,
                       enum debug_draw_flag flags,
                       struct tracking_sample_frame *view,
+                      int view_id,
                       struct camera_model *calib,
                       struct tracking_sample_device_state *devices,
                       uint8_t n_devices)
@@ -271,8 +272,8 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 
 #ifdef XRT_HAVE_OPENCV
 	// Draw view's gravity vector
-	cv::Point from(30 -30*view->cam_gravity_vector.x, 46 -30*view->cam_gravity_vector.y);
-	cv::Point to(30 + 30*view->cam_gravity_vector.x, 46 + 30*view->cam_gravity_vector.y);
+	cv::Point from(30 - 30 * view->cam_gravity_vector.x, 46 - 30 * view->cam_gravity_vector.y);
+	cv::Point to(30 + 30 * view->cam_gravity_vector.x, 46 + 30 * view->cam_gravity_vector.y);
 	cv::arrowedLine(rgbOutMat, from, to, cv::Scalar(0x80, 0x80, 0x80));
 #endif
 
@@ -343,23 +344,37 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 		}
 
 		uint32_t dev_colour = object_id_to_colour(object_id);
-		struct xrt_pose P_cam_obj_prior;
-		math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
+
+		const struct xrt_pose P_cam_camspace = {
+		    {1.0, 0.0, 0.0, 0.0},
+		    {0.0, 0.0, 0.0},
+		};
+
+		struct xrt_pose P_camspace_obj_prior;
+		math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_camspace_obj_prior);
+		// flip around X for drawing
+		math_pose_transform(&P_cam_camspace, &P_camspace_obj_prior, &P_camspace_obj_prior);
 
 #ifdef XRT_HAVE_OPENCV
 		// Draw prior orientation arrow by calculating gravity in the real world, then bringing it into
 		// the camera frame.
 		const struct xrt_vec3 gravity_vector = {0.0, 1.0, 0.0};
 		struct xrt_vec3 dev_gravity_vector, dev_cam_gravity_vector;
-		struct xrt_quat Q_obj_world;
-		math_quat_inverse(&dev_state->P_world_obj_prior.orientation, &Q_obj_world);
-		math_quat_rotate_vec3(&Q_obj_world, &gravity_vector, &dev_gravity_vector);
-		math_quat_rotate_vec3(&view->P_cam_world.orientation, &dev_gravity_vector, &dev_cam_gravity_vector);
+		math_quat_rotate_vec3(&dev_state->P_world_obj_prior.orientation, &gravity_vector, &dev_gravity_vector);
+		math_quat_rotate_vec3(&view->P_world_cam.orientation, &dev_gravity_vector, &dev_cam_gravity_vector);
 
 		cv::Scalar cvCol = cv::Scalar((dev_colour >> 24) & 0xff, (dev_colour >> 16) & 0xff, dev_colour & 0xff);
-		cv::Point from(30 -30*dev_cam_gravity_vector.x, 46 -30*dev_cam_gravity_vector.y);
-		cv::Point to(30 + 30*dev_cam_gravity_vector.x, 46 + 30*dev_cam_gravity_vector.y);
+		cv::Point from(30 - 30 * dev_cam_gravity_vector.x, 46 - 30 * dev_cam_gravity_vector.y);
+		cv::Point to(30 + 30 * dev_cam_gravity_vector.x, 46 + 30 * dev_cam_gravity_vector.y);
 		cv::arrowedLine(rgbOutMat, from, to, cvCol);
+
+#if 0
+		fprintf(stderr, "cam %d cam_gravity %f,%f,%f prior orient %f,%f,%f,%f dev_gravity %f,%f,%f\n", view_id,
+		        view->cam_gravity_vector.x, view->cam_gravity_vector.y, view->cam_gravity_vector.z,
+		        P_camspace_obj_prior.orientation.x, P_camspace_obj_prior.orientation.y,
+		        P_camspace_obj_prior.orientation.z, P_camspace_obj_prior.orientation.w,
+		        dev_cam_gravity_vector.x, dev_cam_gravity_vector.y, dev_cam_gravity_vector.z);
+#endif
 #endif
 
 		if (dev_state->found_device_pose) {
@@ -367,13 +382,15 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 			draw_rgb_filled_rect(dest, width, out_stride, height, 16 * dev_id, 0, 16, 16, dev_colour);
 
 			if (flags & (DEBUG_DRAW_FLAG_LEDS | DEBUG_DRAW_FLAG_POSE_BOUNDS)) {
-				struct xrt_pose P_cam_obj;
-				math_pose_transform(&view->P_cam_world, &dev_state->final_pose, &P_cam_obj);
+				struct xrt_pose P_camspace_obj;
+				math_pose_transform(&view->P_cam_world, &dev_state->final_pose, &P_camspace_obj);
+				math_pose_transform(&P_cam_camspace, &P_camspace_obj, &P_camspace_obj);
 
 				struct pose_metrics_blob_match_info blob_match_info;
 
-				pose_metrics_match_pose_to_blobs(&P_cam_obj, view->bwobs->blobs, view->bwobs->num_blobs,
-				                                 dev_state->led_model, calib, &blob_match_info);
+				pose_metrics_match_pose_to_blobs(&P_camspace_obj, view->bwobs->blobs,
+				                                 view->bwobs->num_blobs, dev_state->led_model, calib,
+				                                 &blob_match_info);
 
 				if (flags & DEBUG_DRAW_FLAG_POSE_BOUNDS) {
 					draw_rgb_rect(dest, width, out_stride, height, blob_match_info.bounds.left,
@@ -403,7 +420,7 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 		if (flags & DEBUG_DRAW_FLAG_PRIOR_LEDS) {
 			struct pose_metrics_blob_match_info blob_match_info;
 
-			pose_metrics_match_pose_to_blobs(&P_cam_obj_prior, NULL, 0, dev_state->led_model, calib,
+			pose_metrics_match_pose_to_blobs(&P_camspace_obj_prior, NULL, 0, dev_state->led_model, calib,
 			                                 &blob_match_info);
 			for (int l = 0; l < blob_match_info.num_visible_leds; l++) {
 				struct pose_metrics_visible_led_info *led_info = blob_match_info.visible_leds + l;
@@ -414,12 +431,13 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 			}
 		}
 		if (dev_state->have_last_seen_pose && (flags & DEBUG_DRAW_FLAG_LAST_SEEN_LEDS)) {
-			struct xrt_pose P_cam_obj;
-			math_pose_transform(&view->P_cam_world, &dev_state->last_seen_pose, &P_cam_obj);
+			struct xrt_pose P_camspace_obj;
+			math_pose_transform(&view->P_cam_world, &dev_state->last_seen_pose, &P_camspace_obj);
+			math_pose_transform(&P_cam_camspace, &P_camspace_obj, &P_camspace_obj);
 
 			struct pose_metrics_blob_match_info blob_match_info;
 
-			pose_metrics_match_pose_to_blobs(&P_cam_obj, NULL, 0, dev_state->led_model, calib,
+			pose_metrics_match_pose_to_blobs(&P_camspace_obj, NULL, 0, dev_state->led_model, calib,
 			                                 &blob_match_info);
 			for (int l = 0; l < blob_match_info.num_visible_leds; l++) {
 				struct pose_metrics_visible_led_info *led_info = blob_match_info.visible_leds + l;

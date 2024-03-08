@@ -40,6 +40,7 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
                       struct xrt_frame *gray_in,
                       enum debug_draw_flag flags,
                       struct tracking_sample_frame *view,
+                      int view_id,
                       struct camera_model *calib,
                       struct tracking_sample_device_state *devices,
                       uint8_t n_devices);

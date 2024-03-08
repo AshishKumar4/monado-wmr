@@ -664,10 +664,8 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 			u_frame_create_one_off(XRT_FORMAT_R8G8B8, xf_src->width, xf_src->height, &xf_dbg);
 			xf_dbg->timestamp = xf_src->timestamp;
 
-			if (view->bwobs != NULL) {
-				debug_draw_blobs_leds(xf_dbg, xf_src, debug_flags, view, &cam->camera_model,
-				                      sample->devices, sample->n_devices);
-			}
+			debug_draw_blobs_leds(xf_dbg, xf_src, debug_flags, view, i, &cam->camera_model, sample->devices,
+			                      sample->n_devices);
 
 			u_sink_debug_push_frame(&cam->debug_sink, xf_dbg);
 			xrt_frame_reference(&xf_dbg, NULL);
