@@ -682,6 +682,8 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	const unsigned char wmr_controller_imu_on_cmd[64] = {0x06, 0x03, 0x02, 0xe1, 0x02};
 	wmr_controller_send_bytes(wcb, wmr_controller_imu_on_cmd, sizeof(wmr_controller_imu_on_cmd));
 
+	wcb->update_yaw_from_optical = true;
+
 	wcb->timesync_counter = 2;
 	wcb->timesync_led_intensity = 200;
 	wcb->timesync_val2 = 0;
@@ -709,6 +711,7 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	u_var_add_gui_header(wcb, NULL, "Optical Tracking");
 	u_var_add_pose(wcb, &wcb->last_tracked_pose, "Last observed pose");
 	u_var_add_ro_i64(wcb, &wcb->last_tracked_pose_ts, "Last observed pose TS");
+	u_var_add_bool(wcb, &wcb->update_yaw_from_optical, "Update yaw using tracking");
 
 	u_var_add_gui_header(wcb, NULL, "LED Sync");
 	u_var_add_draggable_u16(wcb, &wcb->timesync_led_intensity_uvar, "LED intensity");
@@ -908,15 +911,27 @@ wmr_controller_base_push_observed_pose(struct wmr_controller_base *wcb,
                                        const struct xrt_pose *pose)
 {
 	os_mutex_lock(&wcb->data_lock);
+
 	wcb->last_tracked_pose_ts = frame_mono_ns;
 	wcb->last_tracked_pose = *pose;
 
-	// Apply 5% of observed orientation to 3dof fusion
-	// FIXME: Do better
-	struct xrt_pose tmp = (struct xrt_pose)XRT_POSE_IDENTITY;
-	tmp.orientation = wcb->fusion.rot;
-	math_pose_interpolate(&tmp, pose, 0.05, &tmp);
-	wcb->fusion.rot = tmp.orientation; // Update the 3dof pose a bit too. Could just do the yaw?
+	if (wcb->update_yaw_from_optical) {
+#if 1
+		// Apply 5% of observed orientation yaw to 3dof fusion
+		// FIXME: Do better
+		struct xrt_quat delta;
+		math_quat_unrotate(&wcb->fusion.rot, &pose->orientation, &delta);
+		delta.x = delta.z = 0.0; // We only want Yaw
+		// delta.y = 0.05 * delta.y; // 5%
+		math_quat_normalize(&delta);
+
+		WMR_DEBUG(wcb, "Applying yaw rotation of %f degrees", RAD_TO_DEG(2 * asinf(delta.y)));
+
+		math_quat_rotate(&wcb->fusion.rot, &delta, &wcb->fusion.rot);
+#else
+		wcb->fusion.rot = pose->orientation;
+#endif
+	}
 
 	os_mutex_unlock(&wcb->data_lock);
 }

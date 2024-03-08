@@ -157,6 +157,8 @@ struct wmr_controller_base
 	timepoint_ns last_tracked_pose_ts;
 	//! Last tracked pose from optical controller tracking
 	struct xrt_pose last_tracked_pose;
+	//! debug boolean - enable yaw updates
+	bool update_yaw_from_optical;
 
 	//!< Command counter for timesync and keep-alives. conn_lock
 	uint8_t cmd_counter;
