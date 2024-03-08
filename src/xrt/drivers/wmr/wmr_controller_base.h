@@ -139,6 +139,9 @@ struct wmr_controller_base
 	//! Last ticks counter from input, extended to 64-bits
 	uint64_t last_timestamp_ticks;
 
+	//! Newest reported tracked pose
+	struct xrt_pose pose;
+
 	//! Time of last IMU sample, in CPU time.
 	uint64_t last_imu_timestamp_ns;
 	//! Time of last IMU sample, in device time.

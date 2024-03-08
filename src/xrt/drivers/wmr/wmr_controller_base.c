@@ -500,7 +500,6 @@ read_controller_config(struct wmr_controller_base *wcb)
 	free(cache_filename);
 
 	WMR_DEBUG(wcb, "Parsed %d LED entries from controller calibration", wcb->config.led_count);
-	wcb->have_config = true;
 	return true;
 }
 
@@ -551,6 +550,7 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	double prediction_s = time_ns_to_s(prediction_ns);
 
 	m_predict_relation(&relation, prediction_s, out_relation);
+	wcb->pose = out_relation->pose;
 
 	return XRT_SUCCESS;
 }
@@ -606,6 +606,7 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	wcb->log_level = log_level;
 	wcb->wcc = conn;
 	wcb->receive_bytes = receive_bytes;
+	wcb->pose = (struct xrt_pose)XRT_POSE_IDENTITY;
 
 	// IMU samples arrive every 5ms on average
 	// 1 second seems to be enough to smooth things
@@ -663,6 +664,11 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 
 	wmr_config_precompute_transforms(&wcb->config.sensors, NULL);
 
+	// Announce the availabilty of the config for the tracker to retrieve
+	os_mutex_lock(&wcb->data_lock);
+	wcb->have_config = true;
+	os_mutex_unlock(&wcb->data_lock);
+
 	/* Reset device time before controller outputs */
 	fw_cmd = WMR_CONTROLLER_FW_CMD_INIT(0x06, 0x21, 0x00, 0x00);
 	if (wmr_controller_send_fw_cmd(wcb, &fw_cmd, 0x06, &fw_cmd_response) < 0) {
@@ -690,6 +696,8 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 
 	u_var_add_root(wcb, wcb->base.str, true);
 	u_var_add_log_level(wcb, &wcb->log_level, "Log Level");
+	u_var_add_pose(wcb, &wcb->pose, "Reported pose");
+
 	u_var_add_gui_header(wcb, NULL, "IMU");
 	u_var_add_ro_vec3_f32(wcb, &wcb->last_imu.acc, "imu.accel");
 	u_var_add_ro_vec3_f32(wcb, &wcb->last_imu.gyro, "imu.gyro");
@@ -874,9 +882,12 @@ wmr_controller_attach_to_hmd(struct wmr_controller_base *wcb, struct wmr_hmd *hm
 bool
 wmr_controller_base_get_led_model(struct wmr_controller_base *wcb, struct constellation_led_model *led_model)
 {
+	os_mutex_lock(&wcb->data_lock);
 	if (!wcb->have_config) {
+		os_mutex_unlock(&wcb->data_lock);
 		return false;
 	}
+	os_mutex_unlock(&wcb->data_lock);
 
 	constellation_led_model_init((int)wcb->base.device_type, led_model, wcb->config.led_count);
 	for (int i = 0; i < wcb->config.led_count; i++) {
