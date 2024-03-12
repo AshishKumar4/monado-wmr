@@ -285,21 +285,33 @@ wmr_open_system_impl(struct xrt_builder *xb,
 	assert(xret_unlock == XRT_SUCCESS);
 	(void)xret_unlock;
 
+	/* We'll give everyone a shared tracking origin using the system allocated one */
+	origin->type = XRT_TRACKING_TYPE_OTHER;
+	origin->initial_offset.orientation.w = 1.0f;
+	origin->initial_offset.position.y = 1.6;
+	snprintf(origin->name, XRT_TRACKING_NAME_LEN, "%s", "WMR SLAM Tracking");
+
 	struct xrt_device *head_xdev = wmr_hmd_to_xrt_device(head);
 	struct xrt_device *left_xdev = wmr_controller_base_to_xrt_device(ctrl_left);
 	struct xrt_device *right_xdev = wmr_controller_base_to_xrt_device(ctrl_right);
 
+	head_xdev->tracking_origin = origin;
+
 	xsysd->xdevs[xsysd->xdev_count++] = head_xdev;
 	if (left_xdev != NULL) {
+		left_xdev->tracking_origin = origin;
 		xsysd->xdevs[xsysd->xdev_count++] = left_xdev;
 	}
 	if (right_xdev != NULL) {
+		right_xdev->tracking_origin = origin;
 		xsysd->xdevs[xsysd->xdev_count++] = right_xdev;
 	}
 	if (ht_left != NULL) {
+		ht_left->tracking_origin = origin;
 		xsysd->xdevs[xsysd->xdev_count++] = ht_left;
 	}
 	if (ht_right != NULL) {
+		ht_right->tracking_origin = origin;
 		xsysd->xdevs[xsysd->xdev_count++] = ht_right;
 	}
 
