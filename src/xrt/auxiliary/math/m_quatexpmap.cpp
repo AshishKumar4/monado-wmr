@@ -122,7 +122,8 @@ quat_ln(Eigen::Quaternion<Scalar> const &quat)
 	Scalar vecnorm = quat.vec().norm();
 
 	// "best for numerical stability" vs asin or acos
-	Scalar phi = std::atan2(vecnorm, quat.w());
+	Scalar neg = quat.w() < 0 ? -1 : 1;
+	Scalar phi = std::atan2(vecnorm, neg * quat.w());
 
 	// Here is where we compute the coefficient to scale the vector part
 	// by, which is nominally phi / std::sin(phi).
@@ -130,7 +131,8 @@ quat_ln(Eigen::Quaternion<Scalar> const &quat)
 	// differently, since it gets a bit like sinc in that we want it
 	// continuous but 0 is undefined.
 	Scalar phiOverSin = vecnorm < 1e-4 ? cscTaylorExpansion<Scalar>(phi) : (phi / std::sin(phi));
-	return quat.vec() * phiOverSin;
+
+	return quat.vec() * phiOverSin * neg;
 }
 
 } // namespace
