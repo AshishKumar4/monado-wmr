@@ -340,6 +340,26 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 	                                 &cam->camera_model, &dev_state->blob_match_info);
 	mark_matching_blobs(wct, P_cam_obj, view->bwobs, &device->led_model, &dev_state->blob_match_info);
 
+	struct xrt_pose refine_pose = *P_cam_obj;
+
+	int num_leds_out;
+	int num_inliers;
+
+	if (!ransac_pnp_pose(&refine_pose, view->bwobs->blobs, view->bwobs->num_blobs, &device->led_model,
+	                     &cam->camera_model, &num_leds_out, &num_inliers)) {
+		WMR_DEBUG(wct, "Camera %d RANSAC-PnP refinement for device %d from %u blobs failed", view_id,
+		          device->led_model.id, view->bwobs->num_blobs);
+	} else {
+		WMR_DEBUG(wct,
+		          "Camera %d RANSAC-PnP refinement for device %d from %u blobs had %d LEDs with %d inliers. "
+		          "Produced pose %f,%f,%f,%f pos %f,%f,%f",
+		          view_id, device->led_model.id, view->bwobs->num_blobs, num_leds_out, num_inliers,
+		          refine_pose.orientation.x, refine_pose.orientation.y, refine_pose.orientation.z,
+		          refine_pose.orientation.w, refine_pose.position.x, refine_pose.position.y,
+		          refine_pose.position.z);
+		// *P_cam_obj = refine_pose;
+	}
+
 	os_mutex_lock(&cam->bw_lock);
 	blobwatch_update_labels(cam->bw, view->bwobs, device->led_model.id);
 	os_mutex_unlock(&cam->bw_lock);
@@ -529,6 +549,8 @@ device_try_recover_pose(struct wmr_controller_tracker *wct,
 		                                      &cam->camera_model, NULL);
 
 		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD)) {
+			WMR_DEBUG(wct, "Camera %d RANSAC-PnP recovered pose for device %d from %u blobs", view_id,
+			          leds_model->id, num_blobs);
 			submit_device_pose(wct, dev_state, sample, view_id, &P_cam_obj);
 			return true;
 		}
