@@ -52,16 +52,17 @@ DEBUG_GET_ONCE_LOG_OPTION(wmr_log, "WMR_LOG", U_LOGGING_INFO)
 //! When projecting poses into the camera, we need
 // extra flip around the X axis because OpenCV camera space coordinates have
 // +Y down and +Z away from the user
-static void pose_flip_YZ(const struct xrt_pose *in, struct xrt_pose *dest)
+static void
+pose_flip_YZ(const struct xrt_pose *in, struct xrt_pose *dest)
 {
-  const struct xrt_pose P_YZ_flip = {
-      {1.0, 0.0, 0.0, 0.0},
-      {0.0, 0.0, 0.0},
-  };
+	const struct xrt_pose P_YZ_flip = {
+	    {1.0, 0.0, 0.0, 0.0},
+	    {0.0, 0.0, 0.0},
+	};
 
-  struct xrt_pose tmp;
-  math_pose_transform(&P_YZ_flip, in, &tmp);
-  math_pose_transform(&tmp, &P_YZ_flip, dest);
+	struct xrt_pose tmp;
+	math_pose_transform(&P_YZ_flip, in, &tmp);
+	math_pose_transform(&tmp, &P_YZ_flip, dest);
 }
 
 struct wmr_controller_tracker_connection
@@ -368,44 +369,43 @@ submit_device_pose(struct wmr_controller_tracker *wct,
 		          view_id, device->led_model.id, score->match_flags, score->matched_blobs, score->visible_leds,
 		          dev_state->final_pose.orientation.x, dev_state->final_pose.orientation.y,
 		          dev_state->final_pose.orientation.z, dev_state->final_pose.orientation.w,
-		          dev_state->final_pose.position.x, dev_state->final_pose.position.y, dev_state->final_pose.position.z,
-		          dev_fwd.x, dev_fwd.y, dev_fwd.z, P_cam_obj->orientation.x, P_cam_obj->orientation.y,
-		          P_cam_obj->orientation.z, P_cam_obj->orientation.w, P_cam_obj->position.x, P_cam_obj->position.y,
-		          P_cam_obj->position.z,
-			  dev_state->P_world_obj_prior.orientation.x, dev_state->P_world_obj_prior.orientation.y,
-			  dev_state->P_world_obj_prior.orientation.z, dev_state->P_world_obj_prior.orientation.w,
-			  dev_state->P_world_obj_prior.position.x, dev_state->P_world_obj_prior.position.y, dev_state->P_world_obj_prior.position.z,
-			  dev_prior_fwd.x, dev_prior_fwd.y, dev_prior_fwd.z,
+		          dev_state->final_pose.position.x, dev_state->final_pose.position.y,
+		          dev_state->final_pose.position.z, dev_fwd.x, dev_fwd.y, dev_fwd.z, P_cam_obj->orientation.x,
+		          P_cam_obj->orientation.y, P_cam_obj->orientation.z, P_cam_obj->orientation.w,
+		          P_cam_obj->position.x, P_cam_obj->position.y, P_cam_obj->position.z,
+		          dev_state->P_world_obj_prior.orientation.x, dev_state->P_world_obj_prior.orientation.y,
+		          dev_state->P_world_obj_prior.orientation.z, dev_state->P_world_obj_prior.orientation.w,
+		          dev_state->P_world_obj_prior.position.x, dev_state->P_world_obj_prior.position.y,
+		          dev_state->P_world_obj_prior.position.z, dev_prior_fwd.x, dev_prior_fwd.y, dev_prior_fwd.z,
 
 		          P_cam_obj_prior.orientation.x, P_cam_obj_prior.orientation.y, P_cam_obj_prior.orientation.z,
 		          P_cam_obj_prior.orientation.w, P_cam_obj_prior.position.x, P_cam_obj_prior.position.y,
 		          P_cam_obj_prior.position.z, cam_prior_fwd.x, cam_prior_fwd.y, cam_prior_fwd.z);
-	}
-	else if (view_id != dev_state->found_pose_view_id) {
+	} else if (view_id != dev_state->found_pose_view_id) {
 		struct xrt_pose extra_final_pose, pose_delta;
 
 		math_pose_transform(&view->P_world_cam, P_cam_obj, &extra_final_pose);
-		math_quat_unrotate(&dev_state->final_pose.orientation, &extra_final_pose.orientation, &pose_delta.orientation);
+		math_quat_unrotate(&dev_state->final_pose.orientation, &extra_final_pose.orientation,
+		                   &pose_delta.orientation);
 		pose_delta.position = extra_final_pose.position;
 		math_vec3_subtract(&dev_state->final_pose.position, &pose_delta.position);
 
 		WMR_DEBUG(wct,
 		          "Found an extra pose on cam %u device %d score match_flags 0x%x matched %u "
 		          "blobs of %u visible LEDs. Global pose %f,%f,%f,%f pos %f,%f,%f "
-			  "cam-relative pose %f,%f,%f,%f pos %f,%f,%f "
-			  "delta from 1st pose %f,%f,%f,%f pos %f,%f,%f",
+		          "cam-relative pose %f,%f,%f,%f pos %f,%f,%f "
+		          "delta from 1st pose %f,%f,%f,%f pos %f,%f,%f",
 		          view_id, device->led_model.id, score->match_flags, score->matched_blobs, score->visible_leds,
 		          extra_final_pose.orientation.x, extra_final_pose.orientation.y,
-		          extra_final_pose.orientation.z, extra_final_pose.orientation.w,
-		          extra_final_pose.position.x, extra_final_pose.position.y, extra_final_pose.position.z,
-			  P_cam_obj->orientation.x, P_cam_obj->orientation.y,
-			  P_cam_obj->orientation.z, P_cam_obj->orientation.w,
-			  P_cam_obj->position.x, P_cam_obj->position.y, P_cam_obj->position.z,
-			  pose_delta.orientation.x, pose_delta.orientation.y, pose_delta.orientation.z, pose_delta.orientation.w,
-			  pose_delta.position.x, pose_delta.position.y, pose_delta.position.z);
+		          extra_final_pose.orientation.z, extra_final_pose.orientation.w, extra_final_pose.position.x,
+		          extra_final_pose.position.y, extra_final_pose.position.z, P_cam_obj->orientation.x,
+		          P_cam_obj->orientation.y, P_cam_obj->orientation.z, P_cam_obj->orientation.w,
+		          P_cam_obj->position.x, P_cam_obj->position.y, P_cam_obj->position.z, pose_delta.orientation.x,
+		          pose_delta.orientation.y, pose_delta.orientation.z, pose_delta.orientation.w,
+		          pose_delta.position.x, pose_delta.position.y, pose_delta.position.z);
 
 		// Mix the found position with the prior one
-		math_vec3_scalar_mul (0.5, &pose_delta.position);
+		math_vec3_scalar_mul(0.5, &pose_delta.position);
 		math_vec3_accum(&pose_delta.position, &dev_state->final_pose.position);
 	}
 
@@ -452,10 +452,10 @@ device_try_global_pose(struct wmr_controller_tracker *wct,
 		struct xrt_pose P_cam_obj_prior;
 		math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
 
-		pose_metrics_evaluate_pose_with_prior(&dev_state->score, &P_cam_obj_candidate, false,
-		                                      &P_cam_obj_prior, &dev_state->prior_pos_error,
-		                                      &dev_state->prior_rot_error, bwobs->blobs, bwobs->num_blobs,
-		                                      &device->led_model, &cam->camera_model, NULL);
+		pose_metrics_evaluate_pose_with_prior(&dev_state->score, &P_cam_obj_candidate, false, &P_cam_obj_prior,
+		                                      &dev_state->prior_pos_error, &dev_state->prior_rot_error,
+		                                      bwobs->blobs, bwobs->num_blobs, &device->led_model,
+		                                      &cam->camera_model, NULL);
 
 		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD | POSE_MATCH_LED_IDS)) {
 			submit_device_pose(wct, dev_state, sample, view_id, &P_cam_obj_candidate);
@@ -536,10 +536,10 @@ device_try_recover_pose(struct wmr_controller_tracker *wct,
 		          "Camera %d device %d had %d prior blobs, but failed match with flags 0x%x. "
 		          "Yielded pose %f %f %f %f pos %f %f %f (match %d of %d visible) rot_error %f %f %f pos_error "
 		          "%f %f %f",
-		          view_id, leds_model->id, num_blobs, dev_state->score.match_flags,
-		          P_cam_obj.orientation.x, P_cam_obj.orientation.y, P_cam_obj.orientation.z,
-		          P_cam_obj.orientation.w, P_cam_obj.position.x, P_cam_obj.position.y,
-		          P_cam_obj.position.z, dev_state->score.matched_blobs, dev_state->score.visible_leds,
+		          view_id, leds_model->id, num_blobs, dev_state->score.match_flags, P_cam_obj.orientation.x,
+		          P_cam_obj.orientation.y, P_cam_obj.orientation.z, P_cam_obj.orientation.w,
+		          P_cam_obj.position.x, P_cam_obj.position.y, P_cam_obj.position.z,
+		          dev_state->score.matched_blobs, dev_state->score.visible_leds,
 		          dev_state->score.orient_error.x, dev_state->score.orient_error.y,
 		          dev_state->score.orient_error.z, dev_state->score.pos_error.x, dev_state->score.pos_error.y,
 		          dev_state->score.pos_error.z);
@@ -663,7 +663,7 @@ wmr_controller_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xr
 		}
 
 		// Incoming controller pose is in OpenXR. Flip it to OpenCV for all our operations
-		pose_flip_YZ (&xsr.pose, &dev_state->P_world_obj_prior);
+		pose_flip_YZ(&xsr.pose, &dev_state->P_world_obj_prior);
 
 		//! @todo: Get actual error bounds from fusion
 		dev_state->prior_pos_error.x = dev_state->prior_pos_error.y = dev_state->prior_pos_error.z =
@@ -981,21 +981,21 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 		struct t_slam_camera_calibration *cam_slam_cfg = slam_calib->cams + i;
 
 #if 1
-                if (i == 2 || i == 3) {
-                        //! @note The calibration json for the reverb G2v2 (the only 4-camera wmr
-                        //! headset we know about) has the HT2 and HT3 extrinsics flipped compared
-                        //! to the order the third and fourth camera images come from usb.
-                        cam_cfg = hmd_cfg->tcams[i == 2 ? 3 : 2];
-                }
+		if (i == 2 || i == 3) {
+			//! @note The calibration json for the reverb G2v2 (the only 4-camera wmr
+			//! headset we know about) has the HT2 and HT3 extrinsics flipped compared
+			//! to the order the third and fourth camera images come from usb.
+			cam_cfg = hmd_cfg->tcams[i == 2 ? 3 : 2];
+		}
 #endif
 
 		cam->roi = cam_cfg->roi;
 
-                struct xrt_pose P_ci_c0 = cam_cfg->pose;
-                struct xrt_pose P_c0_ci;
-                math_pose_invert(&P_ci_c0, &P_c0_ci);
+		struct xrt_pose P_ci_c0 = cam_cfg->pose;
+		struct xrt_pose P_c0_ci;
+		math_pose_invert(&P_ci_c0, &P_c0_ci);
 
-                math_pose_transform(&P_imu_c0, &P_c0_ci, &cam->P_imu_cam);
+		math_pose_transform(&P_imu_c0, &P_c0_ci, &cam->P_imu_cam);
 
 		/* Init the camera model with size and distortion */
 		cam->camera_model.width = cam_cfg->roi.extent.w;
