@@ -33,8 +33,8 @@ DEBUG_GET_ONCE_LOG_OPTION(wmr_log, "WMR_LOG", U_LOGGING_INFO)
 #define RAD_TO_DEG(RAD) ((RAD)*180. / M_PI)
 #define DEG_TO_RAD(DEG) ((DEG)*M_PI / 180.)
 
-#define MIN_ROT_ERROR DEG_TO_RAD(25)
-#define MIN_POS_ERROR 0.05
+#define MIN_ROT_ERROR DEG_TO_RAD(30)
+#define MIN_POS_ERROR 0.10
 
 #define WMR_TRACE(c, ...) U_LOG_IFL_T(c->log_level, __VA_ARGS__)
 #define WMR_DEBUG(c, ...) U_LOG_IFL_D(c->log_level, __VA_ARGS__)
