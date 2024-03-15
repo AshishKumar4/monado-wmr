@@ -172,6 +172,18 @@ static struct xrt_binding_profile binding_profiles_odyssey[3] = {
     },
 };
 
+static const struct xrt_pose P_OG_left_aim_grip = {
+    .orientation = {.x = 0.293578, .y = 0.065085, .z = -0.000000, .w = 0.953718},
+    .position = {.x = 0.015191, .y = -0.068779, .z = -0.052497}};
+static const struct xrt_pose P_OG_right_aim_grip = {
+    .orientation = {.x = 0.293578, .y = -0.065085, .z = 0.000000, .w = 0.953718},
+    .position = {.x = -0.015191, .y = -0.068779, .z = -0.052497}};
+static const struct xrt_pose P_odyssey_left_aim_grip = {
+    .orientation = {.x = 0.270273, .y = 0.131820, .z = -0.000006, .w = 0.953719},
+    .position = {.x = 0.032802, .y = -0.067479, .z = -0.051951}};
+static const struct xrt_pose P_odyssey_right_aim_grip = {
+    .orientation = {.x = 0.270273, .y = -0.131820, .z = 0.000006, .w = 0.953719},
+    .position = {.x = -0.032802, .y = -0.067479, .z = -0.051951}};
 
 /* OG WMR Controller inputs struct */
 struct wmr_controller_og_input
@@ -399,8 +411,18 @@ wmr_controller_og_create(struct wmr_controller_connection *conn,
 
 	if (pid == ODYSSEY_CONTROLLER_PID) {
 		wcb->base.name = XRT_DEVICE_SAMSUNG_ODYSSEY_CONTROLLER;
+		if (controller_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
+			wcb->P_aim_grip = P_odyssey_left_aim_grip;
+		} else {
+			wcb->P_aim_grip = P_odyssey_right_aim_grip;
+		}
 	} else {
 		wcb->base.name = XRT_DEVICE_WMR_CONTROLLER;
+		if (controller_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
+			wcb->P_aim_grip = P_OG_left_aim_grip;
+		} else {
+			wcb->P_aim_grip = P_OG_right_aim_grip;
+		}
 	}
 
 	if (pid == ODYSSEY_CONTROLLER_PID) {

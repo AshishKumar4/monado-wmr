@@ -17,6 +17,7 @@
 #include "math/m_vec2.h"
 #include "math/m_vec3.h"
 #include "math/m_predict.h"
+#include "math/m_space.h"
 
 #include "util/u_file.h"
 #include "util/u_var.h"
@@ -94,6 +95,7 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 	if (wcb->last_imu_timestamp_ns > (uint64_t)mono_time_ns) {
 		WMR_WARN(wcb, "Received sample from the past, new: %" PRIu64 ", last: %" PRIu64 ", diff: %" PRIu64,
 		         mono_time_ns, now_hw_ns, mono_time_ns - now_hw_ns);
+		wcb->last_imu_timestamp_ns = mono_time_ns;
 		return;
 	}
 
@@ -513,6 +515,21 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 
 	struct wmr_controller_base *wcb = wmr_controller_base(xdev);
 
+	struct xrt_relation_chain xrc = {0};
+
+	if (name == XRT_INPUT_G2_CONTROLLER_GRIP_POSE || name == XRT_INPUT_ODYSSEY_CONTROLLER_GRIP_POSE ||
+	    name == XRT_INPUT_WMR_GRIP_POSE) {
+		m_relation_chain_push_pose(&xrc, &wcb->P_aim_grip);
+	}
+
+	/* Apply the controller rotation */
+	struct xrt_pose pose = {{0, 0, 0, 1}, {0, 1.2, -0.5}};
+	if (xdev->device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
+		pose.position.x = -0.2;
+	} else {
+		pose.position.x = 0.2;
+	}
+
 	// Variables needed for prediction.
 	int64_t last_imu_timestamp_ns = 0;
 	struct xrt_space_relation relation = {0};
@@ -521,12 +538,7 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
 	    XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT);
 
-	struct xrt_pose pose = {{0, 0, 0, 1}, {0, 1.2, -0.5}};
-	if (xdev->device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
-		pose.position.x = -0.2;
-	} else {
-		pose.position.x = 0.2;
-	}
+	// Start with the static pose above, then apply IMU + tracking
 	relation.pose = pose;
 
 	// Copy data while holding the lock.
@@ -539,6 +551,9 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 		relation.pose.position = wcb->last_tracked_pose.position;
 	}
 	os_mutex_unlock(&wcb->data_lock);
+
+	m_relation_chain_push_relation(&xrc, &relation);
+	m_relation_chain_resolve(&xrc, &relation);
 
 	// No prediction needed.
 	if (at_timestamp_ns < last_imu_timestamp_ns) {
@@ -629,8 +644,16 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	wcb->base.name = XRT_DEVICE_WMR_CONTROLLER;
 	wcb->base.device_type = controller_type;
 	wcb->base.supported.orientation_tracking = true;
-	wcb->base.supported.position_tracking = false;
+	wcb->base.supported.position_tracking = true;
 	wcb->base.supported.hand_tracking = false;
+
+	/* Default grip pose up by 35° degrees around the X axis and
+	 * back about 10cm (back is +Z in OXR coords), but overridden
+	 * by subclasses with real values from controller models */
+	struct xrt_vec3 translation = {0.0, 0, 0.1};
+	struct xrt_vec3 axis = {1.0, 0, 0};
+	math_quat_from_angle_vector(DEG_TO_RAD(35), &axis, &wcb->P_aim_grip.orientation);
+	wcb->P_aim_grip.position = translation;
 
 	m_imu_3dof_init(&wcb->fusion, M_IMU_3DOF_USE_GRAVITY_DUR_20MS);
 
@@ -721,6 +744,7 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	u_var_add_ro_u64(wcb, &wcb->last_timesync_device_timestamp_ns, "Last device timesync TS");
 
 	u_var_add_gui_header(wcb, NULL, "Misc");
+	u_var_add_pose(wcb, &wcb->P_aim_grip, "Grip pose offset");
 	u_var_add_ro_u64(wcb, &wcb->next_keepalive_timestamp_ns, "Next keepalive TS");
 
 	return true;

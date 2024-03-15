@@ -136,6 +136,9 @@ struct wmr_controller_base
 	bool have_config;
 	struct wmr_controller_config config;
 
+	//! Offset for grip pose (set by subclasses. adjustable in debug)
+	struct xrt_pose P_aim_grip;
+
 	//! Last ticks counter from input, extended to 64-bits
 	uint64_t last_timestamp_ticks;
 
