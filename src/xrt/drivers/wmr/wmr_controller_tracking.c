@@ -1002,18 +1002,16 @@ wmr_controller_tracker_create(struct xrt_frame_context *xfctx,
 		struct wmr_camera_config *cam_cfg = hmd_cfg->tcams[i];
 		struct t_slam_camera_calibration *cam_slam_cfg = slam_calib->cams + i;
 
-#if 1
+		struct xrt_pose P_ci_c0 = cam_cfg->pose;
 		if (i == 2 || i == 3) {
 			//! @note The calibration json for the reverb G2v2 (the only 4-camera wmr
 			//! headset we know about) has the HT2 and HT3 extrinsics flipped compared
 			//! to the order the third and fourth camera images come from usb.
-			cam_cfg = hmd_cfg->tcams[i == 2 ? 3 : 2];
+			P_ci_c0 = hmd_cfg->tcams[i == 2 ? 3 : 2]->pose;
 		}
-#endif
 
 		cam->roi = cam_cfg->roi;
 
-		struct xrt_pose P_ci_c0 = cam_cfg->pose;
 		struct xrt_pose P_c0_ci;
 		math_pose_invert(&P_ci_c0, &P_c0_ci);
 
