@@ -152,8 +152,6 @@ struct wmr_controller_base
 	uint64_t last_imu_timestamp_ns;
 	//! Time of last IMU sample, in device time.
 	uint64_t last_imu_device_timestamp_ns;
-	//!< Estimated offset from IMU to monotonic clock. Protected by data_lock
-	time_duration_ns hw2mono;
 	//!< Min-Skew estimator for IMU to monotonic clock. Protected by data_lock
 	struct m_clock_windowed_skew_tracker *hw2mono_clock;
 	//!< Last IMU sample received

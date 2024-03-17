@@ -73,11 +73,7 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 
 	timepoint_ns now_hw_ns = wcb->last_timestamp_ticks * WMR_MOTION_CONTROLLER_NS_PER_TICK;
 
-	// Convert hardware timestamp into monotonic clock. Update offset estimate hw2mono.
-	const float IMU_FREQ = 500.f;
-	m_clock_offset_a2b(IMU_FREQ, now_hw_ns, rx_mono_ns, &wcb->hw2mono);
-
-	/* Update windowed min-skew estimator */
+	/* Update windowed min-skew estimator and convert hardware timestamp into monotonic clock */
 	m_clock_windowed_skew_tracker_push(wcb->hw2mono_clock, rx_mono_ns, now_hw_ns);
 
 	timepoint_ns mono_time_ns;
@@ -90,12 +86,21 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 
 	/*
 	 * Check if the timepoint does time travel, we get one or two
-	 * old samples when the device has not been cleanly shut down.
+	 * old samples when the device has not been cleanly shut down,
+	 * and if the controller is left idle and goes into low power
+	 * mode it can come back with a different clock epoch
 	 */
 	if (wcb->last_imu_timestamp_ns > (uint64_t)mono_time_ns) {
-		WMR_WARN(wcb, "Received sample from the past, new: %" PRIu64 ", last: %" PRIu64 ", diff: %" PRIu64,
+		WMR_WARN(wcb,
+		         "Received sample from the past, new: %" PRIu64 ", last: %" PRIu64 ", diff: %" PRIu64
+		         ". resetting clock tracking",
 		         mono_time_ns, now_hw_ns, mono_time_ns - now_hw_ns);
-		wcb->last_imu_timestamp_ns = mono_time_ns;
+		// Reinit. The 3dof fusion will assert if time goes backward
+		wcb->last_imu_timestamp_ns = 0;
+		wcb->last_imu_device_timestamp_ns = 0;
+		m_imu_3dof_init(&wcb->fusion, M_IMU_3DOF_USE_GRAVITY_DUR_20MS);
+		m_clock_windowed_skew_tracker_reset(wcb->hw2mono_clock);
+		m_clock_windowed_skew_tracker_push(wcb->hw2mono_clock, rx_mono_ns, now_hw_ns);
 		return;
 	}
 
