@@ -283,12 +283,24 @@ wmr_controller_og_packet_parse(struct wmr_controller_og *ctrl,
 	last_input->thumbstick.values.x = (float)(stick_x - 0x07FF) / 0x07FF;
 	if (last_input->thumbstick.values.x > 1.0f) {
 		last_input->thumbstick.values.x = 1.0f;
+	} else if (last_input->thumbstick.values.x < -1.0f) {
+		last_input->thumbstick.values.x = -1.0f;
+	} else if (fabs(last_input->thumbstick.values.x) < wcb->thumbstick_deadzone) {
+		last_input->thumbstick.values.x = 0.0f;
 	}
+
+
 
 	last_input->thumbstick.values.y = (float)(stick_y - 0x07FF) / 0x07FF;
 	if (last_input->thumbstick.values.y > 1.0f) {
 		last_input->thumbstick.values.y = 1.0f;
+	} else if (last_input->thumbstick.values.y < -1.0f) {
+		last_input->thumbstick.values.y = -1.0f;
+	} else if (fabs(last_input->thumbstick.values.y) < wcb->thumbstick_deadzone) {
+		last_input->thumbstick.values.y = 0.0f;
 	}
+
+
 
 	// Read trigger value (0x00 - 0xFF)
 	last_input->trigger = (float)read8(&p) / 0xFF;

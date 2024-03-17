@@ -222,11 +222,19 @@ wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl,
 	last_input->thumbstick.values.x = (float)(stick_x - 0x07FF) / 0x07FF;
 	if (last_input->thumbstick.values.x > 1.0f) {
 		last_input->thumbstick.values.x = 1.0f;
+	} else if (last_input->thumbstick.values.x < -1.0f) {
+		last_input->thumbstick.values.x = -1.0f;
+	} else if (fabs(last_input->thumbstick.values.x) < wcb->thumbstick_deadzone) {
+		last_input->thumbstick.values.x = 0.0f;
 	}
 
 	last_input->thumbstick.values.y = (float)(stick_y - 0x07FF) / 0x07FF;
 	if (last_input->thumbstick.values.y > 1.0f) {
 		last_input->thumbstick.values.y = 1.0f;
+	} else if (last_input->thumbstick.values.y < -1.0f) {
+		last_input->thumbstick.values.y = -1.0f;
+	} else if (fabs(last_input->thumbstick.values.y) < wcb->thumbstick_deadzone) {
+		last_input->thumbstick.values.y = 0.0f;
 	}
 
 	// Read trigger value (0x00 - 0xFF)
@@ -394,6 +402,7 @@ wmr_controller_hp_create(struct wmr_controller_connection *conn,
 	u_var_add_f32(wcb, &ctrl->last_inputs.trigger, "input.trigger");
 	u_var_add_u8(wcb, &ctrl->last_inputs.battery, "input.battery");
 	u_var_add_bool(wcb, &ctrl->last_inputs.thumbstick.click, "input.thumbstick.click");
+	u_var_add_f32(wcb, &wcb->thumbstick_deadzone, "thumbstick deadzone");
 	u_var_add_f32(wcb, &ctrl->last_inputs.thumbstick.values.x, "input.thumbstick.values.y");
 	u_var_add_f32(wcb, &ctrl->last_inputs.thumbstick.values.y, "input.thumbstick.values.x");
 	if (controller_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {

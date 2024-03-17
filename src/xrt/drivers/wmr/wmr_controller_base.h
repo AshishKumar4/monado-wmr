@@ -139,6 +139,9 @@ struct wmr_controller_base
 	//! Offset for grip pose (set by subclasses. adjustable in debug)
 	struct xrt_pose P_aim_grip;
 
+	//! Thumbstick deadzone setting. Applied / used by subclasses
+	float thumbstick_deadzone;
+
 	//! Last ticks counter from input, extended to 64-bits
 	uint64_t last_timestamp_ticks;
 
