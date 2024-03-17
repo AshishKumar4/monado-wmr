@@ -669,8 +669,71 @@ public:
 			AddOutputControl(XRT_OUTPUT_NAME_FLIPVR_HAPTIC, "/output/haptic");
 		}
 
-		case XRT_DEVICE_TOUCH_CONTROLLER: break;    // TODO
-		case XRT_DEVICE_WMR_CONTROLLER: break;      // TODO
+		case XRT_DEVICE_TOUCH_CONTROLLER: break; // TODO
+		case XRT_DEVICE_WMR_CONTROLLER: {
+			AddControl("/input/trigger/value", XRT_INPUT_WMR_TRIGGER_VALUE, NULL);
+			AddControl("/input/grip/click", XRT_INPUT_WMR_SQUEEZE_CLICK, NULL);
+
+			// @todo: Does the WMR driver (and variants) need to report a synthesised click input?
+			// AddControl("/input/trigger/click", XRT_INPUT_WMR_TRIGGER_CLICK, NULL);
+
+			AddControl("/input/system/click", XRT_INPUT_WMR_HOME_CLICK, NULL);
+
+			struct MonadoInputComponent x = {true, true, false};
+			struct MonadoInputComponent y = {true, false, true};
+
+			AddControl("/input/trackpad/click", XRT_INPUT_WMR_TRACKPAD_CLICK, NULL);
+			AddControl("/input/trackpad/touch", XRT_INPUT_WMR_TRACKPAD_TOUCH, NULL);
+			AddControl("/input/trackpad/x", XRT_INPUT_WMR_TRACKPAD, &x);
+			AddControl("/input/trackpad/y", XRT_INPUT_WMR_TRACKPAD, &y);
+
+			AddControl("/input/thumbstick/click", XRT_INPUT_WMR_THUMBSTICK_CLICK, NULL);
+			AddControl("/input/thumbstick/x", XRT_INPUT_WMR_THUMBSTICK, &x);
+			AddControl("/input/thumbstick/y", XRT_INPUT_WMR_THUMBSTICK, &y);
+			break;
+		}
+		case XRT_DEVICE_SAMSUNG_ODYSSEY_CONTROLLER: {
+			// Same as the OG controller, but with distinct input names
+			AddControl("/input/trigger/value", XRT_INPUT_ODYSSEY_CONTROLLER_TRIGGER_VALUE, NULL);
+			AddControl("/input/grip/click", XRT_INPUT_ODYSSEY_CONTROLLER_SQUEEZE_CLICK, NULL);
+
+			AddControl("/input/system/click", XRT_INPUT_ODYSSEY_CONTROLLER_HOME_CLICK, NULL);
+
+			struct MonadoInputComponent x = {true, true, false};
+			struct MonadoInputComponent y = {true, false, true};
+
+			AddControl("/input/trackpad/click", XRT_INPUT_ODYSSEY_CONTROLLER_TRACKPAD_CLICK, NULL);
+			AddControl("/input/trackpad/touch", XRT_INPUT_ODYSSEY_CONTROLLER_TRACKPAD_TOUCH, NULL);
+			AddControl("/input/trackpad/x", XRT_INPUT_ODYSSEY_CONTROLLER_TRACKPAD, &x);
+			AddControl("/input/trackpad/y", XRT_INPUT_ODYSSEY_CONTROLLER_TRACKPAD, &y);
+
+			AddControl("/input/thumbstick/click", XRT_INPUT_ODYSSEY_CONTROLLER_THUMBSTICK_CLICK, NULL);
+			AddControl("/input/thumbstick/x", XRT_INPUT_ODYSSEY_CONTROLLER_THUMBSTICK, &x);
+			AddControl("/input/thumbstick/y", XRT_INPUT_ODYSSEY_CONTROLLER_THUMBSTICK, &y);
+			break;
+		}
+		case XRT_DEVICE_HP_REVERB_G2_CONTROLLER: {
+			AddControl("/input/trigger/value", XRT_INPUT_G2_CONTROLLER_TRIGGER_VALUE, NULL);
+			AddControl("/input/grip/value", XRT_INPUT_G2_CONTROLLER_SQUEEZE_VALUE, NULL);
+
+			AddControl("/input/system/click", XRT_INPUT_G2_CONTROLLER_HOME_CLICK, NULL);
+
+			if (m_hand == XRT_HAND_LEFT) {
+				AddControl("/input/a/click", XRT_INPUT_G2_CONTROLLER_X_CLICK, NULL);
+				AddControl("/input/b/click", XRT_INPUT_G2_CONTROLLER_Y_CLICK, NULL);
+			} else {
+				AddControl("/input/a/click", XRT_INPUT_G2_CONTROLLER_A_CLICK, NULL);
+				AddControl("/input/b/click", XRT_INPUT_G2_CONTROLLER_B_CLICK, NULL);
+			}
+			AddControl("/input/thumbstick/click", XRT_INPUT_G2_CONTROLLER_THUMBSTICK_CLICK, NULL);
+
+			struct MonadoInputComponent x = {true, true, false};
+			struct MonadoInputComponent y = {true, false, true};
+
+			AddControl("/input/thumbstick/x", XRT_INPUT_G2_CONTROLLER_THUMBSTICK, &x);
+			AddControl("/input/thumbstick/y", XRT_INPUT_G2_CONTROLLER_THUMBSTICK, &y);
+			break;
+		}
 		case XRT_DEVICE_XBOX_CONTROLLER: break;     // TODO
 		case XRT_DEVICE_VIVE_TRACKER_GEN1: break;   // TODO
 		case XRT_DEVICE_VIVE_TRACKER_GEN2: break;   // TODO
@@ -919,6 +982,12 @@ public:
 			grip_name = XRT_INPUT_HYDRA_GRIP_POSE;
 		} else if (m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER) {
 			grip_name = XRT_INPUT_TOUCH_GRIP_POSE;
+		} else if (m_xdev->name == XRT_DEVICE_WMR_CONTROLLER) {
+			grip_name = XRT_INPUT_WMR_GRIP_POSE;
+		} else if (m_xdev->name == XRT_DEVICE_SAMSUNG_ODYSSEY_CONTROLLER) {
+			grip_name = XRT_INPUT_ODYSSEY_CONTROLLER_GRIP_POSE;
+		} else if (m_xdev->name == XRT_DEVICE_HP_REVERB_G2_CONTROLLER) {
+			grip_name = XRT_INPUT_G2_CONTROLLER_GRIP_POSE;
 		} else if (m_xdev->name == XRT_DEVICE_SIMPLE_CONTROLLER) {
 			grip_name = XRT_INPUT_SIMPLE_GRIP_POSE;
 		} else {
