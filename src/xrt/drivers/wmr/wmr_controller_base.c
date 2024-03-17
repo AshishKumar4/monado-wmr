@@ -660,6 +660,8 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	math_quat_from_angle_vector(DEG_TO_RAD(35), &axis, &wcb->P_aim_grip.orientation);
 	wcb->P_aim_grip.position = translation;
 
+	wcb->thumbstick_deadzone = 0.15;
+
 	m_imu_3dof_init(&wcb->fusion, M_IMU_3DOF_USE_GRAVITY_DUR_20MS);
 
 	if (os_mutex_init(&wcb->conn_lock) != 0 || os_mutex_init(&wcb->data_lock) != 0) {
@@ -956,12 +958,37 @@ wmr_controller_base_push_observed_pose(struct wmr_controller_base *wcb,
 		struct xrt_quat delta;
 		math_quat_unrotate(&wcb->fusion.rot, &pose->orientation, &delta);
 		delta.x = delta.z = 0.0; // We only want Yaw
-		// delta.y = 0.05 * delta.y; // 5%
-		math_quat_normalize(&delta);
 
-		WMR_DEBUG(wcb, "Applying yaw rotation of %f degrees", RAD_TO_DEG(2 * asinf(delta.y)));
+		if (fabs(delta.y) > sin(DEG_TO_RAD(5)) / 2) {
+			delta.y = sin(0.10 * asinf(delta.y)); // 10% correction
+			math_quat_normalize(&delta);
 
-		math_quat_rotate(&wcb->fusion.rot, &delta, &wcb->fusion.rot);
+			struct xrt_quat prev = wcb->fusion.rot;
+			math_quat_rotate(&wcb->fusion.rot, &delta, &wcb->fusion.rot);
+
+			if (wcb->log_level <= U_LOGGING_DEBUG) {
+				struct xrt_quat post_delta;
+				math_quat_unrotate(&wcb->fusion.rot, &pose->orientation, &post_delta);
+				post_delta.x = post_delta.z = 0.0;  // We only want Yaw
+				post_delta.y = 0.10 * post_delta.y; // 5%
+				math_quat_normalize(&post_delta);
+
+				WMR_DEBUG(wcb,
+				          "Applying delta yaw rotation of %f degrees delta quat %f,%f,%f,%f from "
+				          "%f,%f,%f,%f to "
+				          "%f,%f,%f,%f. delta after correction: %f,%f,%f,%f",
+				          RAD_TO_DEG(2 * asinf(delta.y)), delta.x, delta.y, delta.z, delta.w, prev.x,
+				          prev.y, prev.z, prev.w, wcb->fusion.rot.x, wcb->fusion.rot.y,
+				          wcb->fusion.rot.z, wcb->fusion.rot.w, post_delta.x, post_delta.y,
+				          post_delta.z, post_delta.w);
+			}
+		} else {
+			math_quat_normalize(&delta);
+
+			WMR_DEBUG(wcb, "Applying full yaw correction of %f degrees. delta quat %f,%f,%f,%f",
+			          RAD_TO_DEG(2 * asinf(delta.y)), delta.x, delta.y, delta.z, delta.w);
+			math_quat_rotate(&wcb->fusion.rot, &delta, &wcb->fusion.rot);
+		}
 #else
 		wcb->fusion.rot = pose->orientation;
 #endif
