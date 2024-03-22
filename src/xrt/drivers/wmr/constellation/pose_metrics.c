@@ -48,6 +48,12 @@ find_best_matching_led(struct pose_metrics_visible_led_info *led_points,
 		double dy = fabs(pos_px->y - blob->y);
 		double sqerror = dx * dx + dy * dy;
 
+		/* If the blob is much larger than the LED in either dimension,
+		 * don't match */
+		if (blob->width > led_info->led_radius_px * 4 || blob->height > led_info->led_radius_px * 4) {
+			continue;
+		}
+
 		/* Check if the LED falls within the bounding box
 		 * is closer to the camera (smaller Z), or is at least
 		 * led_radius closer to the blob center */
