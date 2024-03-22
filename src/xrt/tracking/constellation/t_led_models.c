@@ -1,7 +1,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-#include "led_models.h"
+#include "tracking/t_led_models.h"
 
 /* Set to 0 to use 3D euclidean distance to sort neighbours,
  * 1 to use orthographic projected (undistorted) 2D distance
@@ -16,20 +16,20 @@
 #endif
 
 void
-constellation_led_model_init(uint8_t device_id, struct constellation_led_model *led_model, uint8_t num_leds)
+t_constellation_led_model_init(uint8_t device_id, struct t_constellation_led_model *led_model, uint8_t num_leds)
 {
 	led_model->id = device_id;
-	led_model->leds = calloc(num_leds, sizeof(struct constellation_led));
+	led_model->leds = calloc(num_leds, sizeof(struct t_constellation_led));
 	led_model->num_leds = num_leds;
 }
 
 void
-constellation_led_model_dump(struct constellation_led_model *led_model, const char *desc)
+t_constellation_led_model_dump(struct t_constellation_led_model *led_model, const char *desc)
 {
 	int i;
 	printf("LED model: %s\n", desc);
 	for (i = 0; i < led_model->num_leds; i++) {
-		struct constellation_led *p = led_model->leds + i;
+		struct t_constellation_led *p = led_model->leds + i;
 
 		printf("{ .pos = {%f,%f,%f}, .dir={%f,%f,%f} },\n", p->pos.x, p->pos.y, p->pos.z, p->dir.x, p->dir.y,
 		       p->dir.z);
@@ -37,7 +37,7 @@ constellation_led_model_dump(struct constellation_led_model *led_model, const ch
 }
 
 void
-constellation_led_model_clear(struct constellation_led_model *led_model)
+t_constellation_led_model_clear(struct t_constellation_led_model *led_model)
 {
 	free(led_model->leds);
 	led_model->leds = NULL;
@@ -45,15 +45,15 @@ constellation_led_model_clear(struct constellation_led_model *led_model)
 
 struct led_candidate_sort_entry
 {
-	struct constellation_led *led;
+	struct t_constellation_led *led;
 	double distance;
 };
 
 #define POW2(_x) ((_x) * (_x))
 
 static double
-calc_led_dist(const struct constellation_search_led_candidate *c,
-              const struct constellation_led *anchor,
+calc_led_dist(const struct t_constellation_search_led_candidate *c,
+              const struct t_constellation_led *anchor,
               struct xrt_vec3 *out_led_pos)
 {
 	struct xrt_vec3 led_pos;
@@ -95,12 +95,12 @@ compare_led_distance(const void *elem1, const void *elem2)
 	return 0;
 }
 
-struct constellation_search_led_candidate *
-constellation_search_led_candidate_new(struct constellation_led *led, struct constellation_led_model *led_model)
+struct t_constellation_search_led_candidate *
+t_constellation_search_led_candidate_new(struct t_constellation_led *led, struct t_constellation_led_model *led_model)
 {
 	int i;
 
-	struct constellation_search_led_candidate *c = calloc(1, sizeof(struct constellation_search_led_candidate));
+	struct t_constellation_search_led_candidate *c = calloc(1, sizeof(struct t_constellation_search_led_candidate));
 	c->led = led;
 
 	/* Calculate the pose that places this LED forward-facing at 0,0,0
@@ -114,7 +114,7 @@ constellation_search_led_candidate_new(struct constellation_led *led, struct con
 	struct led_candidate_sort_entry array[256];
 
 	for (i = 0; i < led_model->num_leds; i++) {
-		struct constellation_led *cur = led_model->leds + i;
+		struct t_constellation_led *cur = led_model->leds + i;
 
 		if (cur == led)
 			continue; // Don't put the current LED in its own neighbour list
@@ -132,7 +132,7 @@ constellation_search_led_candidate_new(struct constellation_led *led, struct con
 	if (c->num_neighbours > 1) {
 		qsort(array, c->num_neighbours, sizeof(struct led_candidate_sort_entry), compare_led_distance);
 
-		c->neighbours = calloc(c->num_neighbours, sizeof(struct constellation_led *));
+		c->neighbours = calloc(c->num_neighbours, sizeof(struct t_constellation_led *));
 		for (i = 0; i < c->num_neighbours; i++) {
 			c->neighbours[i] = array[i].led;
 		}
@@ -145,7 +145,7 @@ constellation_search_led_candidate_new(struct constellation_led *led, struct con
 	      c->pose.orientation.z, c->pose.orientation.w);
 
 	for (i = 0; i < c->num_neighbours; i++) {
-		struct constellation_led *cur = c->neighbours[i];
+		struct t_constellation_led *cur = c->neighbours[i];
 		struct xrt_vec3 led_pos;
 		double distance = calc_led_dist(c, cur, &led_pos);
 
@@ -165,38 +165,38 @@ constellation_search_led_candidate_new(struct constellation_led *led, struct con
 }
 
 void
-constellation_search_led_candidate_free(struct constellation_search_led_candidate *candidate)
+t_constellation_search_led_candidate_free(struct t_constellation_search_led_candidate *candidate)
 {
 	free(candidate->neighbours);
 	free(candidate);
 }
 
-struct constellation_search_model *
-constellation_search_model_new(struct constellation_led_model *led_model)
+struct t_constellation_search_model *
+t_constellation_search_model_new(struct t_constellation_led_model *led_model)
 {
-	struct constellation_search_model *m = calloc(1, sizeof(struct constellation_search_model));
+	struct t_constellation_search_model *m = calloc(1, sizeof(struct t_constellation_search_model));
 	int i;
 
 	m->id = led_model->id;
 	m->led_model = led_model;
 
-	m->points = calloc(led_model->num_leds, sizeof(struct constellation_search_led_candidate *));
+	m->points = calloc(led_model->num_leds, sizeof(struct t_constellation_search_led_candidate *));
 	m->num_points = led_model->num_leds;
 
 	for (i = 0; i < led_model->num_leds; i++) {
-		m->points[i] = constellation_search_led_candidate_new(led_model->leds + i, led_model);
+		m->points[i] = t_constellation_search_led_candidate_new(led_model->leds + i, led_model);
 	}
 
 	return m;
 }
 
 void
-constellation_search_model_free(struct constellation_search_model *model)
+t_constellation_search_model_free(struct t_constellation_search_model *model)
 {
 	int i;
 
 	for (i = 0; i < model->num_points; i++) {
-		constellation_search_led_candidate_free(model->points[i]);
+		t_constellation_search_led_candidate_free(model->points[i]);
 	}
 	free(model->points);
 	free(model);

@@ -10,7 +10,7 @@
 #include "sample.h"
 
 struct constellation_tracking_sample *
-constellation_tracking_sample_new()
+constellation_tracking_sample_new(void)
 {
 	struct constellation_tracking_sample *sample = calloc(1, sizeof(struct constellation_tracking_sample));
 	return sample;

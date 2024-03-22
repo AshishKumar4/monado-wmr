@@ -12,9 +12,9 @@
 #pragma once
 
 #include "xrt/xrt_defines.h"
+#include "tracking/t_led_models.h"
 
 #include "blobwatch.h"
-#include "led_models.h"
 #include "camera_model.h"
 
 #ifdef __cplusplus
@@ -62,7 +62,7 @@ struct pose_metrics
 
 struct pose_metrics_visible_led_info
 {
-	struct constellation_led *led;
+	struct t_constellation_led *led;
 	double led_radius_px;   /* Expected max size of the LED in pixels at that distance */
 	struct xrt_vec2 pos_px; /* Projected position of the LED (pixels) */
 	struct xrt_vec3 pos_m;  /* Projected physical position of the LED (metres) */
@@ -87,7 +87,7 @@ void
 pose_metrics_match_pose_to_blobs(struct xrt_pose *pose,
                                  struct blob *blobs,
                                  int num_blobs,
-                                 struct constellation_led_model *led_model,
+                                 struct t_constellation_led_model *led_model,
                                  struct camera_model *calib,
                                  struct pose_metrics_blob_match_info *match_info);
 
@@ -96,7 +96,7 @@ pose_metrics_evaluate_pose(struct pose_metrics *score,
                            struct xrt_pose *pose,
                            struct blob *blobs,
                            int num_blobs,
-                           struct constellation_led_model *leds_model,
+                           struct t_constellation_led_model *leds_model,
                            struct camera_model *calib,
                            struct pose_rect *out_bounds);
 
@@ -109,7 +109,7 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
                                       const struct xrt_vec3 *rot_error_thresh,
                                       struct blob *blobs,
                                       int num_blobs,
-                                      struct constellation_led_model *leds_model,
+                                      struct t_constellation_led_model *leds_model,
                                       struct camera_model *calib,
                                       struct pose_rect *out_bounds);
 

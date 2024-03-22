@@ -14,22 +14,22 @@
 
 #pragma once
 
-#include "tracking/t_tracking.h"
-#include "xrt/xrt_device.h"
-#include "xrt/xrt_frame.h"
-#include "xrt/xrt_prober.h"
 #include "os/os_threading.h"
 #include "math/m_imu_3dof.h"
+#include "tracking/t_tracking.h"
+#include "tracking/t_constellation_tracking.h"
 #include "util/u_logging.h"
 #include "util/u_distortion_mesh.h"
 #include "util/u_var.h"
+#include "xrt/xrt_device.h"
+#include "xrt/xrt_frame.h"
+#include "xrt/xrt_prober.h"
 
 #include "wmr_protocol.h"
 #include "wmr_config.h"
 #include "wmr_camera.h"
 #include "wmr_common.h"
 #include "wmr_hmd_controller.h"
-#include "wmr_controller_tracking.h"
 
 
 #ifdef __cplusplus
@@ -182,7 +182,7 @@ struct wmr_hmd
 
 	struct wmr_hmd_controller_connection *controller[WMR_MAX_CONTROLLERS];
 
-	struct wmr_controller_tracker *controller_tracker;
+	struct t_constellation_tracker *controller_tracker;
 };
 
 static inline struct wmr_hmd *
@@ -216,8 +216,10 @@ wmr_hmd_send_controller_packet(struct wmr_hmd *hmd, const uint8_t *buffer, uint3
 int
 wmr_hmd_read_sync_from_controller(struct wmr_hmd *hmd, uint8_t *buffer, uint32_t buf_size, int timeout_ms);
 
-struct wmr_controller_tracker_connection *
-wmr_hmd_add_tracked_controller(struct wmr_hmd *hmd, struct wmr_controller_base *wcb);
+struct t_constellation_tracked_device_connection *
+wmr_hmd_add_tracked_controller(struct wmr_hmd *hmd,
+                               struct xrt_device *xdev,
+                               struct t_constellation_tracked_device_callbacks *cb);
 
 #ifdef __cplusplus
 }

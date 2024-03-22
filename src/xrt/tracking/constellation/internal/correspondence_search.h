@@ -11,10 +11,10 @@
  */
 #pragma once
 
-#include "tracking/t_camera_models.h"
+#include "tracking/t_led_models.h"
 
 #include "blobwatch.h"
-#include "led_models.h"
+#include "camera_model.h"
 #include "pose_metrics.h"
 
 #define MAX_BLOB_SEARCH_DEPTH 5
@@ -49,7 +49,7 @@ struct cs_model_info
 {
 	int id;
 
-	struct constellation_search_model *model;
+	struct t_constellation_search_model *model;
 
 	double best_pose_found_time; /* Time (in secs) at which the best pose was found */
 	int best_pose_blob_depth;    /* Blob neighbor depth the best pose is from */
@@ -105,7 +105,7 @@ correspondence_search_free(struct correspondence_search *cs);
 
 bool
 correspondence_search_find_one_pose(struct correspondence_search *cs,
-                                    struct constellation_search_model *model,
+                                    struct t_constellation_search_model *model,
                                     enum correspondence_search_flags search_flags,
                                     struct xrt_pose *pose,
                                     struct xrt_vec3 *pos_error_thresh,

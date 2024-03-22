@@ -19,6 +19,8 @@
 #include "math/m_predict.h"
 #include "math/m_space.h"
 
+#include "tracking/t_constellation_tracking.h"
+
 #include "util/u_file.h"
 #include "util/u_var.h"
 #include "util/u_misc.h"
@@ -595,7 +597,7 @@ wmr_controller_base_deinit(struct wmr_controller_base *wcb)
 	}
 
 	if (wcb->tracking_connection) {
-		wmr_controller_tracker_connection_disconnect(wcb->tracking_connection);
+		t_constellation_tracked_device_connection_disconnect(wcb->tracking_connection);
 		wcb->tracking_connection = NULL;
 	}
 
@@ -812,9 +814,11 @@ fill_timesync_packet(
 	buf[11] = ((U2 >> 6) & 0x1f) | ((flags & 0x3) << 5);
 }
 
-void
-wmr_controller_base_notify_timesync(struct wmr_controller_base *wcb, timepoint_ns next_slam_mono_ns)
+static void
+wmr_controller_base_notify_timesync(struct xrt_device *xdev, uint64_t next_slam_mono_ns, uint64_t frame_sequence)
 {
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)xdev;
+
 	os_mutex_lock(&wcb->data_lock);
 	timepoint_ns next_device_slam_time_ns;
 	if (m_clock_windowed_skew_tracker_to_remote(wcb->hw2mono_clock, next_slam_mono_ns, &next_device_slam_time_ns)) {
@@ -906,16 +910,11 @@ wmr_controller_base_send_keepalive(struct wmr_controller_base *wcb, uint64_t now
 	}
 }
 
-void
-wmr_controller_attach_to_hmd(struct wmr_controller_base *wcb, struct wmr_hmd *hmd)
+static bool
+wmr_controller_base_get_led_model(struct xrt_device *xdev, struct t_constellation_led_model *led_model)
 {
-	/* Register the controller with the HMD for LED constellation tracking and LED sync timing updates */
-	wcb->tracking_connection = wmr_hmd_add_tracked_controller(hmd, wcb);
-}
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
 
-bool
-wmr_controller_base_get_led_model(struct wmr_controller_base *wcb, struct constellation_led_model *led_model)
-{
 	os_mutex_lock(&wcb->data_lock);
 	if (!wcb->have_config) {
 		os_mutex_unlock(&wcb->data_lock);
@@ -923,12 +922,12 @@ wmr_controller_base_get_led_model(struct wmr_controller_base *wcb, struct conste
 	}
 	os_mutex_unlock(&wcb->data_lock);
 
-	constellation_led_model_init((int)wcb->base.device_type, led_model, wcb->config.led_count);
+	t_constellation_led_model_init((int)wcb->base.device_type, led_model, wcb->config.led_count);
 
 	// Note: This LED model is in OpenCV/WMR coordinates with
 	// XYZ = Right/Down/Forward
 	for (int i = 0; i < wcb->config.led_count; i++) {
-		struct constellation_led *led = led_model->leds + i;
+		struct t_constellation_led *led = led_model->leds + i;
 
 		led->id = i;
 
@@ -941,11 +940,10 @@ wmr_controller_base_get_led_model(struct wmr_controller_base *wcb, struct conste
 	return true;
 }
 
-void
-wmr_controller_base_push_observed_pose(struct wmr_controller_base *wcb,
-                                       timepoint_ns frame_mono_ns,
-                                       const struct xrt_pose *pose)
+static void
+wmr_controller_base_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame_mono_ns, const struct xrt_pose *pose)
 {
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
 	os_mutex_lock(&wcb->data_lock);
 
 	wcb->last_tracked_pose_ts = frame_mono_ns;
@@ -995,4 +993,17 @@ wmr_controller_base_push_observed_pose(struct wmr_controller_base *wcb,
 	}
 
 	os_mutex_unlock(&wcb->data_lock);
+}
+
+static struct t_constellation_tracked_device_callbacks tracking_callbacks = {
+    .get_led_model = wmr_controller_base_get_led_model,
+    .notify_frame_received = wmr_controller_base_notify_timesync,
+    .push_observed_pose = wmr_controller_base_push_observed_pose,
+};
+
+void
+wmr_controller_attach_to_hmd(struct wmr_controller_base *wcb, struct wmr_hmd *hmd)
+{
+	/* Register the controller with the HMD for LED constellation tracking and LED sync timing updates */
+	wcb->tracking_connection = wmr_hmd_add_tracked_controller(hmd, &wcb->base, &tracking_callbacks);
 }

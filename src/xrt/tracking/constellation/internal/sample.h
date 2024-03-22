@@ -28,7 +28,7 @@ struct tracking_sample_device_state
 	/* Index into the devices array for this state info */
 	int dev_index;
 
-	struct constellation_led_model *led_model;
+	struct t_constellation_led_model *led_model;
 
 	/* Predicted device pose and error bounds from fusion, in world space */
 	struct xrt_pose P_world_obj_prior;
@@ -83,7 +83,7 @@ struct constellation_tracking_sample
 };
 
 struct constellation_tracking_sample *
-constellation_tracking_sample_new();
+constellation_tracking_sample_new(void);
 void
 constellation_tracking_sample_free(struct constellation_tracking_sample *sample);
 

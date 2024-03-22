@@ -21,13 +21,13 @@
 #include "util/u_logging.h"
 #include "util/u_var.h"
 #include "xrt/xrt_device.h"
+#include "tracking/t_led_models.h"
+#include "tracking/t_constellation_tracking.h"
 
 #include "wmr_common.h"
 #include "wmr_controller_protocol.h"
-#include "wmr_controller_tracking.h"
 #include "wmr_config.h"
 
-#include "constellation/led_models.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -120,7 +120,7 @@ struct wmr_controller_base
 	enum u_logging_level log_level;
 
 	//! Controller tracker connection that is doing 6dof tracking of this controller
-	struct wmr_controller_tracker_connection *tracking_connection;
+	struct t_constellation_tracked_device_connection *tracking_connection;
 
 	//! Mutex protects shared data used from OpenXR callbacks
 	struct os_mutex data_lock;
@@ -208,14 +208,6 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
                                struct wmr_controller_base_imu_sample *imu,
                                timepoint_ns rx_mono_ns);
 
-void
-wmr_controller_base_notify_timesync(struct wmr_controller_base *wcb, timepoint_ns next_slam_mono_ns);
-
-void
-wmr_controller_base_push_observed_pose(struct wmr_controller_base *wcb,
-                                       timepoint_ns frame_mono_ns,
-                                       const struct xrt_pose *pose);
-
 static inline void
 wmr_controller_connection_receive_bytes(struct wmr_controller_connection *wcc,
                                         uint64_t time_ns,
@@ -245,10 +237,6 @@ wmr_controller_base_to_xrt_device(struct wmr_controller_base *wcb)
 /* Tell the controller which HMD to register with for tracking */
 void
 wmr_controller_attach_to_hmd(struct wmr_controller_base *wcb, struct wmr_hmd *hmd);
-
-/* Called to fill out a constellation_led_model struct. Returns false if config not loaded yet */
-bool
-wmr_controller_base_get_led_model(struct wmr_controller_base *wcb, struct constellation_led_model *led_model);
 
 #ifdef __cplusplus
 }

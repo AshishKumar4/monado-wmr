@@ -18,8 +18,9 @@
 #include "xrt/xrt_config_have.h"
 #include "xrt/xrt_defines.h"
 
+#include "tracking/t_led_models.h"
+
 #include "blobwatch.h"
-#include "led_models.h"
 #include "camera_model.h"
 
 #ifdef __cplusplus
@@ -31,7 +32,7 @@ bool
 ransac_pnp_pose(struct xrt_pose *pose,
                 struct blob *blobs,
                 int num_blobs,
-                struct constellation_led_model *leds_model,
+                struct t_constellation_led_model *leds_model,
                 struct camera_model *calib,
                 int *num_leds_out,
                 int *num_inliers);
@@ -41,7 +42,7 @@ static inline bool
 ransac_pnp_pose(struct xrt_pose *pose,
                 struct blob *blobs,
                 int num_blobs,
-                struct constellation_led_model *leds_model,
+                struct t_constellation_led_model *leds_model,
                 struct camera_model *calib,
                 int *num_leds_out,
                 int *num_inliers)

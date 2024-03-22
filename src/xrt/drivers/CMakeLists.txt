@@ -372,6 +372,7 @@ if(XRT_BUILD_DRIVER_RIFT_S)
 			aux_math
 			xrt-external-cjson
 			xrt-external-tinyceres
+			constellation_tracker
 		)
 	if(XRT_BUILD_DRIVER_HANDTRACKING)
 		target_link_libraries(drv_rift_s PRIVATE drv_ht)
@@ -514,8 +515,6 @@ if(XRT_BUILD_DRIVER_WMR)
 		wmr/wmr_controller_hp.c
 		wmr/wmr_controller.c
 		wmr/wmr_controller.h
-		wmr/wmr_controller_tracking.c
-		wmr/wmr_controller_tracking.h
 		wmr/wmr_bt_controller.c
 		wmr/wmr_bt_controller.h
 		wmr/wmr_hmd.c
@@ -530,27 +529,6 @@ if(XRT_BUILD_DRIVER_WMR)
 		wmr/wmr_controller_protocol.h
 		wmr/wmr_source.c
 		wmr/wmr_source.h
-		wmr/constellation/blobwatch.c
-		wmr/constellation/blobwatch.h
-		wmr/constellation/correspondence_search.c
-		wmr/constellation/correspondence_search.h
-		wmr/constellation/debug_draw.cpp
-		wmr/constellation/debug_draw.h
-		wmr/constellation/lambdatwist/cubic.h
-		wmr/constellation/lambdatwist/eig3x3known0.h
-		wmr/constellation/lambdatwist/lambdatwist_p3p.h
-		wmr/constellation/lambdatwist/mat.h
-		wmr/constellation/lambdatwist/quadratic.h
-		wmr/constellation/lambdatwist/refine_lambda.h
-		wmr/constellation/lambdatwist/vec.h
-		wmr/constellation/led_models.c
-		wmr/constellation/led_models.h
-		wmr/constellation/pose_metrics.c
-		wmr/constellation/pose_metrics.h
-		wmr/constellation/ransac_pnp.cpp
-		wmr/constellation/ransac_pnp.h
-		wmr/constellation/sample.c
-		wmr/constellation/sample.h
 		)
 	target_link_libraries(
 		drv_wmr
@@ -561,26 +539,20 @@ if(XRT_BUILD_DRIVER_WMR)
 			aux_math
 			aux_tracking
 			xrt-external-cjson
+			constellation_tracker
 		)
 	list(APPEND ENABLED_HEADSET_DRIVERS wmr)
 
 	# Can only build camera support with libusb
 	if(XRT_HAVE_LIBUSB)
 		target_sources(drv_wmr PRIVATE wmr/wmr_camera.c)
-		target_include_directories(drv_wmr PUBLIC ${LIBUSB1_INCLUDE_DIRS})
+    target_include_directories(drv_wmr PUBLIC ${LIBUSB1_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/../tracking)
 		target_link_libraries(drv_wmr PRIVATE ${LIBUSB1_LIBRARIES})
 	endif()
 
 	if(XRT_BUILD_DRIVER_HANDTRACKING)
 		target_link_libraries(drv_wmr PRIVATE drv_ht)
 		target_link_libraries(drv_wmr PRIVATE drv_cemu)
-	endif()
-
-	if(XRT_HAVE_OPENCV)
-	target_include_directories(drv_wmr PRIVATE ${OpenCV_INCLUDE_DIRS})
-	target_link_libraries(
-		drv_wmr PRIVATE ${OpenCV_LIBRARIES}
-		)
 	endif()
 endif()
 

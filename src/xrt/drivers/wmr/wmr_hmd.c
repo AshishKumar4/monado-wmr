@@ -1996,8 +1996,8 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 
 	// Set up controller 6dof tracker
 	struct xrt_frame_sink *out_controller_sink = NULL;
-	if (wmr_controller_tracker_create(&wh->tracking.xfctx, &wh->base, &wh->config, &wh->tracking.slam_calib,
-	                                  &wh->controller_tracker, &out_controller_sink) != 0) {
+	if (t_constellation_tracker_create(&wh->tracking.xfctx, &wh->base, &wh->config, &wh->tracking.slam_calib,
+	                                   &wh->controller_tracker, &out_controller_sink) != 0) {
 		WMR_WARN(wh, "Failed to create Controller Tracker. Controllers will not be 6dof");
 	}
 
@@ -2095,11 +2095,13 @@ wmr_hmd_read_sync_from_controller(struct wmr_hmd *hmd, uint8_t *buffer, uint32_t
 	return res;
 }
 
-struct wmr_controller_tracker_connection *
-wmr_hmd_add_tracked_controller(struct wmr_hmd *hmd, struct wmr_controller_base *wcb)
+struct t_constellation_tracked_device_connection *
+wmr_hmd_add_tracked_controller(struct wmr_hmd *hmd,
+                               struct xrt_device *xdev,
+                               struct t_constellation_tracked_device_callbacks *cb)
 {
 	if (hmd->controller_tracker != NULL) {
-		return wmr_controller_tracker_add_controller(hmd->controller_tracker, wcb);
+		return t_constellation_tracker_add_device(hmd->controller_tracker, xdev, cb);
 	}
 	return NULL;
 }

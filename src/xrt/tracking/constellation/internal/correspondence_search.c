@@ -216,12 +216,12 @@ compare_blobs_distance(const void *elem1, const void *elem2, void *arg)
 #if DUMP_SCENE
 static void
 dump_pose(struct correspondence_search *cs,
-          struct constellation_search_model *model,
+          struct t_constellation_search_model *model,
           struct xrt_pose *pose,
           struct cs_model_info *mi)
 {
 	int i;
-	struct constellation_led_model *leds = model->led_model;
+	struct t_constellation_led_model *leds = model->led_model;
 
 	printf("pose_points[%i] = [\n", mi->id);
 	for (i = 0; i < leds->num_leds; i++) {
@@ -257,14 +257,14 @@ dump_pose(struct correspondence_search *cs,
 
 static bool
 correspondence_search_project_pose(struct correspondence_search *cs,
-                                   struct constellation_search_model *model,
+                                   struct t_constellation_search_model *model,
                                    struct xrt_pose *pose,
                                    struct cs_model_info *mi,
                                    int depth)
 {
 	/* Given a pose, project each 3D LED point back to 2D and assign correspondences to blobs */
 	/* If enough match, print out the pose */
-	struct constellation_led_model *leds = model->led_model;
+	struct t_constellation_led_model *leds = model->led_model;
 
 	/* Increment stats */
 	cs->num_pose_checks++;
@@ -417,10 +417,10 @@ static void
 check_led_against_model_subset(struct correspondence_search *cs,
                                struct cs_model_info *mi,
                                struct cs_image_point **blobs,
-                               struct constellation_led *model_leds[4],
+                               struct t_constellation_led *model_leds[4],
                                int depth)
 {
-	struct constellation_search_model *model = mi->model;
+	struct t_constellation_search_model *model = mi->model;
 	double x[3][3];
 	struct xrt_vec3 *xcheck;
 	int i;
@@ -592,7 +592,7 @@ check_led_against_model_subset(struct correspondence_search *cs,
 static void
 select_k_blobs_from_n(struct correspondence_search *cs,
                       struct cs_model_info *mi,
-                      struct constellation_led **model_leds,
+                      struct t_constellation_led **model_leds,
                       struct cs_image_point **result_list,
                       struct cs_image_point **output_list,
                       struct cs_image_point **candidate_list,
@@ -642,7 +642,7 @@ select_k_blobs_from_n(struct correspondence_search *cs,
 static void
 check_leds_against_anchor(struct correspondence_search *cs,
                           struct cs_model_info *mi,
-                          struct constellation_led **model_leds,
+                          struct t_constellation_led **model_leds,
                           struct cs_image_point *anchor)
 {
 	struct cs_image_point *work_list[MAX_BLOB_SEARCH_DEPTH + 1];
@@ -660,7 +660,7 @@ check_leds_against_anchor(struct correspondence_search *cs,
 static void
 check_led_match(struct correspondence_search *cs,
                 struct cs_model_info *mi,
-                struct constellation_led **model_leds,
+                struct t_constellation_led **model_leds,
                 int depth)
 {
 	int b;
@@ -679,15 +679,15 @@ check_led_match(struct correspondence_search *cs,
 static void
 select_k_leds_from_n(struct correspondence_search *cs,
                      struct cs_model_info *mi,
-                     struct constellation_led **result_list,
-                     struct constellation_led **output_list,
-                     struct constellation_led **candidate_list,
+                     struct t_constellation_led **result_list,
+                     struct t_constellation_led **output_list,
+                     struct t_constellation_led **candidate_list,
                      int k,
                      int n,
                      int depth)
 {
 	if (k == 1) {
-		struct constellation_led *swap_list[4];
+		struct t_constellation_led *swap_list[4];
 
 		output_list[0] = candidate_list[0];
 		check_led_match(cs, mi, result_list, depth);
@@ -742,9 +742,9 @@ select_k_leds_from_n(struct correspondence_search *cs,
 static void
 generate_led_match_candidates(struct correspondence_search *cs,
                               struct cs_model_info *mi,
-                              struct constellation_search_led_candidate *c)
+                              struct t_constellation_search_led_candidate *c)
 {
-	struct constellation_led *work_list[MAX_LED_SEARCH_DEPTH + 1];
+	struct t_constellation_led *work_list[MAX_LED_SEARCH_DEPTH + 1];
 
 	int max_search_depth = MIN(mi->max_led_depth, c->num_neighbours) - mi->min_led_depth + 1;
 	if (max_search_depth < 3)
@@ -758,7 +758,7 @@ generate_led_match_candidates(struct correspondence_search *cs,
 static bool
 search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi)
 {
-	struct constellation_search_model *model = mi->model;
+	struct t_constellation_search_model *model = mi->model;
 	int b, l;
 
 	/* clear the info for this model */
@@ -829,7 +829,7 @@ search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi
 	/* Start correspondence search for this model */
 	/* At this stage, each image point has a list of the nearest neighbours filtered for this model */
 	for (l = 0; l < model->num_points; l++) {
-		struct constellation_search_led_candidate *c = model->points[l];
+		struct t_constellation_search_led_candidate *c = model->points[l];
 		mi->led_index = l;
 
 		generate_led_match_candidates(cs, mi, c);
@@ -846,7 +846,7 @@ search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi
 
 bool
 correspondence_search_find_one_pose(struct correspondence_search *cs,
-                                    struct constellation_search_model *model,
+                                    struct t_constellation_search_model *model,
                                     enum correspondence_search_flags search_flags,
                                     struct xrt_pose *pose,
                                     struct xrt_vec3 *pos_error_thresh,

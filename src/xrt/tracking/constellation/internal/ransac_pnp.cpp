@@ -58,7 +58,7 @@ bool
 ransac_pnp_pose(struct xrt_pose *pose,
                 struct blob *blobs,
                 int num_blobs,
-                struct constellation_led_model *leds_model,
+                struct t_constellation_led_model *leds_model,
                 struct camera_model *calib,
                 int *num_leds_out,
                 int *num_inliers)

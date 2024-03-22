@@ -9,7 +9,6 @@
 #include "wmr_source.h"
 #include "wmr_camera.h"
 #include "wmr_config.h"
-#include "wmr_controller_tracking.h"
 #include "wmr_protocol.h"
 
 #include "math/m_api.h"
