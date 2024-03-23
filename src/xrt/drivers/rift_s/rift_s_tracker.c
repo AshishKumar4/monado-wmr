@@ -67,6 +67,10 @@ DEBUG_GET_ONCE_BOOL_OPTION(rift_s_slam, "RIFT_S_SLAM", true)
 //! Specifies whether the user wants to use the hand tracker.
 DEBUG_GET_ONCE_BOOL_OPTION(rift_s_handtracking, "RIFT_S_HANDTRACKING", true)
 
+#ifdef XRT_FEATURE_SLAM
+DEBUG_GET_ONCE_OPTION(slam_submit_from_start, "SLAM_SUBMIT_FROM_START", NULL)
+#endif
+
 static xrt_result_t
 rift_s_tracker_get_tracked_pose_imu(struct xrt_device *xdev,
                                     enum xrt_input_name name,
@@ -211,6 +215,9 @@ rift_s_create_slam_tracker(struct rift_s_tracker *t, struct xrt_frame_context *x
 	/* No need to refcount these parameters */
 	config.cam_count = RIFT_S_CAMERA_COUNT;
 	config.slam_calib = &t->slam_calib;
+	if (debug_get_option_slam_submit_from_start() == NULL) {
+		config.submit_from_start = true;
+	}
 
 	int create_status = t_slam_create(xfctx, &config, &t->tracking.slam, &sinks);
 	if (create_status != 0) {
@@ -467,20 +474,28 @@ rift_s_tracker_clock_update(struct rift_s_tracker *t, uint64_t device_timestamp_
 	time_duration_ns last_hw2mono = t->hw2mono;
 	const float freq = 250.0;
 
-	t->seen_clock_observations++;
-	if (t->seen_clock_observations < 100)
-		goto done;
-
 	m_clock_offset_a2b(freq, device_timestamp_ns, local_timestamp_ns, &t->hw2mono);
 
 	if (!t->have_hw2mono) {
+		/* At startup, Rift S can send old data that throws off
+		 * our clock estimation and confuses the SLAM tracker into
+		 * not consuming data correctly. This code tries to
+		 * ensure the clock has stabilised before uncorking
+		 * the SLAM + IMU processing */
 		time_duration_ns change_ns = last_hw2mono - t->hw2mono;
 		if (change_ns >= -U_TIME_HALF_MS_IN_NS && change_ns <= U_TIME_HALF_MS_IN_NS) {
-			RIFT_S_INFO("HMD device to local clock map stabilised");
-			t->have_hw2mono = true;
+			t->valid_clock_observations++;
+			if (t->valid_clock_observations > 500) {
+				RIFT_S_INFO("HMD device to local clock map stabilised");
+				t->have_hw2mono = true;
+			}
+		} else {
+			/* Invalid clock observation. Start again */
+			t->valid_clock_observations = 0;
+			t->hw2mono = 0;
+			m_clock_offset_a2b(freq, device_timestamp_ns, local_timestamp_ns, &t->hw2mono);
 		}
 	}
-done:
 	os_mutex_unlock(&t->mutex);
 }
 
@@ -500,7 +515,7 @@ rift_s_tracker_imu_update(struct rift_s_tracker *t,
 	os_mutex_lock(&t->mutex);
 
 	/* Ignore packets before we're ready and clock is stable */
-	if (!t->ready_for_data || !t->have_hw2mono) {
+	if (!t->ready_for_data || !t->have_hw2mono || t->last_frame_time == 0) {
 		os_mutex_unlock(&t->mutex);
 		return;
 	}
