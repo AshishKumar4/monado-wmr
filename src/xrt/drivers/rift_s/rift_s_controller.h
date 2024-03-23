@@ -83,6 +83,9 @@ struct rift_s_controller
 	struct xrt_vec3 mag;
 	struct m_imu_3dof fusion;
 
+	//! Offset for grip pose
+	struct xrt_pose P_aim_grip;
+
 	/* Controls / buttons state */
 	timepoint_ns last_controls_local_time_ns;
 
