@@ -572,6 +572,12 @@ rift_s_controller_destroy(struct xrt_device *xdev)
 {
 	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
 
+	// Tell the tracker that we're going away
+	if (ctrl->tracking_connection) {
+		t_constellation_tracked_device_connection_disconnect(ctrl->tracking_connection);
+		ctrl->tracking_connection = NULL;
+	}
+
 	/* Tell the system this controller is going away */
 	rift_s_system_remove_controller(ctrl->sys, ctrl);
 
@@ -586,6 +592,92 @@ rift_s_controller_destroy(struct xrt_device *xdev)
 
 	u_device_free(&ctrl->base);
 }
+
+static bool
+rift_s_controller_get_led_model(struct xrt_device *xdev, struct t_constellation_led_model *led_model)
+{
+	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
+
+	os_mutex_unlock(&ctrl->mutex);
+	if (!ctrl->have_calibration) {
+		os_mutex_unlock(&ctrl->mutex);
+		return false;
+	}
+	os_mutex_unlock(&ctrl->mutex);
+
+	t_constellation_led_model_init((int)ctrl->base.device_type, led_model, ctrl->calibration.num_leds);
+
+	// Note: This LED model is in OpenCV coordinates with
+	// XYZ = Right/Down/Forward
+	for (int i = 0; i < ctrl->calibration.num_leds; i++) {
+		struct t_constellation_led *led = led_model->leds + i;
+
+		led->id = i;
+
+		led->pos = ctrl->calibration.leds[i].pos;
+		led->dir = ctrl->calibration.leds[i].dir;
+
+		led->radius_mm = 3.5;
+	}
+
+	return true;
+}
+
+static void
+rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame_mono_ns, const struct xrt_pose *pose)
+{
+	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
+	os_mutex_unlock(&ctrl->mutex);
+
+	ctrl->last_tracked_pose_ts = frame_mono_ns;
+	ctrl->last_tracked_pose = *pose;
+
+	if (ctrl->update_yaw_from_optical) {
+		// Apply 5% of observed orientation yaw to 3dof fusion
+		// FIXME: Do better
+		struct xrt_quat delta;
+		math_quat_unrotate(&ctrl->fusion.rot, &pose->orientation, &delta);
+		delta.x = delta.z = 0.0; // We only want Yaw
+
+		if (fabs(delta.y) > sin(DEG_TO_RAD(5)) / 2) {
+			delta.y = sin(0.10 * asinf(delta.y)); // 10% correction
+			math_quat_normalize(&delta);
+
+			struct xrt_quat prev = ctrl->fusion.rot;
+			math_quat_rotate(&ctrl->fusion.rot, &delta, &ctrl->fusion.rot);
+
+			if (rift_s_log_level <= U_LOGGING_DEBUG) {
+				struct xrt_quat post_delta;
+				math_quat_unrotate(&ctrl->fusion.rot, &pose->orientation, &post_delta);
+				post_delta.x = post_delta.z = 0.0;  // We only want Yaw
+				post_delta.y = 0.10 * post_delta.y; // 5%
+				math_quat_normalize(&post_delta);
+
+				RIFT_S_DEBUG(
+				    "Applying delta yaw rotation of %f degrees delta quat %f,%f,%f,%f from "
+				    "%f,%f,%f,%f to "
+				    "%f,%f,%f,%f. delta after correction: %f,%f,%f,%f",
+				    RAD_TO_DEG(2 * asinf(delta.y)), delta.x, delta.y, delta.z, delta.w, prev.x, prev.y,
+				    prev.z, prev.w, ctrl->fusion.rot.x, ctrl->fusion.rot.y, ctrl->fusion.rot.z,
+				    ctrl->fusion.rot.w, post_delta.x, post_delta.y, post_delta.z, post_delta.w);
+			}
+		} else {
+			math_quat_normalize(&delta);
+
+			RIFT_S_DEBUG("Applying full yaw correction of %f degrees. delta quat %f,%f,%f,%f",
+			             RAD_TO_DEG(2 * asinf(delta.y)), delta.x, delta.y, delta.z, delta.w);
+			math_quat_rotate(&ctrl->fusion.rot, &delta, &ctrl->fusion.rot);
+		}
+	}
+
+	os_mutex_unlock(&ctrl->mutex);
+}
+
+static struct t_constellation_tracked_device_callbacks tracking_callbacks = {
+    .get_led_model = rift_s_controller_get_led_model,
+    .notify_frame_received = NULL,
+    .push_observed_pose = rift_s_controller_push_observed_pose,
+};
 
 struct rift_s_controller *
 rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_type)
@@ -684,6 +776,9 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
 	DEBUG_TOUCH_INPUT_VEC2(ctrl, THUMBSTICK, "Thumbstick X", "Thumbstick Y");
 	DEBUG_TOUCH_INPUT_BOOL(ctrl, THUMBREST_TOUCH, "Thumbrest touch");
 
+	struct rift_s_tracker *tracker = rift_s_system_get_tracker(sys);
+	ctrl->update_yaw_from_optical = true;
+	ctrl->tracking_connection = rift_s_tracker_add_controller(tracker, &ctrl->base, &tracking_callbacks);
 	return ctrl;
 }
 

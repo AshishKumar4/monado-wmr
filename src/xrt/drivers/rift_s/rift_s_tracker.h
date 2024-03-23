@@ -139,6 +139,11 @@ rift_s_tracker_destroy(struct rift_s_tracker *t);
 void
 rift_s_tracker_add_debug_ui(struct rift_s_tracker *t, void *root);
 
+struct t_constellation_tracked_device_connection *
+rift_s_tracker_add_controller(struct rift_s_tracker *t,
+                              struct xrt_device *xdev,
+                              struct t_constellation_tracked_device_callbacks *cb);
+
 struct xrt_slam_sinks *
 rift_s_tracker_get_slam_sinks(struct rift_s_tracker *t);
 struct xrt_device *

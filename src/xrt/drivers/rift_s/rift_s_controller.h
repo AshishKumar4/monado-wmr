@@ -18,6 +18,7 @@
 #include "math/m_imu_3dof.h"
 
 #include "os/os_time.h"
+#include "tracking/t_constellation_tracking.h"
 #include "xrt/xrt_device.h"
 
 #include "rift_s.h"
@@ -48,6 +49,16 @@ struct rift_s_controller
 
 	uint64_t device_id;
 	rift_s_device_type device_type;
+
+	//! Controller tracker connection that is doing 6dof tracking of this controller
+	struct t_constellation_tracked_device_connection *tracking_connection;
+
+	//! Last timestamp of tracked pose from optical controller tracking
+	timepoint_ns last_tracked_pose_ts;
+	//! Last tracked pose from optical controller tracking
+	struct xrt_pose last_tracked_pose;
+	//! debug boolean - enable yaw updates
+	bool update_yaw_from_optical;
 
 	/* Debug logs */
 	/* 0x04 = new log line

@@ -689,6 +689,17 @@ rift_s_tracker_push_slam_frames(struct rift_s_tracker *t,
 	}
 }
 
+struct t_constellation_tracked_device_connection *
+rift_s_tracker_add_controller(struct rift_s_tracker *t,
+                              struct xrt_device *xdev,
+                              struct t_constellation_tracked_device_callbacks *cb)
+{
+	if (t->controller_tracker != NULL) {
+		return t_constellation_tracker_add_device(t->controller_tracker, xdev, cb);
+	}
+	return NULL;
+}
+
 void
 rift_s_tracker_push_controller_frameset(struct rift_s_tracker *t, uint64_t frame_ts_ns, struct xrt_frame *frameset)
 {
