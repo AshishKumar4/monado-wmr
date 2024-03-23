@@ -157,6 +157,11 @@ struct wmr_controller_base
 	//!< Last IMU sample received
 	struct wmr_controller_base_imu_sample last_imu;
 
+	//!< Last frame timestamp in CPU mono ts notified from the tracker
+	uint64_t last_frame_timestamp;
+	//!< Last frame sequence number notified from the tracker
+	uint64_t last_frame_sequence;
+
 	//! Last timestamp of tracked pose from optical controller tracking
 	timepoint_ns last_tracked_pose_ts;
 	//! Last tracked pose from optical controller tracking
@@ -178,9 +183,9 @@ struct wmr_controller_base
 	uint16_t timesync_time_offset;
 	bool timesync_updated;
 
-	//! Time of last timesync SLAM sample, in CPU time.
+	//! Time of last timesync SLAM frame estimate, in CPU time.
 	uint64_t last_timesync_timestamp_ns;
-	//! Time of last timesync SLAM sample, in device time.
+	//! Time of last timesync SLAM frame estimate, in device time.
 	uint64_t last_timesync_device_timestamp_ns;
 
 	struct u_var_draggable_u16 timesync_led_intensity_uvar;

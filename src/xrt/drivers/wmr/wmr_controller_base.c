@@ -814,27 +814,6 @@ fill_timesync_packet(
 	buf[11] = ((U2 >> 6) & 0x1f) | ((flags & 0x3) << 5);
 }
 
-static void
-wmr_controller_base_notify_timesync(struct xrt_device *xdev, uint64_t next_slam_mono_ns, uint64_t frame_sequence)
-{
-	struct wmr_controller_base *wcb = (struct wmr_controller_base *)xdev;
-
-	os_mutex_lock(&wcb->data_lock);
-	timepoint_ns next_device_slam_time_ns;
-	if (m_clock_windowed_skew_tracker_to_remote(wcb->hw2mono_clock, next_slam_mono_ns, &next_device_slam_time_ns)) {
-		uint64_t next_device_slam_time_us = next_device_slam_time_ns / 1000;
-
-		if (next_device_slam_time_us != wcb->timesync_device_slam_time_us) {
-			wcb->timesync_device_slam_time_us = next_device_slam_time_us;
-			wcb->timesync_updated = true;
-		}
-
-		wcb->last_timesync_device_timestamp_ns = next_device_slam_time_ns;
-		wcb->last_timesync_timestamp_ns = next_slam_mono_ns;
-	}
-	os_mutex_unlock(&wcb->data_lock);
-}
-
 /* Called with data_lock held */
 static void
 wmr_controller_base_send_timesync(struct wmr_controller_base *wcb)
@@ -873,6 +852,51 @@ wmr_controller_base_send_timesync(struct wmr_controller_base *wcb)
 	} else {
 		os_mutex_unlock(&wcb->conn_lock);
 	}
+}
+
+static void
+wmr_controller_base_notify_frame(struct xrt_device *xdev, uint64_t frame_mono_ns, uint64_t frame_sequence)
+{
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)xdev;
+
+	os_mutex_lock(&wcb->data_lock);
+
+	/* The frame cadence is SLAM/controller/controller. Only controller frames are received
+	 * here. On the 2nd controller frame, we need to pass the estimate of the time of the next
+	 * *1st controller frame* minus 1/3 of a frame duration to the controller timesync methods.
+	 * That is 2/90 + 1/270 = 5/270 or 5/3rds of the average frame duration.
+	 * @todo: Also calculate how many full 3-frame cycles have passed since the last
+	 * '2nd Controller frame' to add to our estimate in case of scheduling delays.
+	 * @todo: Move the 'next frame' estimate into the controller timesync code so it's
+	 * calculated when the led control packet is actually about to be sent.
+	 * Since only controller frames get passed to here, the 2nd sequential controller
+	 * frame is the one right before the next SLAM frame */
+	bool is_second_frame = (wcb->last_frame_sequence + 1) == frame_sequence;
+
+	if (is_second_frame) {
+		// on the 2nd sequential (controller) frame, update the controller timesync estimate of the next SLAM
+		// frame's time
+		timepoint_ns next_slam_mono_ns = (timepoint_ns)(frame_mono_ns) + U_TIME_1MS_IN_NS * 18;
+
+		timepoint_ns next_device_slam_time_ns;
+		if (m_clock_windowed_skew_tracker_to_remote(wcb->hw2mono_clock, next_slam_mono_ns,
+		                                            &next_device_slam_time_ns)) {
+			uint64_t next_device_slam_time_us = next_device_slam_time_ns / 1000;
+
+			if (next_device_slam_time_us != wcb->timesync_device_slam_time_us) {
+				wcb->timesync_device_slam_time_us = next_device_slam_time_us;
+				wcb->timesync_updated = true;
+			}
+
+			wcb->last_timesync_device_timestamp_ns = next_device_slam_time_ns;
+			wcb->last_timesync_timestamp_ns = next_slam_mono_ns;
+		}
+	}
+
+	wcb->last_frame_timestamp = frame_mono_ns;
+	wcb->last_frame_sequence = frame_sequence;
+
+	os_mutex_unlock(&wcb->data_lock);
 }
 
 /* Called with data_lock held */
@@ -997,7 +1021,7 @@ wmr_controller_base_push_observed_pose(struct xrt_device *xdev, timepoint_ns fra
 
 static struct t_constellation_tracked_device_callbacks tracking_callbacks = {
     .get_led_model = wmr_controller_base_get_led_model,
-    .notify_frame_received = wmr_controller_base_notify_timesync,
+    .notify_frame_received = wmr_controller_base_notify_frame,
     .push_observed_pose = wmr_controller_base_push_observed_pose,
 };
 
