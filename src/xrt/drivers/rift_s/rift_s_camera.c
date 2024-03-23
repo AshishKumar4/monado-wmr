@@ -386,6 +386,7 @@ receive_cam_frame(struct xrt_frame_sink *sink, struct xrt_frame *xf)
 	             (uint16_t)__le16_to_cpu(row_data.data.unknown1));
 
 	// rift_s_hexdump_buffer("Row data", row_data.raw, sizeof(row_data.row));
+	uint64_t frame_ts_ns = (uint64_t)__le64_to_cpu(row_data.data.frame_ts) * OS_NS_PER_USEC;
 
 	// If the top left pixel is > 128, send as SLAM frame else controller
 	if (row_data.data.frame_type & 0x80) {
@@ -407,7 +408,6 @@ receive_cam_frame(struct xrt_frame_sink *sink, struct xrt_frame *xf)
 		//! @todo Update expgain independently for each camera like in WMR
 		update_expgain(cam, frames[0]);
 
-		uint64_t frame_ts_ns = (uint64_t)__le64_to_cpu(row_data.data.frame_ts) * OS_NS_PER_USEC;
 		rift_s_tracker_push_slam_frames(cam->tracker, frame_ts_ns, frames);
 
 		for (int i = 0; i < RIFT_S_CAMERA_COUNT; i++) {
@@ -419,6 +419,8 @@ receive_cam_frame(struct xrt_frame_sink *sink, struct xrt_frame *xf)
 
 		u_frame_create_roi(xf, roi, &xf_crop);
 		u_sink_debug_push_frame(&cam->debug_sinks[1], xf_crop);
+
+		rift_s_tracker_push_controller_frameset(cam->tracker, frame_ts_ns, xf_crop);
 		xrt_frame_reference(&xf_crop, NULL);
 	}
 	if (release_xf)

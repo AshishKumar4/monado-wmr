@@ -22,6 +22,7 @@
 #include "xrt/xrt_device.h"
 
 #include "tracking/t_tracking.h"
+#include "tracking/t_constellation_tracking.h"
 
 #include "rift_s_firmware.h"
 
@@ -77,6 +78,7 @@ struct rift_s_tracker
 
 		//! Set at start. Whether the hand tracker was initialized.
 		bool hand_enabled;
+
 	} tracking;
 
 	// Correction offset poses from firmware
@@ -110,6 +112,12 @@ struct rift_s_tracker
 	struct xrt_slam_sinks slam_sinks;
 
 	struct xrt_device *handtracker;
+
+	//! Calibration data for constellation tracking
+	struct t_constellation_camera_group constellation_calib;
+	// Constellation tracker
+	struct t_constellation_tracker *controller_tracker;
+	struct xrt_frame_sink *controller_sink; //!< Sink to send controller frames to tracker
 
 	struct
 	{
@@ -149,6 +157,10 @@ void
 rift_s_tracker_push_slam_frames(struct rift_s_tracker *t,
                                 uint64_t frame_ts_ns,
                                 struct xrt_frame *frames[RIFT_S_CAMERA_COUNT]);
+
+void
+rift_s_tracker_push_controller_frameset(struct rift_s_tracker *t, uint64_t frame_ts_ns, struct xrt_frame *frameset);
+
 void
 rift_s_tracker_get_tracked_pose(struct rift_s_tracker *t,
                                 enum rift_s_tracker_pose pose,

@@ -292,6 +292,62 @@ rift_s_create_hand_tracker(struct rift_s_tracker *t,
 	return 0;
 }
 
+static void
+rift_s_fill_constellation_calibration(struct rift_s_tracker *t, struct rift_s_hmd_config *hmd_config)
+{
+/* Rfit S thresholds for min brightness and min-blob-required magnitude */
+#define BLOB_PIXEL_THRESHOLD 0x4
+#define BLOB_THRESHOLD_MIN 0x8
+
+	struct rift_s_camera_calibration_block *camera_calibration = &hmd_config->camera_calibration;
+	struct t_constellation_camera_group *out = &t->constellation_calib;
+
+	struct xrt_pose device_from_imu, imu_from_device;
+	math_pose_from_isometry(&hmd_config->imu_calibration.device_from_imu, &device_from_imu);
+	math_pose_invert(&device_from_imu, &imu_from_device);
+
+	out->cam_count = RIFT_S_CAMERA_COUNT;
+	for (int i = 0; i < RIFT_S_CAMERA_COUNT; i++) {
+		struct rift_s_camera_calibration *cam = &camera_calibration->cameras[i];
+
+		/* Compute the cam from IMU transform for each cam */
+		struct xrt_pose device_from_cam;
+		math_pose_from_isometry(&cam->device_from_camera, &device_from_cam);
+
+		struct xrt_pose P_imu_cam;
+		math_pose_transform(&imu_from_device, &device_from_cam, &P_imu_cam);
+
+		struct xrt_rect roi = (struct xrt_rect){
+		    .offset = {.w = i * 640, .h = 0},
+		    .extent = {.w = 640, .h = 480},
+		};
+		out->cams[i] = (struct t_constellation_camera){
+		    .P_imu_cam = P_imu_cam,
+		    .roi = roi,
+		    .calibration = rift_s_get_cam_calib(&hmd_config->camera_calibration, i),
+		    .blob_min_threshold = BLOB_PIXEL_THRESHOLD,
+		    .blob_detect_threshold = BLOB_THRESHOLD_MIN};
+
+		RIFT_S_DEBUG("Constellation IMU cam%d cam pose %f %f %f orient %f %f %f %f", i, P_imu_cam.position.x,
+		             P_imu_cam.position.y, P_imu_cam.position.z, P_imu_cam.orientation.x,
+		             P_imu_cam.orientation.y, P_imu_cam.orientation.z, P_imu_cam.orientation.w);
+	}
+}
+
+static int
+rift_s_create_constellation_tracker(struct rift_s_tracker *t, struct xrt_frame_context *xfctx)
+{
+	struct xrt_frame_sink *controller_sink = NULL;
+
+	if (t_constellation_tracker_create(xfctx, &t->base, &t->constellation_calib, &t->controller_tracker,
+	                                   &controller_sink) != 0) {
+		RIFT_S_WARN("Failed to create Controller Tracker. Controllers will not be 6dof");
+		return -1;
+	}
+	t->controller_sink = controller_sink;
+	return 0;
+}
+
 void
 rift_s_tracker_add_debug_ui(struct rift_s_tracker *t, void *root)
 {
@@ -418,6 +474,16 @@ rift_s_tracker_create(struct xrt_tracking_origin *origin,
 			rift_s_tracker_destroy(t);
 			return NULL;
 		}
+	}
+
+	// Initialize controller constellation tracking
+	rift_s_fill_constellation_calibration(t, hmd_config);
+
+	int constellation_status = rift_s_create_constellation_tracker(t, xfctx);
+	if (constellation_status != 0) {
+		RIFT_S_WARN("Unable to setup the controller constellation tracker");
+		rift_s_tracker_destroy(t);
+		return NULL;
 	}
 
 	// Setup sinks depending on tracking configuration
@@ -558,26 +624,11 @@ rift_s_tracker_imu_update(struct rift_s_tracker *t,
 
 #define UPPER_32BITS(x) ((x)&0xffffffff00000000ULL)
 
-void
-rift_s_tracker_push_slam_frames(struct rift_s_tracker *t,
-                                uint64_t frame_ts_ns,
-                                struct xrt_frame *frames[RIFT_S_CAMERA_COUNT])
+// Called with tracker mutex held
+static timepoint_ns
+raw_frame_ts_to_mono_ts(struct rift_s_tracker *t, uint64_t frame_ts_ns)
 {
 	timepoint_ns frame_time;
-
-	os_mutex_lock(&t->mutex);
-
-	/* Ignore packets before we're ready */
-	if (!t->ready_for_data) {
-		os_mutex_unlock(&t->mutex);
-		return;
-	}
-
-	if (!t->have_hw2mono) {
-		/* Drop any frames before we have IMU */
-		os_mutex_unlock(&t->mutex);
-		return;
-	}
 
 	/* Ensure the input timestamp is within 32-bits of the IMU
 	 * time, because the timestamps are reported and extended to 64-bits
@@ -594,23 +645,73 @@ rift_s_tracker_push_slam_frames(struct rift_s_tracker *t,
 	frame_ts_ns += t->camera_ts_offset;
 
 	clock_hw2mono_get(t, frame_ts_ns, &frame_time);
+	return frame_time;
+}
 
-	if (frame_time < t->last_frame_time) {
-		RIFT_S_WARN("Camera frame time went backward by %" PRId64 " ns", frame_time - t->last_frame_time);
+void
+rift_s_tracker_push_slam_frames(struct rift_s_tracker *t,
+                                uint64_t frame_ts_ns,
+                                struct xrt_frame *frames[RIFT_S_CAMERA_COUNT])
+{
+
+	os_mutex_lock(&t->mutex);
+
+	/* Ignore packets before we're ready */
+	if (!t->ready_for_data) {
 		os_mutex_unlock(&t->mutex);
 		return;
 	}
 
-	RIFT_S_TRACE("SLAM frame timestamp %" PRIu64 " local %" PRIu64, frame_ts_ns, frame_time);
+	if (!t->have_hw2mono) {
+		/* Drop any frames before we have IMU */
+		os_mutex_unlock(&t->mutex);
+		return;
+	}
 
-	t->last_frame_time = frame_time;
+
+	timepoint_ns frame_mono_ns = raw_frame_ts_to_mono_ts(t, frame_ts_ns);
+	if (frame_mono_ns < t->last_frame_time) {
+		RIFT_S_WARN("Camera frame time went backward by %" PRId64 " ns", frame_mono_ns - t->last_frame_time);
+		os_mutex_unlock(&t->mutex);
+		return;
+	}
+
+	RIFT_S_TRACE("SLAM frame timestamp %" PRIu64 " local %" PRIu64, frame_ts_ns, frame_mono_ns);
+
+	t->last_frame_time = frame_mono_ns;
 	os_mutex_unlock(&t->mutex);
 
 	for (int i = 0; i < RIFT_S_CAMERA_COUNT; i++) {
 		if (t->slam_sinks.cams[i]) {
-			frames[i]->timestamp = frame_time;
+			frames[i]->timestamp = frame_mono_ns;
 			xrt_sink_push_frame(t->slam_sinks.cams[i], frames[i]);
 		}
+	}
+}
+
+void
+rift_s_tracker_push_controller_frameset(struct rift_s_tracker *t, uint64_t frame_ts_ns, struct xrt_frame *frameset)
+{
+	os_mutex_lock(&t->mutex);
+
+	/* Ignore packets before we're ready */
+	if (!t->ready_for_data) {
+		os_mutex_unlock(&t->mutex);
+		return;
+	}
+
+	if (!t->have_hw2mono) {
+		/* Drop any frames before we have IMU */
+		os_mutex_unlock(&t->mutex);
+		return;
+	}
+
+	timepoint_ns frame_mono_ns = raw_frame_ts_to_mono_ts(t, frame_ts_ns);
+	os_mutex_unlock(&t->mutex);
+
+	if (t->controller_sink) {
+		frameset->timestamp = frame_mono_ns;
+		xrt_sink_push_frame(t->controller_sink, frameset);
 	}
 }
 
