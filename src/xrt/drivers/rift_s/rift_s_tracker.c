@@ -295,9 +295,10 @@ rift_s_create_hand_tracker(struct rift_s_tracker *t,
 static void
 rift_s_fill_constellation_calibration(struct rift_s_tracker *t, struct rift_s_hmd_config *hmd_config)
 {
-/* Rfit S thresholds for min brightness and min-blob-required magnitude */
-#define BLOB_PIXEL_THRESHOLD 0x4
-#define BLOB_THRESHOLD_MIN 0x8
+/* Rift S thresholds for min brightness and min-blob-required magnitude. Quite high thresholds,
+ * due to bright LED pulses and a lot of light bleed */
+#define BLOB_PIXEL_THRESHOLD 0x60
+#define BLOB_THRESHOLD_MIN 0x80
 
 	struct rift_s_camera_calibration_block *camera_calibration = &hmd_config->camera_calibration;
 	struct t_constellation_camera_group *out = &t->constellation_calib;
