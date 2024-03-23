@@ -159,7 +159,7 @@ correspondence_search_set_blobs(struct correspondence_search *cs, struct blob *b
 
 		p->size[0] = b->width / cs->calib->calib.fx;
 		p->size[1] = b->height / cs->calib->calib.fy;
-		p->max_dist = sqrt(p->size[0] * p->size[9] + p->size[1] * p->size[1]);
+		p->max_dist = sqrt(p->size[0] * p->size[0] + p->size[1] * p->size[1]);
 
 		p->blob = b;
 		blob_list[i] = p;
