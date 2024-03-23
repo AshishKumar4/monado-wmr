@@ -4,7 +4,7 @@
  * @file
  * @brief Implementation of LED constellation tracking
  * @author Jan Schmidt <jan@centricular.com>
- * @ingroup drv_wmr
+ * @ingroup constellation
  */
 #include <inttypes.h>
 #include <stdio.h>
@@ -28,10 +28,7 @@
 #include "internal/ransac_pnp.h"
 #include "internal/sample.h"
 
-// #include "wmr_hmd.h"
-
 #define MAX_TRACKED_DEVICES 4
-#define MAX_CAMERAS 4
 
 DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
 
@@ -43,10 +40,6 @@ DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
 #define CT_INFO(c, ...) U_LOG_IFL_I(c->log_level, __VA_ARGS__)
 #define CT_WARN(c, ...) U_LOG_IFL_W(c->log_level, __VA_ARGS__)
 #define CT_ERROR(c, ...) U_LOG_IFL_E(c->log_level, __VA_ARGS__)
-
-/* WMR thresholds for min brightness and min-blob-required magnitude */
-#define BLOB_PIXEL_THRESHOLD_WMR 0x4
-#define BLOB_THRESHOLD_MIN_WMR 0x8
 
 /* Maximum number of frames to permit waiting in the fast-processing queue */
 #define MAX_FAST_QUEUE_SIZE 2
@@ -103,7 +96,7 @@ struct constellation_tracker_device
 	struct xrt_pose last_matched_cam_pose; // Camera-relative pose
 };
 
-struct constellation_tracker_camera
+struct constellation_tracker_camera_state
 {
 	//! Distortion params
 	struct camera_model camera_model;
@@ -149,7 +142,7 @@ struct t_constellation_tracker
 	struct constellation_tracker_device devices[MAX_TRACKED_DEVICES];
 
 	//!< Tracking camera entries
-	struct constellation_tracker_camera cam[MAX_CAMERAS];
+	struct constellation_tracker_camera_state cam[XRT_TRACKING_MAX_SLAM_CAMS];
 	int cam_count;
 
 	/* Debug */
@@ -315,7 +308,7 @@ submit_device_pose(struct t_constellation_tracker *ct,
                    int view_id,
                    struct xrt_pose *P_cam_obj)
 {
-	struct constellation_tracker_camera *cam = ct->cam + view_id;
+	struct constellation_tracker_camera_state *cam = ct->cam + view_id;
 	struct tracking_sample_frame *view = sample->views + view_id;
 	struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
 
@@ -443,7 +436,7 @@ device_try_global_pose(struct t_constellation_tracker *ct,
 	bool ret = false;
 	for (int view_id = 0; view_id < sample->n_views; view_id++) {
 		struct tracking_sample_frame *view = sample->views + view_id;
-		struct constellation_tracker_camera *cam = ct->cam + view_id;
+		struct constellation_tracker_camera_state *cam = ct->cam + view_id;
 
 		if (view->bwobs == NULL || view->bwobs->num_blobs == 0) {
 			continue;
@@ -483,7 +476,7 @@ device_try_recover_pose(struct t_constellation_tracker *ct,
 
 	for (int view_id = 0; view_id < sample->n_views; view_id++) {
 		struct tracking_sample_frame *view = sample->views + view_id;
-		struct constellation_tracker_camera *cam = ct->cam + view_id;
+		struct constellation_tracker_camera_state *cam = ct->cam + view_id;
 
 		if (view->bwobs == NULL || view->bwobs->num_blobs == 0) {
 			continue;
@@ -572,12 +565,12 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 	xrt_device_get_tracked_pose(ct->hmd_xdev, XRT_INPUT_GENERIC_TRACKER_POSE, xf->timestamp, &xsr_base_pose);
 
 	/* Split out camera views and collect blobs across all cameras */
-	assert(ct->cam_count <= CONSTELLATION_MAX_CAMERAS);
+	assert(ct->cam_count <= XRT_TRACKING_MAX_SLAM_CAMS);
 	sample->n_views = ct->cam_count;
 	sample->timestamp = xf->timestamp;
 
 	for (int i = 0; i < ct->cam_count; i++) {
-		struct constellation_tracker_camera *cam = ct->cam + i;
+		struct constellation_tracker_camera_state *cam = ct->cam + i;
 		struct tracking_sample_frame *view = sample->views + i;
 
 		// Flip the input pose to CV coords, so we can do all our operations
@@ -751,7 +744,7 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		debug_flags |= DEBUG_DRAW_FLAG_POSE_BOUNDS;
 
 	for (int i = 0; i < sample->n_views; i++) {
-		struct constellation_tracker_camera *cam = ct->cam + i;
+		struct constellation_tracker_camera_state *cam = ct->cam + i;
 		struct tracking_sample_frame *view = sample->views + i;
 
 		cam->debug_last_pose = view->P_world_cam;
@@ -801,7 +794,7 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
 
 	for (int view_id = 0; view_id < sample->n_views; view_id++) {
 		struct tracking_sample_frame *view = sample->views + view_id;
-		struct constellation_tracker_camera *cam = ct->cam + view_id;
+		struct constellation_tracker_camera_state *cam = ct->cam + view_id;
 
 		if (view->bwobs == NULL || view->bwobs->num_blobs == 0) {
 			continue; // no blobs in this view
@@ -936,7 +929,7 @@ constellation_tracker_node_destroy(struct xrt_frame_node *node)
 
 	//! Clean up
 	for (int i = 0; i < ct->cam_count; i++) {
-		struct constellation_tracker_camera *cam = ct->cam + i;
+		struct constellation_tracker_camera_state *cam = ct->cam + i;
 
 		u_sink_debug_destroy(&cam->debug_sink);
 
@@ -964,8 +957,7 @@ ct_full_search_btn_cb(void *ct_ptr)
 int
 t_constellation_tracker_create(struct xrt_frame_context *xfctx,
                                struct xrt_device *hmd_xdev,
-                               struct wmr_hmd_config *hmd_cfg,
-                               struct t_slam_calibration *slam_calib,
+                               struct t_constellation_camera_group *cams,
                                struct t_constellation_tracker **out_tracker,
                                struct xrt_frame_sink **out_sink)
 {
@@ -980,37 +972,21 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
 	ct->hmd_xdev = hmd_xdev;
 
 	// Set up the per-camera constellation tracking pieces config and pose
-	ct->cam_count = slam_calib->cam_count;
-
-	struct xrt_pose P_imu_c0 = hmd_cfg->sensors.accel.pose;
-
+	ct->cam_count = cams->cam_count;
 	for (int i = 0; i < ct->cam_count; i++) {
-		struct constellation_tracker_camera *cam = ct->cam + i;
-		struct wmr_camera_config *cam_cfg = hmd_cfg->tcams[i];
-		struct t_slam_camera_calibration *cam_slam_cfg = slam_calib->cams + i;
-
-		struct xrt_pose P_ci_c0 = cam_cfg->pose;
-		if (i == 2 || i == 3) {
-			//! @note The calibration json for the reverb G2v2 (the only 4-camera wmr
-			//! headset we know about) has the HT2 and HT3 extrinsics flipped compared
-			//! to the order the third and fourth camera images come from usb.
-			P_ci_c0 = hmd_cfg->tcams[i == 2 ? 3 : 2]->pose;
-		}
+		struct constellation_tracker_camera_state *cam = ct->cam + i;
+		struct t_constellation_camera *cam_cfg = cams->cams + i;
 
 		cam->roi = cam_cfg->roi;
-
-		struct xrt_pose P_c0_ci;
-		math_pose_invert(&P_ci_c0, &P_c0_ci);
-
-		math_pose_transform(&P_imu_c0, &P_c0_ci, &cam->P_imu_cam);
+		cam->P_imu_cam = cam_cfg->P_imu_cam;
 
 		/* Init the camera model with size and distortion */
 		cam->camera_model.width = cam_cfg->roi.extent.w;
 		cam->camera_model.height = cam_cfg->roi.extent.h;
-		t_camera_model_params_from_t_camera_calibration(&cam_slam_cfg->base, &cam->camera_model.calib);
+		t_camera_model_params_from_t_camera_calibration(&cam_cfg->calibration, &cam->camera_model.calib);
 
 		os_mutex_init(&cam->bw_lock);
-		cam->bw = blobwatch_new(BLOB_PIXEL_THRESHOLD_WMR, BLOB_THRESHOLD_MIN_WMR);
+		cam->bw = blobwatch_new(cam_cfg->blob_min_threshold, cam_cfg->blob_detect_threshold);
 		cam->cs = correspondence_search_new(&cam->camera_model);
 	}
 
@@ -1077,7 +1053,7 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
 	u_var_add_bool(ct, &ct->debug_draw_pose_bounds, "Debug: Draw bounds rect for found poses");
 
 	for (int i = 0; i < ct->cam_count; i++) {
-		struct constellation_tracker_camera *cam = ct->cam + i;
+		struct constellation_tracker_camera_state *cam = ct->cam + i;
 		u_var_add_ro_i32(ct, &cam->last_num_blobs, "Num Blobs");
 		u_var_add_pose(ct, &cam->debug_last_pose, "Last view pose");
 		u_var_add_vec3_f32(ct, &cam->debug_last_gravity_vector, "Last gravity vector");

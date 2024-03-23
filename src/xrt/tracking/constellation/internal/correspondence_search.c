@@ -7,7 +7,7 @@
  * @file
  * @brief  Ab-initio blob<->LED correspondence search
  * @author Jan Schmidt <jan@centricular.com>
- * @ingroup drv_wmr
+ * @ingroup constellation
  */
 #ifndef _GNU_SOURCE // For qsort_r FIXME to use qsort
 #define _GNU_SOURCE

@@ -7,7 +7,7 @@
  * @file
  * @brief  Ab-initio blob<->LED correspondence search
  * @author Jan Schmidt <jan@centricular.com>
- * @ingroup drv_wmr
+ * @ingroup constellation
  */
 #pragma once
 

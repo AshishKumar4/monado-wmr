@@ -7,7 +7,7 @@
  * @file
  * @brief  Debug visualisation for constellation tracking
  * @author Jan Schmidt <jan@centricular.com>
- * @ingroup drv_wmr
+ * @ingroup constellation
  */
 #pragma once
 

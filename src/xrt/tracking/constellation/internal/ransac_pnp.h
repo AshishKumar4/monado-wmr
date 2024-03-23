@@ -11,7 +11,7 @@
  * @file
  * @brief  RANSAC PnP pose refinement
  * @author Jan Schmidt <jan@centricular.com>
- * @ingroup drv_wmr
+ * @ingroup constellation
  */
 #pragma once
 

@@ -4,7 +4,7 @@
  * @file
  * @brief Constellation tracking metrics for assessing pose matches
  * @author Jan Schmidt <jan@centricular.com>
- * @ingroup drv_wmr
+ * @ingroup constellation
  */
 #include <assert.h>
 #include <stdio.h>

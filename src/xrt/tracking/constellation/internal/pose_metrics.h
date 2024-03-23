@@ -7,7 +7,7 @@
  * @file
  * @brief  Metrics for constellation tracking poses
  * @author Jan Schmidt <jan@centricular.com>
- * @ingroup drv_wmr
+ * @ingroup constellation
  */
 #pragma once
 

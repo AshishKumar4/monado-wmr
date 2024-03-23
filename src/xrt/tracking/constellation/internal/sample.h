@@ -4,10 +4,12 @@
  * @file
  * @brief  Constellation tracking details for 1 exposure sample
  * @author Jan Schmidt <jan@centricular.com>
- * @ingroup drv_wmr
+ * @ingroup constellation
  */
 
 #pragma once
+
+#include "tracking/t_tracking.h"
 
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_frame.h"
@@ -20,7 +22,7 @@ extern "C" {
 #endif
 
 #define CONSTELLATION_MAX_DEVICES 3
-#define CONSTELLATION_MAX_CAMERAS 5
+#define CONSTELLATION_MAX_CAMERAS XRT_TRACKING_MAX_SLAM_CAMS
 
 /* Information about one device being tracked in this sample */
 struct tracking_sample_device_state

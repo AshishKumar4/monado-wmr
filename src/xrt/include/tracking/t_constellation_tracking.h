@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief Implementation of WMR controller tracking logic
+ * @brief Implementation of LED constellation tracking logic
  * @author Jan Schmidt <jan@centricular.com>
- * @ingroup drv_wmr
+ * @ingroup constellation
  */
 #pragma once
 
@@ -17,20 +17,52 @@
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_frame.h"
 
-#include "../../drivers/wmr/wmr_config.h"
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+/*!
+ * @defgroup constellation LED constellation tracking
+ * @ingroup tracking
+ *
+ * @brief Tracker for devices with LED constellations
+ */
+
+/*!
+ * @dir tracking/constellation
+ *
+ * @brief @ref constellation tracking files.
+ */
+
 struct t_constellation_tracker;
 struct t_constellation_tracked_device_connection;
+
+struct t_constellation_camera
+{
+	//!< IMU to camera pose
+	struct xrt_pose P_imu_cam;
+	//! ROI in the full frame mosaic
+	struct xrt_rect roi;
+	//! Intrinsics and distortion parameters
+	struct t_camera_calibration calibration;
+	//! Minimum blob brightness threshold
+	uint8_t min_threshold;
+	//! Minimum blob brightness threshold for pixel inclusion
+	uint8_t blob_min_threshold;
+	//! Threshold at which a group of pixels become a detected blob
+	uint8_t blob_detect_threshold;
+};
+
+struct t_constellation_camera_group
+{
+	int cam_count; //!< Number of cameras
+	struct t_constellation_camera cams[XRT_TRACKING_MAX_SLAM_CAMS];
+};
 
 int
 t_constellation_tracker_create(struct xrt_frame_context *xfctx,
                                struct xrt_device *hmd_xdev,
-                               struct wmr_hmd_config *hmd_cfg,
-                               struct t_slam_calibration *slam_calib,
+                               struct t_constellation_camera_group *cams,
                                struct t_constellation_tracker **out_tracker,
                                struct xrt_frame_sink **out_sink);
 

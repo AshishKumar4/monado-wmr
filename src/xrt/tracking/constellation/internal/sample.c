@@ -5,7 +5,7 @@
  * @file
  * @brief  Constellation tracking details for 1 exposure sample
  * @author Jan Schmidt <jan@centricular.com>
- * @ingroup drv_wmr
+ * @ingroup constellation
  */
 #include "sample.h"
 

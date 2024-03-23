@@ -8,7 +8,7 @@
  * @file
  * @brief  Blob thresholding and tracking in camera frames
  * @author Jan Schmidt <jan@centricular.com>
- * @ingroup drv_wmr
+ * @ingroup constellation
  */
 #include <assert.h>
 #include <stdbool.h>
