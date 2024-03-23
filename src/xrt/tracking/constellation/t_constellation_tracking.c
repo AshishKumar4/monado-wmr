@@ -165,7 +165,6 @@ struct t_constellation_tracker
 	bool debug_draw_pose_bounds;
 
 	uint64_t last_frame_timestamp;
-	uint64_t last_frame_sequence;
 
 	uint64_t last_fast_analysis_ms;
 	uint64_t last_blob_analysis_ms;
@@ -184,12 +183,13 @@ struct t_constellation_tracker
 };
 
 static void
-constellation_tracked_device_connection_notify_timesync(struct t_constellation_tracked_device_connection *ctdc,
-                                                        timepoint_ns frame_mono_ns)
+constellation_tracked_device_connection_notify_frame(struct t_constellation_tracked_device_connection *ctdc,
+                                                     uint64_t frame_mono_ns,
+                                                     uint64_t frame_sequence)
 {
 	os_mutex_lock(&ctdc->lock);
 	if (!ctdc->disconnected && ctdc->cb->notify_frame_received) {
-		ctdc->cb->notify_frame_received(ctdc->xdev, frame_mono_ns, 0);
+		ctdc->cb->notify_frame_received(ctdc->xdev, frame_mono_ns, frame_sequence);
 	}
 	os_mutex_unlock(&ctdc->lock);
 }
@@ -246,36 +246,15 @@ constellation_tracker_receive_frame(struct xrt_frame_sink *sink, struct xrt_fram
 
 	assert(xf->format == XRT_FORMAT_L8);
 
-	// FIXME: Move this logic into the WMR controllers
-	/* The frame cadence is SLAM/controller/controller. Only controller frames are received
-	 * here. On the 2nd controller frame, we need to pass the estimate of the time of the next
-	 * *1st controller frame* minus 1/3 of a frame duration to the controller timesync methods.
-	 * That is 2/90 + 1/270 = 5/270 or 5/3rds of the average frame duration.
-	 * @todo: Also calculate how many full 3-frame cycles have passed since the last
-	 * '2nd Controller frame' to add to our estimate in case of scheduling delays.
-	 * @todo: Move the 'next frame' estimate into the controller timesync code so it's
-	 * calculated when the led control packet is actually about to be sent.
-	 * Since only controller frames get passed to here, the 2nd sequential controller
-	 * frame is the one right before the next SLAM frame */
-	bool is_second_frame = (ct->last_frame_sequence + 1) == xf->source_sequence;
-
+	// Tell the controllers about the frame so they can their timesync estimate
 	os_mutex_lock(&ct->tracked_device_lock);
-
-	// Update the controller timesync estimate
-	if (is_second_frame) {
-		timepoint_ns next_timesync_ts = (timepoint_ns)(xf->timestamp) + U_TIME_1MS_IN_NS * 18;
-
-		for (int i = 0; i < ct->num_devices; i++) {
-			constellation_tracked_device_connection_notify_timesync(ct->devices[i].connection,
-			                                                        next_timesync_ts);
-		}
+	for (int i = 0; i < ct->num_devices; i++) {
+		constellation_tracked_device_connection_notify_frame(ct->devices[i].connection, xf->timestamp,
+		                                                     xf->source_sequence);
 	}
-
 	os_mutex_unlock(&ct->tracked_device_lock);
 
 	ct->last_frame_timestamp = xf->timestamp;
-	ct->last_frame_sequence = xf->source_sequence;
-
 	xrt_sink_push_frame(ct->fast_q_sink, xf);
 }
 
