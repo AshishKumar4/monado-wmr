@@ -137,6 +137,9 @@ struct wmr_hmd
 		//! Calibration data for SLAM
 		struct t_slam_calibration slam_calib;
 
+		//! Calibration data for constellation tracking
+		struct t_constellation_camera_group constellation_calib;
+
 		//! Set at start. Whether the SLAM tracker was initialized.
 		bool slam_enabled;
 

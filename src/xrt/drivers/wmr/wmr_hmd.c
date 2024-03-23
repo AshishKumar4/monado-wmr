@@ -1470,6 +1470,50 @@ wmr_hmd_fill_slam_calibration(struct wmr_hmd *wh)
 }
 
 static void
+wmr_hmd_fill_constellation_calibration(struct wmr_hmd *wh)
+{
+/* WMR thresholds for min brightness and min-blob-required magnitude */
+#define BLOB_PIXEL_THRESHOLD_WMR 0x4
+#define BLOB_THRESHOLD_MIN_WMR 0x8
+
+	struct t_constellation_camera_group *out = &wh->tracking.constellation_calib;
+
+	out->cam_count = wh->config.tcam_count;
+
+	// Fill camera 0
+	struct xrt_pose P_imu_c0 = wh->config.sensors.accel.pose;
+	out->cams[0] = (struct t_constellation_camera){.P_imu_cam = P_imu_c0,
+	                                               .roi = wh->config.tcams[0]->roi,
+	                                               .calibration = wmr_hmd_get_cam_calib(wh, 0),
+	                                               .blob_min_threshold = BLOB_PIXEL_THRESHOLD_WMR,
+	                                               .blob_detect_threshold = BLOB_THRESHOLD_MIN_WMR};
+
+	// Fill remaining cameras
+	for (int i = 1; i < wh->config.tcam_count; i++) {
+		struct xrt_pose P_ci_c0 = wh->config.tcams[i]->pose;
+
+		if (i == 2 || i == 3) {
+			//! @note The calibration json for the reverb G2v2 (the only 4-camera wmr
+			//! headset we know about) has the HT2 and HT3 extrinsics flipped compared
+			//! to the order the third and fourth camera images come from usb.
+			P_ci_c0 = wh->config.tcams[i == 2 ? 3 : 2]->pose;
+		}
+
+		struct xrt_pose P_c0_ci;
+		math_pose_invert(&P_ci_c0, &P_c0_ci);
+
+		struct xrt_pose P_imu_ci;
+		math_pose_transform(&P_imu_c0, &P_c0_ci, &P_imu_ci);
+
+		out->cams[i] = (struct t_constellation_camera){.P_imu_cam = P_imu_ci,
+		                                               .roi = wh->config.tcams[i]->roi,
+		                                               .calibration = wmr_hmd_get_cam_calib(wh, i),
+		                                               .blob_min_threshold = BLOB_PIXEL_THRESHOLD_WMR,
+		                                               .blob_detect_threshold = BLOB_THRESHOLD_MIN_WMR};
+	}
+}
+
+static void
 wmr_hmd_switch_hmd_tracker(void *wh_ptr)
 {
 	DRV_TRACE_MARKER();
@@ -1995,8 +2039,9 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 	wmr_hmd_fill_slam_calibration(wh);
 
 	// Set up controller 6dof tracker
+	wmr_hmd_fill_constellation_calibration(wh);
 	struct xrt_frame_sink *out_controller_sink = NULL;
-	if (t_constellation_tracker_create(&wh->tracking.xfctx, &wh->base, &wh->config, &wh->tracking.slam_calib,
+	if (t_constellation_tracker_create(&wh->tracking.xfctx, &wh->base, &wh->tracking.constellation_calib,
 	                                   &wh->controller_tracker, &out_controller_sink) != 0) {
 		WMR_WARN(wh, "Failed to create Controller Tracker. Controllers will not be 6dof");
 	}
