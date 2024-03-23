@@ -309,7 +309,8 @@ rift_s_fill_constellation_calibration(struct rift_s_tracker *t, struct rift_s_hm
 
 	out->cam_count = RIFT_S_CAMERA_COUNT;
 	for (int i = 0; i < RIFT_S_CAMERA_COUNT; i++) {
-		struct rift_s_camera_calibration *cam = &camera_calibration->cameras[i];
+		enum rift_s_camera_id cam_id = CAM_IDX_TO_ID[i];
+		struct rift_s_camera_calibration *cam = &camera_calibration->cameras[cam_id];
 
 		/* Compute the cam from IMU transform for each cam */
 		struct xrt_pose device_from_cam;
@@ -319,18 +320,18 @@ rift_s_fill_constellation_calibration(struct rift_s_tracker *t, struct rift_s_hm
 		math_pose_transform(&imu_from_device, &device_from_cam, &P_imu_cam);
 
 		struct xrt_rect roi = (struct xrt_rect){
-		    .offset = {.w = i * 640, .h = 0},
+		    .offset = {.w = cam_id * 640, .h = 0},
 		    .extent = {.w = 640, .h = 480},
 		};
 		out->cams[i] = (struct t_constellation_camera){
 		    .P_imu_cam = P_imu_cam,
 		    .roi = roi,
-		    .calibration = rift_s_get_cam_calib(&hmd_config->camera_calibration, i),
+		    .calibration = rift_s_get_cam_calib(&hmd_config->camera_calibration, cam_id),
 		    .blob_min_threshold = BLOB_PIXEL_THRESHOLD,
 		    .blob_detect_threshold = BLOB_THRESHOLD_MIN};
 
-		RIFT_S_DEBUG("Constellation IMU cam%d cam pose %f %f %f orient %f %f %f %f", i, P_imu_cam.position.x,
-		             P_imu_cam.position.y, P_imu_cam.position.z, P_imu_cam.orientation.x,
+		RIFT_S_DEBUG("Constellation IMU cam%d cam pose %f %f %f orient %f %f %f %f", cam_id,
+		             P_imu_cam.position.x, P_imu_cam.position.y, P_imu_cam.position.z, P_imu_cam.orientation.x,
 		             P_imu_cam.orientation.y, P_imu_cam.orientation.z, P_imu_cam.orientation.w);
 	}
 }
