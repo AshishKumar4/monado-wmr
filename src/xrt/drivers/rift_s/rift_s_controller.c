@@ -560,6 +560,9 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 
 	os_mutex_lock(&ctrl->mutex);
 	rift_s_controller_get_fusion_pose(ctrl, name, at_timestamp_ns, rel);
+	if (ctrl->last_tracked_pose_ts != 0) {
+		rel->pose.position = ctrl->last_tracked_pose.position;
+	}
 	os_mutex_unlock(&ctrl->mutex);
 
 	m_relation_chain_resolve(&xrc, out_relation);
