@@ -599,7 +599,7 @@ rift_s_controller_get_led_model(struct xrt_device *xdev, struct t_constellation_
 {
 	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
 
-	os_mutex_unlock(&ctrl->mutex);
+	os_mutex_lock(&ctrl->mutex);
 	if (!ctrl->have_calibration) {
 		os_mutex_unlock(&ctrl->mutex);
 		return false;
@@ -632,7 +632,7 @@ static void
 rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame_mono_ns, const struct xrt_pose *pose)
 {
 	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
-	os_mutex_unlock(&ctrl->mutex);
+	os_mutex_lock(&ctrl->mutex);
 
 	ctrl->last_tracked_pose_ts = frame_mono_ns;
 	ctrl->last_tracked_pose = *pose;
@@ -666,7 +666,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 				    prev.z, prev.w, ctrl->fusion.rot.x, ctrl->fusion.rot.y, ctrl->fusion.rot.z,
 				    ctrl->fusion.rot.w, post_delta.x, post_delta.y, post_delta.z, post_delta.w);
 			}
-		} else {
+		} else if (fabs(delta.y) > sin(DEG_TO_RAD(0.25)) / 2) {
 			math_quat_normalize(&delta);
 
 			RIFT_S_DEBUG("Applying full yaw correction of %f degrees. delta quat %f,%f,%f,%f",
@@ -674,7 +674,8 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 			math_quat_rotate(&ctrl->fusion.rot, &delta, &ctrl->fusion.rot);
 		}
 	}
-
+	// Update pose position for the debug UI
+	ctrl->pose.position = pose->position;
 	os_mutex_unlock(&ctrl->mutex);
 }
 
