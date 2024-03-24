@@ -608,15 +608,19 @@ rift_s_controller_get_led_model(struct xrt_device *xdev, struct t_constellation_
 
 	t_constellation_led_model_init((int)ctrl->base.device_type, led_model, ctrl->calibration.num_leds);
 
-	// Note: This LED model is in OpenCV coordinates with
-	// XYZ = Right/Down/Forward
+	// Note: This LED model is in OpenXR coordinates with
+	// XYZ = Right/Down/Forward. Flip to OpenCV for the constellation tracker
 	for (int i = 0; i < ctrl->calibration.num_leds; i++) {
 		struct t_constellation_led *led = led_model->leds + i;
 
 		led->id = i;
 
-		led->pos = ctrl->calibration.leds[i].pos;
-		led->dir = ctrl->calibration.leds[i].dir;
+		led->pos.x = ctrl->calibration.leds[i].pos.x;
+		led->pos.y = -ctrl->calibration.leds[i].pos.y;
+		led->pos.z = -ctrl->calibration.leds[i].pos.z;
+		led->dir.x = ctrl->calibration.leds[i].dir.x;
+		led->dir.y = -ctrl->calibration.leds[i].dir.y;
+		led->dir.z = -ctrl->calibration.leds[i].dir.z;
 
 		led->radius_mm = 3.5;
 	}

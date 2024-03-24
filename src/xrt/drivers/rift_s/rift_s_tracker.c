@@ -319,12 +319,20 @@ rift_s_fill_constellation_calibration(struct rift_s_tracker *t, struct rift_s_hm
 		struct xrt_pose P_imu_cam;
 		math_pose_transform(&imu_from_device, &device_from_cam, &P_imu_cam);
 
+		const struct xrt_pose P_YZ_flip = {
+		    {1.0, 0.0, 0.0, 0.0},
+		    {0.0, 0.0, 0.0},
+		};
+
+		struct xrt_pose P_imu_camcv;
+		math_pose_transform(&P_YZ_flip, &P_imu_cam, &P_imu_camcv);
+
 		struct xrt_rect roi = (struct xrt_rect){
 		    .offset = {.w = cam_id * 640, .h = 0},
 		    .extent = {.w = 640, .h = 480},
 		};
 		out->cams[i] = (struct t_constellation_camera){
-		    .P_imu_cam = P_imu_cam,
+		    .P_imu_cam = P_imu_camcv,
 		    .roi = roi,
 		    .calibration = rift_s_get_cam_calib(&hmd_config->camera_calibration, cam_id),
 		    .blob_min_threshold = BLOB_PIXEL_THRESHOLD,
