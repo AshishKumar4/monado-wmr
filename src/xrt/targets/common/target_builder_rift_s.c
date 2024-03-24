@@ -163,15 +163,23 @@ rift_s_open_system_impl(struct xrt_builder *xb,
 		goto fail;
 	}
 
+	/* We'll give everyone a shared tracking origin using the system allocated one */
+	origin->type = XRT_TRACKING_TYPE_OTHER;
+	origin->initial_offset.orientation.w = 1.0f;
+	origin->initial_offset.position.y = 1.6;
+	snprintf(origin->name, XRT_TRACKING_NAME_LEN, "%s", "Oculus Rift S SLAM Tracking");
 
 	// Create and add to list.
 	struct xrt_device *hmd_xdev = rift_s_system_get_hmd(sys);
+	hmd_xdev->tracking_origin = origin;
 	xsysd->xdevs[xsysd->xdev_count++] = hmd_xdev;
 
 	struct xrt_device *left_xdev = rift_s_system_get_controller(sys, 0);
+	left_xdev->tracking_origin = origin;
 	xsysd->xdevs[xsysd->xdev_count++] = left_xdev;
 
 	struct xrt_device *right_xdev = rift_s_system_get_controller(sys, 1);
+	right_xdev->tracking_origin = origin;
 	xsysd->xdevs[xsysd->xdev_count++] = right_xdev;
 
 
