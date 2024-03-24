@@ -401,9 +401,11 @@ ctrl_config_cb(bool success, uint8_t *response_bytes, int response_bytes_len, st
 static void
 ctrl_json_cb(bool success, uint8_t *response_bytes, int response_bytes_len, struct rift_s_controller *ctrl)
 {
+	os_mutex_lock(&ctrl->mutex);
 	ctrl->reading_calibration = false;
 
 	if (!success) {
+		os_mutex_unlock(&ctrl->mutex);
 		RIFT_S_WARN("Failed to read controller calibration block");
 		return;
 	}
@@ -411,11 +413,14 @@ ctrl_json_cb(bool success, uint8_t *response_bytes, int response_bytes_len, stru
 	RIFT_S_TRACE("Got Controller calibration:\n%s", response_bytes);
 
 	if (rift_s_controller_parse_imu_calibration((char *)response_bytes, &ctrl->calibration) == 0) {
+		ctrl->P_device_imu.position = ctrl->calibration.imu_position;
+		math_pose_invert(&ctrl->P_device_imu, &ctrl->P_imu_device);
 		ctrl->have_calibration = true;
 	} else {
 		RIFT_S_ERROR("Failed to parse controller configuration for controller 0x%16" PRIx64 "\n",
 		             ctrl->device_id);
 	}
+	os_mutex_unlock(&ctrl->mutex);
 }
 
 static void
@@ -547,14 +552,17 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 
 	struct xrt_relation_chain xrc = {0};
 
-	if (name == XRT_INPUT_TOUCH_GRIP_POSE) {
+	os_mutex_lock(&ctrl->mutex);
+	if (name == XRT_INPUT_TOUCH_AIM_POSE) {
+		m_relation_chain_push_pose(&xrc, &ctrl->P_imu_device);
+	} else if (name == XRT_INPUT_TOUCH_GRIP_POSE) {
+		m_relation_chain_push_pose(&xrc, &ctrl->P_imu_device);
 		m_relation_chain_push_pose(&xrc, &ctrl->P_aim_grip);
 	}
 
 	/* Apply the fusion rotation */
 	struct xrt_space_relation *rel = m_relation_chain_reserve(&xrc);
 
-	os_mutex_lock(&ctrl->mutex);
 	rift_s_controller_get_fusion_pose(ctrl, name, at_timestamp_ns, rel);
 	if (ctrl->last_tracked_pose_ts != 0) {
 		rel->pose.position = ctrl->last_tracked_pose.position;
@@ -610,17 +618,21 @@ rift_s_controller_get_led_model(struct xrt_device *xdev, struct t_constellation_
 
 	// Note: This LED model is in OpenXR coordinates with
 	// XYZ = Right/Down/Forward. Flip to OpenCV for the constellation tracker
+	// after moving to imu-relative position
 	for (int i = 0; i < ctrl->calibration.num_leds; i++) {
 		struct t_constellation_led *led = led_model->leds + i;
+		struct xrt_vec3 pos, dir;
+
+		math_pose_transform_point(&ctrl->P_device_imu, &ctrl->calibration.leds[i].pos, &pos);
+		math_quat_rotate_vec3(&ctrl->P_device_imu.orientation, &ctrl->calibration.leds[i].dir, &dir);
 
 		led->id = i;
-
-		led->pos.x = ctrl->calibration.leds[i].pos.x;
-		led->pos.y = -ctrl->calibration.leds[i].pos.y;
-		led->pos.z = -ctrl->calibration.leds[i].pos.z;
-		led->dir.x = ctrl->calibration.leds[i].dir.x;
-		led->dir.y = -ctrl->calibration.leds[i].dir.y;
-		led->dir.z = -ctrl->calibration.leds[i].dir.z;
+		led->pos.x = pos.x;
+		led->pos.y = -pos.y;
+		led->pos.z = -pos.z;
+		led->dir.x = dir.x;
+		led->dir.y = -dir.y;
+		led->dir.z = -dir.z;
 
 		led->radius_mm = 3.5;
 	}
@@ -702,8 +714,8 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
 
 	os_mutex_init(&ctrl->mutex);
 
-	/* Default grip pose up by 40° degrees around the X axis */
-	struct xrt_vec3 translation = {0.0, 0, 0.0};
+	/* Default grip pose up by 40° degrees around the X axis and back about 10cm in Z */
+	struct xrt_vec3 translation = {0.0, 0, 0.1};
 	struct xrt_vec3 axis = {1.0, 0, 0};
 	math_quat_from_angle_vector(DEG_TO_RAD(40), &axis, &ctrl->P_aim_grip.orientation);
 	ctrl->P_aim_grip.position = translation;
@@ -726,6 +738,9 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
 
 	ctrl->pose.orientation.w = 1.0f; // All other values set to zero by U_DEVICE_ALLOCATE (which calls U_CALLOC)
 	m_imu_3dof_init(&ctrl->fusion, M_IMU_3DOF_USE_GRAVITY_DUR_20MS);
+
+	// Real offset will be updated from the calibration once available
+	ctrl->P_imu_device = ctrl->P_device_imu = (struct xrt_pose)XRT_POSE_IDENTITY;
 
 	// Setup inputs and outputs
 	if (device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
@@ -764,6 +779,8 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
 	u_var_add_root(ctrl, ctrl->base.str, true);
 	u_var_add_gui_header(ctrl, NULL, "Tracking");
 	u_var_add_pose(ctrl, &ctrl->pose, "Tracked Pose");
+
+	u_var_add_pose(ctrl, &ctrl->P_aim_grip, "Grip pose offset");
 
 	u_var_add_gui_header(ctrl, NULL, "3DoF Tracking");
 	m_imu_3dof_add_vars(&ctrl->fusion, ctrl, "");

@@ -83,6 +83,11 @@ struct rift_s_controller
 	struct xrt_vec3 mag;
 	struct m_imu_3dof fusion;
 
+	//! Offset for IMU pose from device (from json calibration)
+	struct xrt_pose P_device_imu;
+	//! Offset for device pose from imu
+	struct xrt_pose P_imu_device;
+
 	//! Offset for grip pose
 	struct xrt_pose P_aim_grip;
 
