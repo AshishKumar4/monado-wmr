@@ -39,6 +39,10 @@
 #include "util/u_trace_marker.h"
 #include "util/u_var.h"
 
+#ifdef XRT_OS_LINUX
+#include "util/u_linux.h"
+#endif
+
 #include "xrt/xrt_device.h"
 
 #include "rift_s.h"
@@ -555,6 +559,11 @@ rift_s_run_thread(void *ptr)
 	DRV_TRACE_MARKER();
 
 	struct rift_s_system *sys = (struct rift_s_system *)ptr;
+
+#ifdef XRT_OS_LINUX
+	// Try to raise priority of this thread.
+	u_linux_try_to_set_realtime_priority_on_thread(rift_s_log_level, "Rift S: USB-HMD");
+#endif
 
 	os_thread_helper_lock(&sys->oth);
 	while (os_thread_helper_is_running_locked(&sys->oth)) {
