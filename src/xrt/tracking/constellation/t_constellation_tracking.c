@@ -416,12 +416,17 @@ submit_device_pose(struct t_constellation_tracker *ct,
 		device->last_matched_cam = view_id;
 		device->last_matched_cam_pose = *P_cam_obj;
 
-		/* Submit this pose observation to the fusion / real device. Flip back to OpenXR coords first */
-		struct xrt_pose P_xrworld_obj;
-		pose_flip_YZ(&dev_state->final_pose, &P_xrworld_obj);
+		/* Submit this pose observation to the fusion / real device. Flip back to OpenXR coords first, then
+		 * apply model pose */
+		struct xrt_pose P_xrworld_model;
+		pose_flip_YZ(&dev_state->final_pose, &P_xrworld_model);
+
+		// Apply device -> LED model pose from xsr = P_world_device + P_device_model = model pose
+		struct xrt_pose P_xrworld_device;
+		math_pose_transform(&P_xrworld_model, &device->led_model.P_model_device, &P_xrworld_device);
 
 		constellation_tracked_device_connection_notify_pose(device->connection, sample->timestamp,
-		                                                    &P_xrworld_obj);
+		                                                    &P_xrworld_device);
 	}
 	os_mutex_unlock(&ct->tracked_device_lock);
 }
@@ -664,8 +669,12 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 			continue; // Can't retrieve the pose: means the device was disconnected
 		}
 
+		// Apply device -> LED model pose from xsr = P_world_device + P_device_model = P_world_model
+		struct xrt_pose P_xrworld_model;
+		math_pose_transform(&xsr.pose, &device->led_model.P_device_model, &P_xrworld_model);
+
 		// Incoming controller pose is in OpenXR. Flip it to OpenCV for all our operations
-		pose_flip_YZ(&xsr.pose, &dev_state->P_world_obj_prior);
+		pose_flip_YZ(&P_xrworld_model, &dev_state->P_world_obj_prior);
 
 		//! @todo: Get actual error bounds from fusion
 		dev_state->prior_pos_error.x = dev_state->prior_pos_error.y = dev_state->prior_pos_error.z =
