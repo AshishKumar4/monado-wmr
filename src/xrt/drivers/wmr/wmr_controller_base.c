@@ -946,7 +946,7 @@ wmr_controller_base_get_led_model(struct xrt_device *xdev, struct t_constellatio
 	}
 	os_mutex_unlock(&wcb->data_lock);
 
-	t_constellation_led_model_init((int)wcb->base.device_type, led_model, wcb->config.led_count);
+	t_constellation_led_model_init((int)wcb->base.device_type, NULL, led_model, wcb->config.led_count);
 
 	// Note: This LED model is in OpenCV/WMR coordinates with
 	// XYZ = Right/Down/Forward
