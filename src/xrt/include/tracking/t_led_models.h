@@ -32,12 +32,20 @@ struct t_constellation_led_model
 	// Device ID
 	uint8_t id;
 
+	// LED model relative to the tracked device
+	struct xrt_pose P_device_model;
+	// and inverse
+	struct xrt_pose P_model_device;
+
 	struct t_constellation_led *leds;
 	uint8_t num_leds;
 };
 
 void
-t_constellation_led_model_init(uint8_t device_id, struct t_constellation_led_model *led_model, uint8_t num_leds);
+t_constellation_led_model_init(uint8_t device_id,
+                               struct xrt_pose *P_device_model,
+                               struct t_constellation_led_model *led_model,
+                               uint8_t num_leds);
 void
 t_constellation_led_model_dump(struct t_constellation_led_model *led_model, const char *desc);
 void

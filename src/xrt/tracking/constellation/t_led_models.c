@@ -16,9 +16,18 @@
 #endif
 
 void
-t_constellation_led_model_init(uint8_t device_id, struct t_constellation_led_model *led_model, uint8_t num_leds)
+t_constellation_led_model_init(uint8_t device_id,
+                               struct xrt_pose *P_device_model,
+                               struct t_constellation_led_model *led_model,
+                               uint8_t num_leds)
 {
 	led_model->id = device_id;
+	if (P_device_model != NULL) {
+		led_model->P_device_model = *P_device_model;
+		math_pose_invert(&led_model->P_device_model, &led_model->P_model_device);
+	} else {
+		led_model->P_device_model = led_model->P_model_device = (struct xrt_pose)XRT_POSE_IDENTITY;
+	}
 	led_model->leds = calloc(num_leds, sizeof(struct t_constellation_led));
 	led_model->num_leds = num_leds;
 }
