@@ -1144,9 +1144,18 @@ t_constellation_tracker_add_device(struct t_constellation_tracker *ct,
 		device->last_matched_cam = -1;
 		ct->num_devices++;
 
+		const char *device_type;
+		switch (xdev->device_type) {
+		case XRT_DEVICE_TYPE_HMD: device_type = "HMD"; break;
+		case XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER: device_type = "Right"; break;
+		case XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER: device_type = "Left"; break;
+		case XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER: device_type = "Any"; break;
+		case XRT_DEVICE_TYPE_GENERIC_TRACKER: device_type = "Tracker"; break;
+		default: device_type = "Unknown"; break;
+		}
+
 		char dev_name[64];
-		sprintf(dev_name, "Device %u - %s", ct->num_devices,
-		        xdev->device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER ? "Left" : "Right");
+		sprintf(dev_name, "Device %u - %s", ct->num_devices, device_type);
 		u_var_add_ro_text(ct, "Device", dev_name);
 		u_var_add_pose(ct, &device->last_seen_pose, "Last observed global pose");
 		u_var_add_u64(ct, &device->last_seen_pose_ts, "Last observed pose");
