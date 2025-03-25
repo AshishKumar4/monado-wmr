@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-#define CONSTELLATION_MAX_DEVICES 3
+#define CONSTELLATION_MAX_DEVICES 4
 #define CONSTELLATION_MAX_CAMERAS XRT_TRACKING_MAX_SLAM_CAMS
 
 /* Information about one device being tracked in this sample */
