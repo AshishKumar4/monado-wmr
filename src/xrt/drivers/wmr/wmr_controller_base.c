@@ -934,6 +934,106 @@ wmr_controller_base_send_keepalive(struct wmr_controller_base *wcb, uint64_t now
 	}
 }
 
+#define WMR_RING_HEIGHT 0.02194146618190565
+#define WMR_RING_TOP_RADIUS (0.11277887330599087 / 2.0)
+#define WMR_RING_BOTTOM_RADIUS (0.09375531956362483 / 2.0)
+
+static bool
+conical_frustum_ray_intersect(struct xrt_vec3 ray_origin,
+                              struct xrt_vec3 ray_dir,
+                              struct xrt_vec3 base_center,
+                              struct xrt_vec3 axis,
+                              float h,
+                              float r1,
+                              float r2,
+                              float *hit_time)
+{
+	// cone has it's base on the bottom, must shrink as it goes up
+	assert(r1 > r2);
+
+	// compute cone slope k = (r1 - r2) / h
+	float k = (r1 - r2) / h;
+	float k2 = k * k;
+
+	// apex of the cone
+	float cone_height = r1 / k;
+	struct xrt_vec3 apex = m_vec3_sub(base_center, m_vec3_mul_scalar(axis, cone_height));
+
+	// vector from apex to ray origin
+	struct xrt_vec3 delta_p = m_vec3_sub(ray_origin, apex);
+
+	// dot products
+	float dv = m_vec3_dot(ray_dir, axis);
+	float pv = m_vec3_dot(delta_p, axis);
+
+	// quadratic coefficients
+	float a = m_vec3_dot(ray_dir, ray_dir) - (1 + k2) * dv * dv;
+	float b = 2 * (m_vec3_dot(ray_dir, delta_p) - (1 + k2) * dv * pv);
+	float c = m_vec3_dot(delta_p, delta_p) - (1 + k2) * pv * pv;
+
+	// discriminant
+	float discriminant = b * b - 4 * a * c;
+	if (discriminant < -1e-6f) // allow some small numerical tolerance
+		return false;
+
+	if (discriminant < 0.0f)
+		discriminant = 0.0f;
+
+	float sqrt_d = sqrtf(discriminant);
+	float t0 = (-b - sqrt_d) / (2 * a);
+	float t1 = (-b + sqrt_d) / (2 * a);
+
+	// pick nearest positive intersection
+	float t = t0 > 0 ? t0 : t1;
+	if (t < 0)
+		return false;
+
+	// intersection point
+	struct xrt_vec3 p = m_vec3_add(ray_origin, m_vec3_mul_scalar(ray_dir, t));
+
+	// project onto cone axis to check vertical bounds
+	float u = m_vec3_dot(m_vec3_sub(p, base_center), axis);
+	if (u < 0 || u > h)
+		return false;
+
+	if (hit_time)
+		*hit_time = t;
+
+	return true;
+}
+
+static bool
+wmr_controller_base_check_led_visibility(struct t_constellation_led_model *led_model,
+                                         size_t led_index,
+                                         struct xrt_vec3 T_obj_cam)
+{
+	// @todo *so much* of this can be pre-computed... but this is fine for now.
+
+	struct t_constellation_led *led = &led_model->leds[led_index];
+
+	struct xrt_vec3 led_dir = led->dir;
+	led_dir.z = 0;
+	math_vec3_normalize(&led_dir);
+
+	struct xrt_vec3 led_dir_to_z_axis = m_vec3_inverse((struct xrt_vec3){led->pos.x, led->pos.y, 0});
+	math_vec3_normalize(&led_dir_to_z_axis);
+
+	float angle_away_from_origin = fabsf(acosf(m_vec3_dot(led_dir_to_z_axis, led_dir)));
+
+	struct xrt_vec3 ring_base_pos = {0, 0, (WMR_RING_HEIGHT / 2.0)};
+	struct xrt_vec3 ring_base_rot = {0, 0, -1};
+
+	// for inward-facing LEDs, check if they intersect with the Cone
+	if (angle_away_from_origin < DEG_TO_RAD(30.0) &&
+	    conical_frustum_ray_intersect(led->pos, m_vec3_normalize(m_vec3_sub(T_obj_cam, led->pos)), ring_base_pos,
+	                                  ring_base_rot, WMR_RING_HEIGHT, WMR_RING_TOP_RADIUS, WMR_RING_BOTTOM_RADIUS,
+	                                  NULL)) {
+		return false;
+	}
+
+	return true;
+}
+
 static bool
 wmr_controller_base_get_led_model(struct xrt_device *xdev, struct t_constellation_led_model *led_model)
 {
@@ -947,6 +1047,7 @@ wmr_controller_base_get_led_model(struct xrt_device *xdev, struct t_constellatio
 	os_mutex_unlock(&wcb->data_lock);
 
 	t_constellation_led_model_init((int)wcb->base.device_type, NULL, led_model, wcb->config.led_count);
+	led_model->check_led_visibility = wmr_controller_base_check_led_visibility;
 
 	// Note: This LED model is in OpenCV/WMR coordinates with
 	// XYZ = Right/Down/Forward
@@ -955,11 +1056,24 @@ wmr_controller_base_get_led_model(struct xrt_device *xdev, struct t_constellatio
 
 		led->id = i;
 
-		led->pos = wcb->config.leds[i].pos;
-		led->dir = wcb->config.leds[i].norm;
+		struct wmr_led_config *wmr_led = &wcb->config.leds[i];
+		// led->pos = (struct xrt_vec3){
+		//     wmr_led->pos.x,
+		//     wmr_led->pos.z,
+		//     -wmr_led->pos.y,
+		// };
+		// led->dir = (struct xrt_vec3){
+		//     wmr_led->norm.x,
+		//     wmr_led->norm.z,
+		//     -wmr_led->norm.y,
+		// };
+		led->pos = wmr_led->pos;
+		led->dir = wmr_led->norm;
 
 		led->radius_mm = 3.5;
 	}
+
+	t_constellation_led_model_dump(led_model, wcb->base.str);
 
 	return true;
 }
