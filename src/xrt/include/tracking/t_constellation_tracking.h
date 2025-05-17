@@ -71,6 +71,7 @@ struct t_constellation_tracked_device_callbacks
 	bool (*get_led_model)(struct xrt_device *xdev, struct t_constellation_led_model *led_model);
 	void (*notify_frame_received)(struct xrt_device *xdev, uint64_t frame_mono_ns, uint64_t frame_sequence);
 	void (*push_observed_pose)(struct xrt_device *xdev, timepoint_ns frame_mono_ns, const struct xrt_pose *pose);
+	void (*push_brightness_update)(struct xrt_device *xdev, uint8_t average_brightness);
 };
 
 struct t_constellation_tracked_device_connection *

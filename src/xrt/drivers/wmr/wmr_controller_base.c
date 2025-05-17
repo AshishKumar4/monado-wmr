@@ -106,7 +106,13 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 		return;
 	}
 
-	WMR_TRACE(wcb, "Accel [m/s^2] : %f", m_vec3_len(imu_sample->acc));
+	float accel_m_p_s_2 = m_vec3_len(imu_sample->acc);
+	WMR_TRACE(wcb, "Accel [m/s^2] : %f", accel_m_p_s_2);
+
+	// if it accelerates quite quickly, then we up the brightness to make it easier to find constellation poses
+	if (accel_m_p_s_2 > 20) {
+		wcb->timesync_led_intensity = MIN(wcb->timesync_led_intensity + 10, 399);
+	}
 
 	m_imu_3dof_update(&wcb->fusion, mono_time_ns, &imu_sample->acc, &imu_sample->gyro);
 	wcb->last_imu_timestamp_ns = mono_time_ns;
@@ -718,7 +724,7 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 
 	wcb->timesync_counter = 2;
 	wcb->timesync_led_intensity = 200;
-	wcb->timesync_val2 = 0;
+	wcb->timesync_val2 = 500;
 	wcb->timesync_time_offset = 0;
 
 	wcb->timesync_led_intensity_uvar =
@@ -1079,6 +1085,23 @@ wmr_controller_base_get_led_model(struct xrt_device *xdev, struct t_constellatio
 }
 
 static void
+wmr_controller_base_push_brightness_update(struct xrt_device *xdev, uint8_t average_brightness)
+{
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
+	os_mutex_lock(&wcb->data_lock);
+
+	if (average_brightness > 70) {
+		wcb->timesync_led_intensity -= MIN(wcb->timesync_led_intensity, 3);
+	}
+
+	if (average_brightness < 30) {
+		wcb->timesync_led_intensity = MIN(wcb->timesync_led_intensity + 10, 399);
+	}
+
+	os_mutex_unlock(&wcb->data_lock);
+}
+
+static void
 wmr_controller_base_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame_mono_ns, const struct xrt_pose *pose)
 {
 	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
@@ -1137,6 +1160,7 @@ static struct t_constellation_tracked_device_callbacks tracking_callbacks = {
     .get_led_model = wmr_controller_base_get_led_model,
     .notify_frame_received = wmr_controller_base_notify_frame,
     .push_observed_pose = wmr_controller_base_push_observed_pose,
+    .push_brightness_update = wmr_controller_base_push_brightness_update,
 };
 
 void

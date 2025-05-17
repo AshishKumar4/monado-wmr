@@ -24,7 +24,7 @@ extern "C" {
 #define MAX_BLOBS_PER_FRAME 100
 #define LED_INVALID_ID ((uint16_t)(-1))
 #define LED_NOISE_ID ((uint16_t)(-2))
-#define LED_LOCAL_ID(l) (((l) == LED_INVALID_ID) ? (l) : (l)&0xFF)
+#define LED_LOCAL_ID(l) (((l) == LED_INVALID_ID) ? (l) : (l) & 0xFF)
 #define LED_OBJECT_ID(l) (((l) == LED_INVALID_ID) ? (l) : (l) >> 8)
 #define LED_MAKE_ID(o, n) ((uint16_t)((uint16_t)(o)) << 8 | ((uint16_t)(n)))
 
@@ -51,6 +51,9 @@ struct blob
 	/* Motion vector from previous blob */
 	float vx;
 	float vy;
+
+	/* The max brightness we see in the blob */
+	uint8_t brightness;
 
 	/* bounding box */
 	uint16_t top;

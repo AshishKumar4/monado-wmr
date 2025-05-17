@@ -1473,8 +1473,8 @@ static void
 wmr_hmd_fill_constellation_calibration(struct wmr_hmd *wh)
 {
 /* WMR thresholds for min brightness and min-blob-required magnitude */
-#define BLOB_PIXEL_THRESHOLD_WMR 0x4
-#define BLOB_THRESHOLD_MIN_WMR 0x10
+#define BLOB_PIXEL_THRESHOLD_WMR 0x8
+#define BLOB_THRESHOLD_MIN_WMR 0x18
 
 	struct t_constellation_camera_group *out = &wh->tracking.constellation_calib;
 

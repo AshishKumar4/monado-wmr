@@ -194,7 +194,14 @@ compute_greysum(blobwatch *bw, struct xrt_frame *frame, struct extent *e, int en
  * array b at the given index.
  */
 static inline void
-store_blob(struct extent *e, int index, int end_y, struct blob *b, uint32_t blob_id, float led_x, float led_y)
+store_blob(struct extent *e,
+           int index,
+           int end_y,
+           struct blob *b,
+           uint32_t blob_id,
+           float led_x,
+           float led_y,
+           uint8_t brightness)
 {
 	b += index;
 	b->blob_id = blob_id;
@@ -212,6 +219,7 @@ store_blob(struct extent *e, int index, int end_y, struct blob *b, uint32_t blob
 	b->track_index = -1;
 	b->id_age = 0;
 	b->prev_led_id = b->led_id = LED_INVALID_ID;
+	b->brightness = brightness;
 }
 
 static void
@@ -241,7 +249,7 @@ extent_to_blobs(blobwatch *bw, blobservation *ob, struct extent *e, int y, struc
 
 		compute_greysum(bw, frame, e, y, &led_x, &led_y);
 
-		store_blob(e, ob->num_blobs++, y, blobs, bw->next_blob_id++, led_x, led_y);
+		store_blob(e, ob->num_blobs++, y, blobs, bw->next_blob_id++, led_x, led_y, e->max_pixel);
 		break;
 	}
 }

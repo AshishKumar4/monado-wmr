@@ -199,6 +199,17 @@ constellation_tracked_device_connection_notify_pose(struct t_constellation_track
 	os_mutex_unlock(&ctdc->lock);
 }
 
+static void
+constellation_tracked_device_connection_notify_brightness_update(struct t_constellation_tracked_device_connection *ctdc,
+                                                                 uint8_t average_brightness)
+{
+	os_mutex_lock(&ctdc->lock);
+	if (!ctdc->disconnected && ctdc->cb->push_brightness_update) {
+		ctdc->cb->push_brightness_update(ctdc->xdev, average_brightness);
+	}
+	os_mutex_unlock(&ctdc->lock);
+}
+
 static bool
 constellation_tracked_device_connection_get_led_model(struct t_constellation_tracked_device_connection *ctdc,
                                                       struct t_constellation_led_model *led_model)
@@ -424,6 +435,21 @@ submit_device_pose(struct t_constellation_tracker *ct,
 		// Apply device -> LED model pose from xsr = P_world_device + P_device_model = model pose
 		struct xrt_pose P_xrworld_device;
 		math_pose_transform(&P_xrworld_model, &device->led_model.P_model_device, &P_xrworld_device);
+
+		// calculate the average brightness of all the matched blobs
+		uint32_t average_brightness = 0;
+		int matched_blobs = 0;
+		for (int i = 0; i < dev_state->blob_match_info.num_visible_leds; i++) {
+			struct pose_metrics_visible_led_info *visible_led = &dev_state->blob_match_info.visible_leds[i];
+			if (visible_led->matched_blob) {
+				average_brightness += visible_led->matched_blob->brightness;
+				matched_blobs++;
+			}
+		}
+		average_brightness /= matched_blobs;
+
+		constellation_tracked_device_connection_notify_brightness_update(device->connection,
+		                                                                 average_brightness);
 
 		constellation_tracked_device_connection_notify_pose(device->connection, sample->timestamp,
 		                                                    &P_xrworld_device);
@@ -801,6 +827,7 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
 {
 	CT_DEBUG(ct, "Starting long analysis of frame TS %" PRIu64, sample->timestamp);
 
+	bool dev_found[CONSTELLATION_MAX_DEVICES] = {0};
 	for (int view_id = 0; view_id < sample->n_views; view_id++) {
 		struct tracking_sample_frame *view = sample->views + view_id;
 		struct constellation_tracker_camera_state *cam = ct->cam + view_id;
@@ -850,9 +877,18 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
 					CT_DEBUG(ct, "Found a pose on cam %u device %d long search pass %d", view_id,
 					         device->led_model.id, pass);
 					submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj);
+					dev_found[d] = true;
 					break;
 				}
 			}
+		}
+	}
+
+	// if a long analysis did not find the device at all, then we push that it has no brightness
+	for (int d = 0; d < sample->n_devices; d++) {
+		if (!dev_found[d]) {
+			constellation_tracked_device_connection_notify_brightness_update(
+			    ct->devices[sample->devices[d].dev_index].connection, 0);
 		}
 	}
 }
