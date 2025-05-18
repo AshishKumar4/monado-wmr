@@ -1070,7 +1070,7 @@ wmr_controller_base_get_led_model(struct xrt_device *xdev, struct t_constellatio
 		led->pos = wmr_led->pos;
 		led->dir = wmr_led->norm;
 
-		led->radius_mm = 3.5;
+		led->radius_mm = 3;
 	}
 
 	t_constellation_led_model_dump(led_model, wcb->base.str);
