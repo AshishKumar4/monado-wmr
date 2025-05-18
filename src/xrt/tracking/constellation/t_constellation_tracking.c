@@ -28,8 +28,6 @@
 #include "internal/ransac_pnp.h"
 #include "internal/sample.h"
 
-#define MAX_TRACKED_DEVICES 4
-
 DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
 
 #define MIN_ROT_ERROR DEG_TO_RAD(30)
@@ -139,7 +137,7 @@ struct t_constellation_tracker
 
 	//! Tracked device communication connections
 	int num_devices;
-	struct constellation_tracker_device devices[MAX_TRACKED_DEVICES];
+	struct constellation_tracker_device devices[CONSTELLATION_MAX_DEVICES];
 
 	//!< Tracking camera entries
 	struct constellation_tracker_camera_state cam[XRT_TRACKING_MAX_SLAM_CAMS];
@@ -1168,7 +1166,7 @@ t_constellation_tracker_add_device(struct t_constellation_tracker *ct,
                                    struct t_constellation_tracked_device_callbacks *cb)
 {
 	os_mutex_lock(&ct->tracked_device_lock);
-	assert(ct->num_devices < MAX_TRACKED_DEVICES);
+	assert(ct->num_devices < CONSTELLATION_MAX_DEVICES);
 
 	CT_DEBUG(ct, "Constellation tracker: Adding device %d", ct->num_devices);
 
