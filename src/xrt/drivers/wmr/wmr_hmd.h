@@ -134,6 +134,8 @@ struct wmr_hmd
 		//! an equivalent for hand tracking.
 		struct xrt_tracked_slam *slam;
 
+		struct xrt_slam_sinks *slam_sinks;
+
 		//! Calibration data for SLAM
 		struct t_slam_calibration slam_calib;
 

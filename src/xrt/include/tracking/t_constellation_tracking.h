@@ -16,6 +16,7 @@
 #include "util/u_sink.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_frame.h"
+#include "xrt/xrt_tracking.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,6 +52,8 @@ struct t_constellation_camera
 	uint8_t blob_min_threshold;
 	//! Threshold at which a group of pixels become a detected blob
 	uint8_t blob_detect_threshold;
+	//! The index into the slam tracking camera array this camera represents
+	size_t slam_tracking_index;
 };
 
 struct t_constellation_camera_group
@@ -64,7 +67,8 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
                                struct xrt_device *hmd_xdev,
                                struct t_constellation_camera_group *cams,
                                struct t_constellation_tracker **out_tracker,
-                               struct xrt_frame_sink **out_sink);
+                               struct xrt_frame_sink **out_sink,
+                               struct xrt_device_masks_sink *controller_mask_sink);
 
 struct t_constellation_tracked_device_callbacks
 {

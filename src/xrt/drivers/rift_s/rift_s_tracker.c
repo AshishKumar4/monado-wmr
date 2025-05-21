@@ -350,7 +350,7 @@ rift_s_create_constellation_tracker(struct rift_s_tracker *t, struct xrt_frame_c
 	struct xrt_frame_sink *controller_sink = NULL;
 
 	if (t_constellation_tracker_create(xfctx, &t->base, &t->constellation_calib, &t->controller_tracker,
-	                                   &controller_sink) != 0) {
+	                                   &controller_sink, NULL /* @todo */) != 0) {
 		RIFT_S_WARN("Failed to create Controller Tracker. Controllers will not be 6dof");
 		return -1;
 	}

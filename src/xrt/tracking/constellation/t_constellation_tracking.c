@@ -115,6 +115,9 @@ struct constellation_tracker_camera_state
 	struct u_sink_debug debug_sink;
 	struct xrt_pose debug_last_pose;
 	struct xrt_vec3 debug_last_gravity_vector;
+
+	//! The index into the slam tracking camera array this camera represents
+	size_t slam_tracking_index;
 };
 
 /*!
@@ -154,6 +157,7 @@ struct t_constellation_tracker
 	bool debug_draw_prior_leds;
 	bool debug_draw_last_leds;
 	bool debug_draw_pose_bounds;
+	bool debug_draw_device_bounds;
 
 	uint64_t last_frame_timestamp;
 
@@ -171,6 +175,9 @@ struct t_constellation_tracker
 	// Long analysis / recovery thread
 	struct os_thread_helper long_analysis_thread;
 	struct constellation_tracking_sample *long_analysis_pending_sample;
+
+	struct xrt_device_masks_sample controller_masks_sample;
+	struct xrt_device_masks_sink *controller_masks_sink;
 };
 
 static void
@@ -451,6 +458,44 @@ submit_device_pose(struct t_constellation_tracker *ct,
 
 		constellation_tracked_device_connection_notify_pose(device->connection, sample->timestamp,
 		                                                    &P_xrworld_device);
+
+		// update the controller masks for this controller
+		if (ct->controller_masks_sink) {
+			struct xrt_pose P_imu_obj;
+			math_pose_transform(&ct->cam[view_id].P_imu_cam, P_cam_obj, &P_imu_obj);
+
+			for (int i = 0; i < ct->cam_count; i++) {
+				struct constellation_tracker_camera_state *cam = &ct->cam[i];
+
+				struct xrt_device_masks_sample_camera *sample_camera =
+				    &ct->controller_masks_sample.views[cam->slam_tracking_index];
+
+				struct xrt_device_masks_sample_device *device_mask =
+				    &sample_camera->devices[dev_state->dev_index];
+
+				struct xrt_pose P_tcam_imu;
+				math_pose_invert(&cam->P_imu_cam, &P_tcam_imu);
+
+				struct xrt_pose P_tcam_obj;
+				math_pose_transform(&P_tcam_imu, &P_imu_obj, &P_tcam_obj);
+
+				struct pose_rect device_bounds;
+				pose_metrics_get_device_bounds(&P_tcam_obj, &device->led_model, &cam->camera_model,
+				                               &device_bounds, NULL, NULL);
+
+				device_mask->enabled = pose_rect_has_area(&device_bounds);
+				if (device_mask->enabled) {
+					device_mask->rect = (struct xrt_rect_f32){
+					    .x = device_bounds.left,
+					    .y = device_bounds.top,
+					    .w = device_bounds.right - device_bounds.left,
+					    .h = device_bounds.bottom - device_bounds.top,
+					};
+				}
+			}
+
+			xrt_sink_push_device_masks(ct->controller_masks_sink, &ct->controller_masks_sample);
+		}
 	}
 	os_mutex_unlock(&ct->tracked_device_lock);
 }
@@ -775,6 +820,8 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		debug_flags |= DEBUG_DRAW_FLAG_LAST_SEEN_LEDS;
 	if (ct->debug_draw_pose_bounds)
 		debug_flags |= DEBUG_DRAW_FLAG_POSE_BOUNDS;
+	if (ct->debug_draw_device_bounds)
+		debug_flags |= DEBUG_DRAW_FLAG_DEVICE_BOUNDS;
 
 	for (int i = 0; i < sample->n_views; i++) {
 		struct constellation_tracker_camera_state *cam = ct->cam + i;
@@ -882,11 +929,29 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
 		}
 	}
 
-	// if a long analysis did not find the device at all, then we push that it has no brightness
 	for (int d = 0; d < sample->n_devices; d++) {
 		if (!dev_found[d]) {
+			// if a long analysis did not find the device at all, then we push that it has no brightness
 			constellation_tracked_device_connection_notify_brightness_update(
 			    ct->devices[sample->devices[d].dev_index].connection, 0);
+
+			// update the controller masks for this controller to mark it as not active
+			if (ct->controller_masks_sink) {
+
+				for (int i = 0; i < ct->cam_count; i++) {
+					struct constellation_tracker_camera_state *cam = &ct->cam[i];
+
+					struct xrt_device_masks_sample_camera *sample_camera =
+					    &ct->controller_masks_sample.views[cam->slam_tracking_index];
+
+					struct xrt_device_masks_sample_device *device_mask =
+					    &sample_camera->devices[sample->devices[d].dev_index];
+
+					device_mask->enabled = false;
+				}
+
+				xrt_sink_push_device_masks(ct->controller_masks_sink, &ct->controller_masks_sample);
+			}
 		}
 	}
 }
@@ -1002,7 +1067,8 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
                                struct xrt_device *hmd_xdev,
                                struct t_constellation_camera_group *cams,
                                struct t_constellation_tracker **out_tracker,
-                               struct xrt_frame_sink **out_sink)
+                               struct xrt_frame_sink **out_sink,
+                               struct xrt_device_masks_sink *controller_mask_sink)
 {
 	DRV_TRACE_MARKER();
 
@@ -1013,6 +1079,7 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
 	ct->debug_draw_blob_tint = true;
 	ct->debug_draw_blob_ids = true;
 	ct->hmd_xdev = hmd_xdev;
+	ct->controller_masks_sink = controller_mask_sink;
 
 	// Set up the per-camera constellation tracking pieces config and pose
 	ct->cam_count = cams->cam_count;
@@ -1022,6 +1089,7 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
 
 		cam->roi = cam_cfg->roi;
 		cam->P_imu_cam = cam_cfg->P_imu_cam;
+		cam->slam_tracking_index = cam_cfg->slam_tracking_index;
 
 		/* Init the camera model with size and distortion */
 		cam->camera_model.width = cam_cfg->roi.extent.w;
@@ -1093,7 +1161,8 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
 	u_var_add_bool(ct, &ct->debug_draw_leds, "Debug: Draw LED position markers for found poses");
 	u_var_add_bool(ct, &ct->debug_draw_prior_leds, "Debug: Draw LED markers for prior poses");
 	u_var_add_bool(ct, &ct->debug_draw_last_leds, "Debug: Draw LED markers for last observed poses");
-	u_var_add_bool(ct, &ct->debug_draw_pose_bounds, "Debug: Draw bounds rect for found poses");
+	u_var_add_bool(ct, &ct->debug_draw_pose_bounds, "Debug: Draw LED bounds rect for found poses");
+	u_var_add_bool(ct, &ct->debug_draw_device_bounds, "Debug: Draw device bounds rect for found poses");
 
 	for (int i = 0; i < ct->cam_count; i++) {
 		struct constellation_tracker_camera_state *cam = ct->cam + i;

@@ -19,7 +19,8 @@ void
 t_constellation_led_model_init(uint8_t device_id,
                                struct xrt_pose *P_device_model,
                                struct t_constellation_led_model *led_model,
-                               uint8_t num_leds)
+                               uint8_t num_leds,
+                               uint8_t num_bounding_points)
 {
 	led_model->id = device_id;
 	if (P_device_model != NULL) {
@@ -30,6 +31,8 @@ t_constellation_led_model_init(uint8_t device_id,
 	}
 	led_model->leds = calloc(num_leds, sizeof(struct t_constellation_led));
 	led_model->num_leds = num_leds;
+	led_model->bounding_points = calloc(num_bounding_points, sizeof(struct t_constellation_bounding_point));
+	led_model->num_bounding_points = num_bounding_points;
 }
 
 void

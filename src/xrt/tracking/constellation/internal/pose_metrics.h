@@ -31,6 +31,12 @@ struct pose_rect
 	double bottom;
 };
 
+XRT_MAYBE_UNUSED static bool
+pose_rect_has_area(struct pose_rect *rect)
+{
+	return rect->left != rect->right && rect->top != rect->bottom;
+}
+
 enum pose_match_flags
 {
 	POSE_MATCH_GOOD = 0x1,      /* A reasonable pose match - most LEDs matched to within a few pixels error */
@@ -82,6 +88,14 @@ struct pose_metrics_blob_match_info
 	double reprojection_error;
 	struct pose_rect bounds;
 };
+
+void
+pose_metrics_get_device_bounds(struct xrt_pose *P_cam_obj,
+                               struct t_constellation_led_model *led_model,
+                               struct camera_model *calib,
+                               struct pose_rect *device_bounds,
+                               struct xrt_vec2 *visible_points,
+                               size_t *num_visible_points);
 
 void
 pose_metrics_match_pose_to_blobs(struct xrt_pose *pose,

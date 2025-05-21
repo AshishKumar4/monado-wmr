@@ -614,7 +614,8 @@ rift_s_controller_get_led_model(struct xrt_device *xdev, struct t_constellation_
 	}
 	os_mutex_unlock(&ctrl->mutex);
 
-	t_constellation_led_model_init((int)ctrl->base.device_type, NULL, led_model, ctrl->calibration.num_leds);
+	t_constellation_led_model_init((int)ctrl->base.device_type, NULL, led_model, ctrl->calibration.num_leds,
+	                               0);
 
 	// Note: This LED model is in OpenXR coordinates with
 	// XYZ = Right/Down/Forward. Flip to OpenCV for the constellation tracker

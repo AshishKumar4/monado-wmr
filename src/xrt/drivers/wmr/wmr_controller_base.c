@@ -1052,7 +1052,7 @@ wmr_controller_base_get_led_model(struct xrt_device *xdev, struct t_constellatio
 	}
 	os_mutex_unlock(&wcb->data_lock);
 
-	t_constellation_led_model_init((int)wcb->base.device_type, NULL, led_model, wcb->config.led_count);
+	t_constellation_led_model_init((int)wcb->base.device_type, NULL, led_model, wcb->config.led_count, 8);
 	led_model->check_led_visibility = wmr_controller_base_check_led_visibility;
 
 	// Note: This LED model is in OpenCV/WMR coordinates with
@@ -1063,20 +1063,30 @@ wmr_controller_base_get_led_model(struct xrt_device *xdev, struct t_constellatio
 		led->id = i;
 
 		struct wmr_led_config *wmr_led = &wcb->config.leds[i];
-		// led->pos = (struct xrt_vec3){
-		//     wmr_led->pos.x,
-		//     wmr_led->pos.z,
-		//     -wmr_led->pos.y,
-		// };
-		// led->dir = (struct xrt_vec3){
-		//     wmr_led->norm.x,
-		//     wmr_led->norm.z,
-		//     -wmr_led->norm.y,
-		// };
 		led->pos = wmr_led->pos;
 		led->dir = wmr_led->norm;
 
 		led->radius_mm = 3;
+	}
+
+	const float controller_height = 0.150; // controller is about 150mm high
+	const float bounding_box_back = -(controller_height - (WMR_RING_HEIGHT / 2.0));
+
+	const float base_radius = 0.070 / 2.0; // the width between the the left and right of the controller's face
+
+	struct xrt_vec3 bounding_points[8] = {
+	    {WMR_RING_TOP_RADIUS, WMR_RING_TOP_RADIUS, WMR_RING_HEIGHT / 2},   // +Z, +X, +Y
+	    {-WMR_RING_TOP_RADIUS, WMR_RING_TOP_RADIUS, WMR_RING_HEIGHT / 2},  // +Z, -X, +Y
+	    {WMR_RING_TOP_RADIUS, -WMR_RING_TOP_RADIUS, WMR_RING_HEIGHT / 2},  // +Z, +X, -Y
+	    {-WMR_RING_TOP_RADIUS, -WMR_RING_TOP_RADIUS, WMR_RING_HEIGHT / 2}, // +Z, -X, -Y
+	    {base_radius, base_radius, bounding_box_back},                     // -Z, +X, +Y
+	    {-base_radius, base_radius, bounding_box_back},                    // -Z, -X, +Y
+	    {base_radius, -base_radius, bounding_box_back},                    // -Z, +X, -Y
+	    {-base_radius, -base_radius, bounding_box_back},                   // -Z, -X, -Y
+	};
+
+	for (size_t i = 0; i < ARRAY_SIZE(bounding_points); i++) {
+		led_model->bounding_points[i].pos = bounding_points[i];
 	}
 
 	t_constellation_led_model_dump(led_model, wcb->base.str);

@@ -366,6 +366,27 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 			/* Draw a marker in the top-left of the frame for which devices we found a pose for */
 			draw_rgb_filled_rect(dest, width, out_stride, height, 16 * dev_id, 0, 16, 16, dev_colour);
 
+			if (flags & DEBUG_DRAW_FLAG_DEVICE_BOUNDS) {
+				struct xrt_pose P_cam_obj;
+				math_pose_transform(&view->P_cam_world, &dev_state->final_pose, &P_cam_obj);
+
+				struct xrt_vec2 object_bound_points[MAX_OBJECT_LEDS];
+				size_t num_object_bound_points;
+
+				struct pose_rect device_bounds;
+				pose_metrics_get_device_bounds(&P_cam_obj, dev_state->led_model, calib, &device_bounds,
+				                               object_bound_points, &num_object_bound_points);
+
+				draw_rgb_rect(dest, width, out_stride, height, device_bounds.left, device_bounds.top,
+				              device_bounds.right - device_bounds.left,
+				              device_bounds.bottom - device_bounds.top, dev_colour);
+
+				for (size_t i = 0; i < num_object_bound_points; i++) {
+					draw_rgb_marker(dest, width, out_stride, height, object_bound_points[i].x,
+					                object_bound_points[i].y, 1, 1, dev_colour);
+				}
+			}
+
 			if (flags & (DEBUG_DRAW_FLAG_LEDS | DEBUG_DRAW_FLAG_POSE_BOUNDS)) {
 				struct xrt_pose P_cam_obj;
 				math_pose_transform(&view->P_cam_world, &dev_state->final_pose, &P_cam_obj);

@@ -1486,7 +1486,8 @@ wmr_hmd_fill_constellation_calibration(struct wmr_hmd *wh)
 	                                               .roi = wh->config.tcams[0]->roi,
 	                                               .calibration = wmr_hmd_get_cam_calib(wh, 0),
 	                                               .blob_min_threshold = BLOB_PIXEL_THRESHOLD_WMR,
-	                                               .blob_detect_threshold = BLOB_THRESHOLD_MIN_WMR};
+	                                               .blob_detect_threshold = BLOB_THRESHOLD_MIN_WMR,
+	                                               .slam_tracking_index = 0};
 
 	// Fill remaining cameras
 	for (int i = 1; i < wh->config.tcam_count; i++) {
@@ -1509,7 +1510,8 @@ wmr_hmd_fill_constellation_calibration(struct wmr_hmd *wh)
 		                                               .roi = wh->config.tcams[i]->roi,
 		                                               .calibration = wmr_hmd_get_cam_calib(wh, i),
 		                                               .blob_min_threshold = BLOB_PIXEL_THRESHOLD_WMR,
-		                                               .blob_detect_threshold = BLOB_THRESHOLD_MIN_WMR};
+		                                               .blob_detect_threshold = BLOB_THRESHOLD_MIN_WMR,
+		                                               .slam_tracking_index = i};
 	}
 }
 
@@ -2038,17 +2040,6 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 	// Compute the slam calibration for SLAM or controller tracking
 	wmr_hmd_fill_slam_calibration(wh);
 
-	// Set up controller 6dof tracker
-	wmr_hmd_fill_constellation_calibration(wh);
-	struct xrt_frame_sink *out_controller_sink = NULL;
-	if (t_constellation_tracker_create(&wh->tracking.xfctx, &wh->base, &wh->tracking.constellation_calib,
-	                                   &wh->controller_tracker, &out_controller_sink) != 0) {
-		WMR_WARN(wh, "Failed to create Controller Tracker. Controllers will not be 6dof");
-	}
-
-	// Switch on data streams on the HMD (only cameras for now as IMU is not yet integrated into wmr_source)
-	wh->tracking.source = wmr_source_create(&wh->tracking.xfctx, dev_holo, wh->config, out_controller_sink);
-
 	struct xrt_slam_sinks sinks = {0};
 	struct xrt_device *hand_device = NULL;
 	bool success = wmr_hmd_setup_trackers(wh, &sinks, &hand_device);
@@ -2057,6 +2048,18 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 		wh = NULL;
 		return;
 	}
+
+	// Set up controller 6dof tracker
+	wmr_hmd_fill_constellation_calibration(wh);
+	struct xrt_frame_sink *out_controller_sink = NULL;
+	if (t_constellation_tracker_create(&wh->tracking.xfctx, &wh->base, &wh->tracking.constellation_calib,
+	                                   &wh->controller_tracker, &out_controller_sink,
+	                                   sinks.controller_masks) != 0) {
+		WMR_WARN(wh, "Failed to create Controller Tracker. Controllers will not be 6dof");
+	}
+
+	// Switch on data streams on the HMD (only cameras for now as IMU is not yet integrated into wmr_source)
+	wh->tracking.source = wmr_source_create(&wh->tracking.xfctx, dev_holo, wh->config, out_controller_sink);
 
 	// Stream data source into sinks (if populated)
 	bool stream_started = xrt_fs_slam_stream_start(wh->tracking.source, &sinks);
