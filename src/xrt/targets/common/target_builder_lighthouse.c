@@ -201,7 +201,7 @@ valve_index_hand_track(struct lighthouse_system *lhs,
                        struct xrt_frame_context *xfctx,
                        struct xrt_pose head_in_left_cam,
                        struct t_stereo_camera_calibration *stereo_calib,
-                       struct xrt_hand_masks_sink *masks_sink,
+                       struct xrt_device_masks_sink *masks_sink,
                        struct xrt_slam_sinks **out_sinks,
                        struct xrt_device **out_devices)
 {
@@ -385,7 +385,7 @@ valve_index_setup_visual_trackers(struct lighthouse_system *lhs,
 	// Initialize hand tracker
 	struct xrt_slam_sinks *hand_sinks = NULL;
 	struct xrt_device *hand_devices[2] = {NULL};
-	struct xrt_hand_masks_sink *masks_sink = slam_sinks ? slam_sinks->hand_masks : NULL;
+	struct xrt_device_masks_sink *masks_sink = slam_sinks ? slam_sinks->hand_masks : NULL;
 	if (hand_enabled) {
 		bool success = valve_index_hand_track( //
 		    lhs,                               //

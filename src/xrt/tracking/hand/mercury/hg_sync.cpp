@@ -511,7 +511,7 @@ void
 predict_new_regions_of_interest(struct HandTracking *hgt)
 {
 
-	xrt_hand_masks_sample masks{}; // Zero initialization
+	xrt_device_masks_sample masks{}; // Zero initialization
 
 	for (int hand_idx = 0; hand_idx < 2; hand_idx++) {
 		// If we don't have the past two frames, this code doesn't do what we want.
@@ -563,9 +563,7 @@ predict_new_regions_of_interest(struct HandTracking *hgt)
 		for (int view_idx = 0; view_idx < 2; view_idx++) {
 			hand_region_of_interest &hroi = hgt->views[view_idx].regions_of_interest_this_frame[hand_idx];
 			auto &masks_view = masks.views[view_idx];
-			auto &masks_hand = masks_view.hands[hand_idx];
-
-			masks_view.enabled = true;
+			auto &masks_device = masks_view.devices[hand_idx];
 
 			if (num_outside[view_idx] < hgt->tuneable_values.max_num_outside_view) {
 				hroi.provenance = ROIProvenance::POSE_PREDICTION;
@@ -574,17 +572,17 @@ predict_new_regions_of_interest(struct HandTracking *hgt)
 				const float SCALER = 1.25f;
 				float s = hroi.size_px * SCALER;
 				xrt_vec2 &c = hroi.center_px;
-				masks_hand.rect = xrt_rect_f32{c.x - s / 2, c.y - s / 2, s, s};
-				masks_hand.enabled = true;
+				masks_device.rect = xrt_rect_f32{c.x - s / 2, c.y - s / 2, s, s};
+				masks_device.enabled = true;
 			} else {
 				hroi.found = false;
-				masks_hand.enabled = false;
+				masks_device.enabled = false;
 			}
 		}
 	}
 
 	if (hgt->hand_masks_sink != NULL) {
-		xrt_sink_push_hand_masks(hgt->hand_masks_sink, &masks);
+		xrt_sink_push_device_masks(hgt->hand_masks_sink, &masks);
 	}
 }
 
