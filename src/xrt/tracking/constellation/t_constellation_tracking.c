@@ -351,7 +351,7 @@ submit_device_pose(struct t_constellation_tracker *ct,
 		         refine_pose.orientation.x, refine_pose.orientation.y, refine_pose.orientation.z,
 		         refine_pose.orientation.w, refine_pose.position.x, refine_pose.position.y,
 		         refine_pose.position.z);
-		// *P_cam_obj = refine_pose;
+		*P_cam_obj = refine_pose;
 	}
 
 	os_mutex_lock(&cam->bw_lock);
