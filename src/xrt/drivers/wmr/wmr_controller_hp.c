@@ -125,6 +125,10 @@ static const struct xrt_pose P_HP_G2_left_aim_grip = {
 static const struct xrt_pose P_HP_G2_right_aim_grip = {
     .orientation = {.x = 0.300705, .y = 0.000000, .z = 0.000000, .w = 0.953717},
     .position = {.x = -0.000683, .y = -0.015332, .z = 0.068270}};
+static const struct xrt_pose P_HP_G2_left_aim = {.orientation = {.x = 0.0, .y = 0.0, .z = 0.0, .w = 1.0},
+                                                 .position = {.x = 0.0, .y = 0.0, .z = 0.0}};
+static const struct xrt_pose P_HP_G2_right_aim = {.orientation = {.x = 0.0, .y = 0.0, .z = 0.0, .w = 1.0},
+                                                  .position = {.x = 0.0, .y = 0.0, .z = 0.0}};
 
 /* OG WMR Controller inputs struct */
 struct wmr_controller_hp_input
@@ -362,9 +366,11 @@ wmr_controller_hp_create(struct wmr_controller_connection *conn,
 	if (controller_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
 		snprintf(wcb->base.str, ARRAY_SIZE(wcb->base.str), "HP Reverb G2 Left Controller");
 		wcb->P_aim_grip = P_HP_G2_left_aim_grip;
+		wcb->P_aim = P_HP_G2_left_aim;
 	} else {
 		snprintf(wcb->base.str, ARRAY_SIZE(wcb->base.str), "HP Reverb G2 Right Controller");
 		wcb->P_aim_grip = P_HP_G2_right_aim_grip;
+		wcb->P_aim = P_HP_G2_right_aim;
 	}
 
 	SET_INPUT(wcb, MENU_CLICK, MENU_CLICK);

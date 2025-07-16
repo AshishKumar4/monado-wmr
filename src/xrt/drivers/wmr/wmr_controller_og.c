@@ -173,17 +173,25 @@ static struct xrt_binding_profile binding_profiles_odyssey[3] = {
 };
 
 static const struct xrt_pose P_OG_left_aim_grip = {
-    .orientation = {.x = 0.293578, .y = 0.065085, .z = -0.000000, .w = 0.953718},
-    .position = {.x = 0.015191, .y = -0.068779, .z = -0.052497}};
+    .orientation = {.x = 0.300706, .y = 0.0, .z = -0.000000, .w = 0.953717},
+    .position = {.x = -0.0, .y = -0.026310, .z = 0.078693}};
 static const struct xrt_pose P_OG_right_aim_grip = {
-    .orientation = {.x = 0.293578, .y = -0.065085, .z = 0.000000, .w = 0.953718},
-    .position = {.x = -0.015191, .y = -0.068779, .z = -0.052497}};
+    .orientation = {.x = 0.300706, .y = 0.0, .z = -0.000000, .w = 0.953717},
+    .position = {.x = 0.0, .y = -0.026310, .z = 0.078693}};
+static const struct xrt_pose P_OG_left_aim = {.orientation = {.x = 0.0, .y = 0.108867, .z = -0.000000, .w = 0.994056},
+                                              .position = {.x = -0.014322, .y = 0.018838, .z = 0.0}};
+static const struct xrt_pose P_OG_right_aim = {.orientation = {.x = 0.0, .y = -0.108867, .z = -0.000000, .w = 0.994056},
+                                               .position = {.x = 0.014322, .y = 0.018838, .z = 0.0}};
 static const struct xrt_pose P_odyssey_left_aim_grip = {
     .orientation = {.x = 0.270273, .y = 0.131820, .z = -0.000006, .w = 0.953719},
     .position = {.x = 0.032802, .y = -0.067479, .z = -0.051951}};
 static const struct xrt_pose P_odyssey_right_aim_grip = {
     .orientation = {.x = 0.270273, .y = -0.131820, .z = 0.000006, .w = 0.953719},
     .position = {.x = -0.032802, .y = -0.067479, .z = -0.051951}};
+static const struct xrt_pose P_odyssey_left_aim = {.orientation = {.x = 0.0, .y = 0.0, .z = 0.0, .w = 1.0},
+                                                   .position = {.x = 0.0, .y = 0.0, .z = 0.0}};
+static const struct xrt_pose P_odyssey_right_aim = {.orientation = {.x = 0.0, .y = 0.0, .z = 0.0, .w = 1.0},
+                                                    .position = {.x = 0.0, .y = 0.0, .z = 0.0}};
 
 /* OG WMR Controller inputs struct */
 struct wmr_controller_og_input
@@ -424,15 +432,19 @@ wmr_controller_og_create(struct wmr_controller_connection *conn,
 	if (pid == ODYSSEY_CONTROLLER_PID) {
 		wcb->base.name = XRT_DEVICE_SAMSUNG_ODYSSEY_CONTROLLER;
 		if (controller_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
+			wcb->P_aim = P_odyssey_left_aim;
 			wcb->P_aim_grip = P_odyssey_left_aim_grip;
 		} else {
+			wcb->P_aim = P_odyssey_right_aim;
 			wcb->P_aim_grip = P_odyssey_right_aim_grip;
 		}
 	} else {
 		wcb->base.name = XRT_DEVICE_WMR_CONTROLLER;
 		if (controller_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
+			wcb->P_aim = P_OG_left_aim;
 			wcb->P_aim_grip = P_OG_left_aim_grip;
 		} else {
+			wcb->P_aim = P_OG_right_aim;
 			wcb->P_aim_grip = P_OG_right_aim_grip;
 		}
 	}

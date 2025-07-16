@@ -530,6 +530,7 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 
 	struct xrt_relation_chain xrc = {0};
 
+	m_relation_chain_push_pose(&xrc, &wcb->P_aim);
 	if (name == XRT_INPUT_G2_CONTROLLER_GRIP_POSE || name == XRT_INPUT_ODYSSEY_CONTROLLER_GRIP_POSE ||
 	    name == XRT_INPUT_WMR_GRIP_POSE) {
 		m_relation_chain_push_pose(&xrc, &wcb->P_aim_grip);
@@ -668,6 +669,11 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	math_quat_from_angle_vector(DEG_TO_RAD(35), &axis, &wcb->P_aim_grip.orientation);
 	wcb->P_aim_grip.position = translation;
 
+	struct xrt_vec3 aim_translation = {-0.014322, 0.018838, 0};
+	wcb->P_aim.position = aim_translation;
+	struct xrt_vec3 aim_axis = {0.0, 1.0, 0};
+	math_quat_from_angle_vector(DEG_TO_RAD(12.5), &aim_axis, &wcb->P_aim.orientation);
+
 	wcb->thumbstick_deadzone = 0.15;
 
 	m_imu_3dof_init(&wcb->fusion, M_IMU_3DOF_USE_GRAVITY_DUR_20MS);
@@ -759,6 +765,7 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	u_var_add_ro_u64(wcb, &wcb->last_timesync_device_timestamp_ns, "Last device timesync TS");
 
 	u_var_add_gui_header(wcb, NULL, "Misc");
+	u_var_add_pose(wcb, &wcb->P_aim, "Aim pose offset");
 	u_var_add_pose(wcb, &wcb->P_aim_grip, "Grip pose offset");
 	u_var_add_ro_u64(wcb, &wcb->next_keepalive_timestamp_ns, "Next keepalive TS");
 

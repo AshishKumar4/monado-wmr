@@ -136,7 +136,10 @@ struct wmr_controller_base
 	bool have_config;
 	struct wmr_controller_config config;
 
-	//! Offset for grip pose (set by subclasses. adjustable in debug)
+	//! Offset for aim pose (set by subclasses. adjustable in debug)
+	struct xrt_pose P_aim;
+
+	//! Offset for grip pose relative to aim (set by subclasses. adjustable in debug)
 	struct xrt_pose P_aim_grip;
 
 	//! Thumbstick deadzone setting. Applied / used by subclasses
