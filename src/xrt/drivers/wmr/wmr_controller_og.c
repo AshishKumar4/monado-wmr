@@ -183,15 +183,17 @@ static const struct xrt_pose P_OG_left_aim = {.orientation = {.x = 0.0, .y = 0.1
 static const struct xrt_pose P_OG_right_aim = {.orientation = {.x = 0.0, .y = -0.108867, .z = -0.000000, .w = 0.994056},
                                                .position = {.x = 0.014322, .y = 0.018838, .z = 0.0}};
 static const struct xrt_pose P_odyssey_left_aim_grip = {
-    .orientation = {.x = 0.270273, .y = 0.131820, .z = -0.000006, .w = 0.953719},
-    .position = {.x = 0.032802, .y = -0.067479, .z = -0.051951}};
+    .orientation = {.x = 0.300706, .y = 0.0, .z = -0.000000, .w = 0.953717},
+    .position = {.x = 0.0, .y = -0.079738, .z = -0.035449}};
 static const struct xrt_pose P_odyssey_right_aim_grip = {
-    .orientation = {.x = 0.270273, .y = -0.131820, .z = 0.000006, .w = 0.953719},
-    .position = {.x = -0.032802, .y = -0.067479, .z = -0.051951}};
-static const struct xrt_pose P_odyssey_left_aim = {.orientation = {.x = 0.0, .y = 0.0, .z = 0.0, .w = 1.0},
-                                                   .position = {.x = 0.0, .y = 0.0, .z = 0.0}};
-static const struct xrt_pose P_odyssey_right_aim = {.orientation = {.x = 0.0, .y = 0.0, .z = 0.0, .w = 1.0},
-                                                    .position = {.x = 0.0, .y = 0.0, .z = 0.0}};
+    .orientation = {.x = 0.300706, .y = 0.0, .z = -0.000000, .w = 0.953717},
+    .position = {.x = 0.0, .y = -0.079738, .z = -0.035449}};
+static const struct xrt_pose P_odyssey_left_aim = {
+    .orientation = {.x = -0.076448, .y = -0.017649, .z = 0.224258, .w = 0.971366},
+    .position = {.x = -0.020508, .y = 0.018774, .z = 0.0}};
+static const struct xrt_pose P_odyssey_right_aim = {
+    .orientation = {.x = -0.076448, .y = 0.017649, .z = -0.224258, .w = 0.971366},
+    .position = {.x = 0.020508, .y = 0.018774, .z = 0.0}};
 
 /* OG WMR Controller inputs struct */
 struct wmr_controller_og_input
