@@ -35,7 +35,7 @@ enum wmr_distortion_model
 	WMR_DISTORTION_MODEL_POLYNOMIAL_6KT,
 };
 
-/* Location is used as camera_id for setting gain */
+/* Location is used as camera_id for setting SLAM gain, and id+2 for controller gain */
 enum wmr_camera_location
 {
 	WMR_CAMERA_LOCATION_HT0 = 0,

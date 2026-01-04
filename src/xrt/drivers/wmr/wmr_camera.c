@@ -39,6 +39,8 @@ DEBUG_GET_ONCE_BOOL_OPTION(wmr_unify_expgain, "WMR_UNIFY_EXPGAIN", false)
 
 static int
 update_expgain(struct wmr_camera *cam, struct xrt_frame **frames);
+static int
+wmr_camera_set_ctrl_exposure_gain(struct wmr_camera *cam, uint8_t camera_id, uint16_t exposure, uint8_t gain);
 
 /*
  *
@@ -60,8 +62,10 @@ update_expgain(struct wmr_camera *cam, struct xrt_frame **frames);
 #define WMR_CAMERA_CMD_ON 0x81
 #define WMR_CAMERA_CMD_OFF 0x82
 
-#define DEFAULT_EXPOSURE 6000
-#define DEFAULT_GAIN 127
+#define DEFAULT_SLAM_EXPOSURE 6000
+#define DEFAULT_SLAM_GAIN 127
+#define DEFAULT_CTRL_EXPOSURE 0x0190
+#define DEFAULT_CTRL_GAIN 0x0001
 
 #define WMR_FRAMETYPE_SLAM 0x0
 #define WMR_FRAMETYPE_CONTROLLER 0x2
@@ -517,15 +521,27 @@ wmr_camera_open(struct wmr_camera_open_config *config)
 	for (int i = 0; i < cam->tcam_count; i++) {
 		struct wmr_camera_expgain *ceg = &cam->ceg[i];
 		ceg->manual_control = false;
-		ceg->last_exposure = DEFAULT_EXPOSURE;
-		ceg->exposure = DEFAULT_EXPOSURE;
-		ceg->last_gain = DEFAULT_GAIN;
-		ceg->gain = DEFAULT_GAIN;
+		ceg->last_exposure = DEFAULT_SLAM_EXPOSURE;
+		ceg->exposure = DEFAULT_SLAM_EXPOSURE;
+		ceg->last_gain = DEFAULT_SLAM_GAIN;
+		ceg->gain = DEFAULT_SLAM_GAIN;
 		ceg->exposure_ui.val = &ceg->exposure;
 		ceg->exposure_ui.max = WMR_MAX_EXPOSURE;
 		ceg->exposure_ui.min = WMR_MIN_EXPOSURE;
 		ceg->exposure_ui.step = 25;
 		ceg->aeg = u_autoexpgain_create(U_AEG_STRATEGY_TRACKING, enable_aeg, frame_delay);
+	}
+
+	// Set exposure & gain for controller tracking
+	for (int i = cam->tcam_count; i < cam->tcam_count; i++) {
+		const struct wmr_camera_config *config = &cam->tcam_confs[i];
+
+		bool status =
+		    wmr_camera_set_ctrl_exposure_gain(cam, config->location, DEFAULT_CTRL_EXPOSURE, DEFAULT_CTRL_GAIN);
+		if (status != 0) {
+			WMR_CAM_ERROR(cam,
+			              "Failed to set exposure and gain for controller tracking frames on camera %d", i);
+		}
 	}
 
 	u_sink_debug_init(&cam->debug_sinks[WMR_DEBUG_SINK_SLAM]);
@@ -760,4 +776,10 @@ wmr_camera_set_exposure_gain(struct wmr_camera *cam, uint8_t camera_id, uint16_t
 	};
 
 	return send_buffer_to_device(cam, (uint8_t *)&cmd, sizeof(cmd));
+}
+
+static int
+wmr_camera_set_ctrl_exposure_gain(struct wmr_camera *cam, uint8_t camera_id, uint16_t exposure, uint8_t gain)
+{
+	return wmr_camera_set_exposure_gain(cam, camera_id + 2, exposure, gain);
 }
