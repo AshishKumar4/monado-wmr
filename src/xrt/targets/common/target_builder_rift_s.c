@@ -208,6 +208,10 @@ rift_s_open_system_impl(struct xrt_builder *xb,
 	}
 #endif
 
+	// Drop system reference now. It'll be cleaned up when the
+	// devices are
+	rift_s_system_reference(&sys, NULL);
+
 	// Assign to role(s).
 	ubrh->head = hmd_xdev;
 	ubrh->left = left_xdev;

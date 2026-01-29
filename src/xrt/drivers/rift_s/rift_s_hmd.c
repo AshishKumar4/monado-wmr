@@ -180,6 +180,11 @@ rift_s_hmd_destroy(struct xrt_device *xdev)
 
 	DRV_TRACE_MARKER();
 
+	RIFT_S_DEBUG("Destroying HMD");
+
+	/* Tell the tracker there will be no more IMU */
+	rift_s_tracker_imu_finish(hmd->tracker);
+
 	/* Remove this device from the system */
 	rift_s_system_remove_hmd(hmd->sys);
 

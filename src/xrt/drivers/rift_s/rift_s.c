@@ -256,6 +256,10 @@ cleanup:
 static void
 rift_s_system_free(struct rift_s_system *sys)
 {
+	DRV_TRACE_MARKER();
+
+	RIFT_S_DEBUG("Freeing Rift S system");
+
 	/* Stop the packet reading thread */
 	os_thread_helper_destroy(&sys->oth);
 

@@ -818,3 +818,14 @@ rift_s_tracker_start(struct rift_s_tracker *t)
 	t->ready_for_data = true;
 	os_mutex_unlock(&t->mutex);
 }
+
+void
+rift_s_tracker_imu_finish(struct rift_s_tracker *t)
+{
+	os_mutex_lock(&t->mutex);
+	/* Clearing the hw2mono clock disabled sending camera frames, preventing deadlocks on shutdown
+	 * if the IMU data stops before camera frames do */
+	t->have_hw2mono = false;
+	t->valid_clock_observations = 0;
+	os_mutex_unlock(&t->mutex);
+}

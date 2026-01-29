@@ -581,6 +581,10 @@ rift_s_controller_destroy(struct xrt_device *xdev)
 {
 	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
 
+	DRV_TRACE_MARKER();
+
+	RIFT_S_DEBUG("Destroying %s controller", ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "left" : "right");
+
 	// Tell the tracker that we're going away
 	if (ctrl->tracking_connection) {
 		t_constellation_tracked_device_connection_disconnect(ctrl->tracking_connection);

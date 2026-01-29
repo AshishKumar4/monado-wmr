@@ -159,6 +159,9 @@ rift_s_tracker_imu_update(struct rift_s_tracker *t,
                           const struct xrt_vec3 *gyro);
 
 void
+rift_s_tracker_imu_finish(struct rift_s_tracker *t);
+
+void
 rift_s_tracker_push_slam_frames(struct rift_s_tracker *t,
                                 uint64_t frame_ts_ns,
                                 struct xrt_frame *frames[RIFT_S_CAMERA_COUNT]);
