@@ -756,6 +756,7 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	u_var_add_pose(wcb, &wcb->last_tracked_pose, "Last observed pose");
 	u_var_add_ro_i64(wcb, &wcb->last_tracked_pose_ts, "Last observed pose TS");
 	u_var_add_bool(wcb, &wcb->update_yaw_from_optical, "Update yaw using tracking");
+	u_var_add_ro_u16(wcb, &wcb->last_brightness_report, "Last observed average LED brightness");
 
 	u_var_add_gui_header(wcb, NULL, "LED Sync");
 	u_var_add_draggable_u16(wcb, &wcb->timesync_led_intensity_uvar, "LED intensity");
@@ -1106,6 +1107,8 @@ wmr_controller_base_push_brightness_update(struct xrt_device *xdev, uint8_t aver
 {
 	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
 	os_mutex_lock(&wcb->data_lock);
+
+	wcb->last_brightness_report = average_brightness;
 
 	if (average_brightness > 70) {
 		wcb->timesync_led_intensity -= MIN(wcb->timesync_led_intensity, 3);

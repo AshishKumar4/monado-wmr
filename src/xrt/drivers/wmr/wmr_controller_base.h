@@ -169,6 +169,8 @@ struct wmr_controller_base
 	timepoint_ns last_tracked_pose_ts;
 	//! Last tracked pose from optical controller tracking
 	struct xrt_pose last_tracked_pose;
+	//! Last LED brightness report from optical controller tracking
+	uint16_t last_brightness_report;
 	//! debug boolean - enable yaw updates
 	bool update_yaw_from_optical;
 
