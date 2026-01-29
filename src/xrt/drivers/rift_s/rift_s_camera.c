@@ -54,6 +54,8 @@ struct rift_s_camera
 
 	struct rift_s_camera_calibration_block *camera_calibration;
 
+	uint64_t last_frame_ts_ns;
+
 	struct xrt_frame_sink in_sink; // Receive raw frames and split them
 
 	struct u_sink_debug debug_sinks[2];
@@ -387,6 +389,10 @@ receive_cam_frame(struct xrt_frame_sink *sink, struct xrt_frame *xf)
 
 	// rift_s_hexdump_buffer("Row data", row_data.raw, sizeof(row_data.row));
 	uint64_t frame_ts_ns = (uint64_t)__le64_to_cpu(row_data.data.frame_ts) * OS_NS_PER_USEC;
+	if (frame_ts_ns == cam->last_frame_ts_ns) {
+		RIFT_S_WARN("Camera frame TS didn't advance. Probably the headset crashed");
+		return;
+	}
 
 	// If the top left pixel is > 128, send as SLAM frame else controller
 	if (row_data.data.frame_type & 0x80) {

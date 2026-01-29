@@ -403,7 +403,7 @@ static void
 ctrl_json_cb(bool success, uint8_t *response_bytes, int response_bytes_len, struct rift_s_controller *ctrl)
 {
 	if (!success) {
-		RIFT_S_LOG("Failed to read controller calibration block");
+		RIFT_S_DEBUG("Failed to read controller calibration block");
 		return;
 	}
 
