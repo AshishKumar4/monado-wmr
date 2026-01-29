@@ -351,11 +351,12 @@ rift_s_controller_handle_report(struct rift_s_controller *ctrl,
 static void
 ctrl_config_cb(bool success, uint8_t *response_bytes, int response_bytes_len, struct rift_s_controller *ctrl)
 {
-	ctrl->reading_config = false;
 	if (!success) {
 		RIFT_S_WARN("Failed to read controller config");
 		return;
 	}
+
+	ctrl->reading_config = false;
 
 	if (response_bytes_len < 5) {
 		RIFT_S_WARN("Failed to read controller config - short result");
@@ -401,14 +402,13 @@ ctrl_config_cb(bool success, uint8_t *response_bytes, int response_bytes_len, st
 static void
 ctrl_json_cb(bool success, uint8_t *response_bytes, int response_bytes_len, struct rift_s_controller *ctrl)
 {
-	os_mutex_lock(&ctrl->mutex);
-	ctrl->reading_calibration = false;
-
 	if (!success) {
-		os_mutex_unlock(&ctrl->mutex);
-		RIFT_S_WARN("Failed to read controller calibration block");
+		RIFT_S_LOG("Failed to read controller calibration block");
 		return;
 	}
+
+	os_mutex_lock(&ctrl->mutex);
+	ctrl->reading_calibration = false;
 
 	RIFT_S_TRACE("Got Controller calibration:\n%s", response_bytes);
 
