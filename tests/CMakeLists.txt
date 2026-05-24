@@ -93,6 +93,14 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 				Threads::Threads ${OpenCV_LIBRARIES})
 	target_include_directories(offline_vio_replay PRIVATE ${OpenCV_INCLUDE_DIRS})
 	set_target_properties(offline_vio_replay PROPERTIES FOLDER monado_tests)
+
+	# Inertial coast-drift experiment: real ESKF on recorded IMU + optical, with withheld-optical
+	# windows, to measure out-of-view dead-reckon drift (a tool, not a ctest).
+	add_executable(eskf_coast_experiment eskf_coast_experiment.cpp)
+	target_link_libraries(
+		eskf_coast_experiment PRIVATE aux_math aux_tracking xrt-interfaces Threads::Threads
+									  ${OpenCV_LIBRARIES})
+	set_target_properties(eskf_coast_experiment PROPERTIES FOLDER monado_tests)
 endif()
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
