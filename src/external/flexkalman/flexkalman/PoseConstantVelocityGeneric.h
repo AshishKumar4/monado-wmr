@@ -77,7 +77,7 @@ class PoseConstantVelocityGenericProcessModel
     void predictStateOnly(State &s, double dt) const {
         FLEXKALMAN_DEBUG_OUTPUT("Time change", dt);
         // using argument-dependent lookup
-        applyVelocity(s, dt);
+        applyAcceleration(s, dt);
     }
     //! Updates state vector and error covariance
     void predictState(State &s, double dt) const {
@@ -95,12 +95,20 @@ class PoseConstantVelocityGenericProcessModel
      * enhancements in some algorithms.
      */
     StateSquareMatrix getSampledProcessNoiseCovariance(double dt) const {
+        /*!
+         * Allow state classes with constant-velocity or constant-
+         * acceleration (12- or 15- element states).
+         * */
         constexpr auto dim = getDimension<State>();
+        static_assert(dim == 12 || dim == 15,
+                      "State doesn't have the right size?");
+
         StateSquareMatrix cov = StateSquareMatrix::Zero();
         auto dt3 = (dt * dt * dt) / 3;
         auto dt2 = (dt * dt) / 2;
-        for (std::size_t xIndex = 0; xIndex < dim / 2; ++xIndex) {
-            auto xDotIndex = xIndex + dim / 2;
+        constexpr auto LEN = 6;
+        for (std::size_t xIndex = 0; xIndex < LEN; ++xIndex) {
+            auto xDotIndex = xIndex + LEN;
             // xIndex is 'i' and xDotIndex is 'j' in eq. 4.8
             const auto mu = getMu(xIndex);
             cov(xIndex, xIndex) = mu * dt3;
@@ -108,6 +116,22 @@ class PoseConstantVelocityGenericProcessModel
             cov(xIndex, xDotIndex) = symmetric;
             cov(xDotIndex, xIndex) = symmetric;
             cov(xDotIndex, xDotIndex) = mu * dt;
+        }
+
+        //! Add section for acceleration's effect on velocity (Not sure
+        //! if this is right at all.)
+        if (dim == 15) {
+            for (size_t i = 0; i < 3; ++i) {
+                const auto xDotIndex = 6 + i;
+                const auto xDotDotIndex = 12 + i;
+
+                const auto mu = getMu(i);
+                const auto symmetric = mu * dt;
+
+                cov(xDotIndex, xDotDotIndex) = symmetric;
+                cov(xDotDotIndex, xDotIndex) = symmetric;
+                cov(xDotDotIndex, xDotDotIndex) = mu;
+            }
         }
         return cov;
     }

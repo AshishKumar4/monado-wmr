@@ -46,7 +46,7 @@
 namespace flexkalman {
 
 namespace pose_externalized_rotation {
-    constexpr size_t Dimension = 12;
+    constexpr size_t Dimension = 15;
     using StateVector = types::Vector<Dimension>;
     using StateVectorBlock3 = StateVector::FixedSegmentReturnType<3>::Type;
     using ConstStateVectorBlock3 =
@@ -66,6 +66,10 @@ namespace pose_externalized_rotation {
         // end
         StateSquareMatrix A = StateSquareMatrix::Identity();
         A.topRightCorner<6, 6>() = types::SquareMatrix<6>::Identity() * dt;
+        //! These might not be right
+        A.block<3, 3>(6, 12) = types::SquareMatrix<3>::Identity() * dt;
+        A.block<3, 3>(0, 12) =
+            types::SquareMatrix<3>::Identity() * dt * dt / 2.0;
 
         return A;
     }
@@ -81,7 +85,7 @@ namespace pose_externalized_rotation {
       public:
         EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
-        static constexpr size_t Dimension = 12;
+        static constexpr size_t Dimension = 15;
         using StateVector = types::Vector<Dimension>;
         using StateSquareMatrix = types::SquareMatrix<Dimension>;
 
@@ -142,11 +146,21 @@ namespace pose_externalized_rotation {
             return m_state.segment<3>(9);
         }
 
-        //! Linear and angular velocities
-        StateVectorBlock6 velocities() { return m_state.tail<6>(); }
+        //! Acceleration
+        StateVectorBlock3 acceleration() { return m_state.tail<3>(); }
+
+        //! Acceleration
+        ConstStateVectorBlock3 acceleration() const {
+            return m_state.tail<3>();
+        }
 
         //! Linear and angular velocities
-        ConstStateVectorBlock6 velocities() const { return m_state.tail<6>(); }
+        StateVectorBlock6 velocities() { return m_state.segment<6>(6); }
+
+        //! Linear and angular velocities
+        ConstStateVectorBlock6 velocities() const {
+            return m_state.segment<6>(6);
+        }
 
         Eigen::Quaterniond const &getQuaternion() const {
             return m_orientation;
@@ -208,6 +222,11 @@ namespace pose_externalized_rotation {
         state.incrementalOrientation() += state.angularVelocity() * dt;
     }
 
+    inline void applyAcceleration(State &state, double dt) {
+        state.velocity() += state.acceleration() * dt;
+        applyVelocity(state, dt);
+    }
+
     //! Dampen all 6 components of velocity by a single factor.
     inline void dampenVelocities(State &state, double damping, double dt) {
         auto attenuation = computeAttenuation(damping, dt);
@@ -236,7 +255,7 @@ namespace pose_externalized_rotation {
                                              double damping) {
         // eq. 4.5 in Welch 1996
         auto A = stateTransitionMatrix(state, dt);
-        A.bottomRightCorner<6, 6>() *= computeAttenuation(damping, dt);
+        A.block<6, 6>(6, 6) *= computeAttenuation(damping, dt);
         return A;
     }
 
@@ -251,7 +270,7 @@ namespace pose_externalized_rotation {
         // eq. 4.5 in Welch 1996
         auto A = stateTransitionMatrix(state, dt);
         A.block<3, 3>(6, 6) *= computeAttenuation(posDamping, dt);
-        A.bottomRightCorner<3, 3>() *= computeAttenuation(oriDamping, dt);
+        A.block<3, 3>(9, 9) *= computeAttenuation(oriDamping, dt);
         return A;
     }
 } // namespace pose_externalized_rotation

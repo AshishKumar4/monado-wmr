@@ -489,12 +489,12 @@ t_convert_in_place_h8s8v8_to_r8g8b8(uint32_t width, uint32_t height, size_t stri
 
 #define T_HSV_DEFAULT_PARAMS()                                                                                         \
 	{                                                                                                              \
-		{                                                                                                      \
-		    {165, 30, 160, 100},                                                                               \
-		    {135, 30, 160, 100},                                                                               \
-		    {95, 30, 160, 100},                                                                                \
-		},                                                                                                     \
-		    {128, 80},                                                                                         \
+	    {                                                                                                          \
+	        {165, 30, 160, 100},                                                                                   \
+	        {135, 30, 160, 100},                                                                                   \
+	        {95, 30, 160, 100},                                                                                    \
+	    },                                                                                                         \
+	    {128, 80},                                                                                                 \
 	}
 
 struct t_hsv_filter_color
