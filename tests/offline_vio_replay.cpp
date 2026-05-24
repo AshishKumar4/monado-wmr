@@ -23,14 +23,23 @@
 #include <filesystem>
 #include <fstream>
 
+#include <chrono>
+#include <mutex>
+#include <thread>
+
 #include <cjson/cJSON.h>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 
 #include "xrt/xrt_defines.h"
+#include "xrt/xrt_device.h"
+#include "xrt/xrt_frame.h"
 #include "xrt/xrt_tracking.h"
+#include "math/m_api.h"
+#include "util/u_frame.h"
 #include "tracking/t_constellation_tracking.h"
 #include "tracking/t_led_models.h"
+#include "tracking/t_tracker_kalman_fusion_c.h"
 
 namespace {
 
@@ -260,6 +269,187 @@ load_imu(const std::string &telemetry_dir, int device_id)
 	return out;
 }
 
+// ---- recorded head pose (gt) for the fake HMD: places the cameras in the gravity-aligned world ----
+
+struct HeadPose
+{
+	int64_t t_ns;
+	struct xrt_pose pose;
+};
+
+std::vector<HeadPose>
+load_gt(const std::string &mav0)
+{
+	std::vector<HeadPose> v;
+	std::ifstream csv(mav0 + "/gt/data.csv");
+	std::string line;
+	std::getline(csv, line); // header: t, px,py,pz, qw,qx,qy,qz
+	while (std::getline(csv, line)) {
+		long long t = 0;
+		double px, py, pz, qw, qx, qy, qz;
+		if (sscanf(line.c_str(), "%lld,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &t, &px, &py, &pz, &qw, &qx, &qy,
+		           &qz) == 8) {
+			HeadPose h{};
+			h.t_ns = t;
+			h.pose.position = {(float)px, (float)py, (float)pz};
+			h.pose.orientation = {(float)qx, (float)qy, (float)qz, (float)qw}; // xrt order x,y,z,w
+			v.push_back(h);
+		}
+	}
+	return v;
+}
+
+// ---- fake xrt_device shared no-ops ----
+xrt_result_t
+dev_noop_update(struct xrt_device *)
+{
+	return XRT_SUCCESS;
+}
+void
+dev_noop_destroy(struct xrt_device *)
+{
+}
+
+// ---- fake HMD: returns the recorded head pose at the queried time (nearest sample) ----
+struct FakeHmd
+{
+	struct xrt_device base;
+	std::vector<HeadPose> gt;
+};
+
+xrt_result_t
+hmd_get_pose(struct xrt_device *xdev, enum xrt_input_name, int64_t t, struct xrt_space_relation *rel)
+{
+	FakeHmd *h = reinterpret_cast<FakeHmd *>(xdev);
+	struct xrt_pose pose = XRT_POSE_IDENTITY;
+	if (!h->gt.empty()) {
+		size_t best = 0;
+		int64_t bd = INT64_MAX;
+		for (size_t i = 0; i < h->gt.size(); i++) {
+			int64_t d = h->gt[i].t_ns > t ? h->gt[i].t_ns - t : t - h->gt[i].t_ns;
+			if (d < bd) {
+				bd = d;
+				best = i;
+			}
+		}
+		pose = h->gt[best].pose;
+	}
+	rel->pose = pose;
+	rel->relation_flags = (enum xrt_space_relation_flags)(
+	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
+	    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+	return XRT_SUCCESS;
+}
+
+// ---- fake controller: ESKF prior via get_tracked_pose + the constellation feed callbacks ----
+struct FakeController
+{
+	struct xrt_device base;
+	struct KalmanFusionInterfaceWrapper *kf;
+	uint8_t device_id; // 1=left, 2=right
+	std::vector<struct t_constellation_led> leds;
+	std::mutex cap_lock;
+	bool opt_valid = false;
+	struct xrt_pose opt_pose {};
+};
+
+xrt_result_t
+ctrl_get_pose(struct xrt_device *xdev, enum xrt_input_name, int64_t t, struct xrt_space_relation *rel)
+{
+	FakeController *c = reinterpret_cast<FakeController *>(xdev);
+	kalman_fusion_get_prediction(c->kf, t, rel); // the IMU-dead-reckoned prior the matcher refines
+	return XRT_SUCCESS;
+}
+
+bool
+cb_get_led_model(struct xrt_device *xdev, struct t_constellation_led_model *led_model)
+{
+	FakeController *c = reinterpret_cast<FakeController *>(xdev);
+	t_constellation_led_model_init(c->device_id, nullptr, led_model, (uint8_t)c->leds.size(), 0);
+	for (size_t i = 0; i < c->leds.size(); i++) {
+		led_model->leds[i] = c->leds[i];
+	}
+	return true;
+}
+void
+cb_push_pose(struct xrt_device *xdev, timepoint_ns t, const struct xrt_pose *pose)
+{
+	FakeController *c = reinterpret_cast<FakeController *>(xdev);
+	struct xrt_pose_sample s = {};
+	s.pose = *pose;
+	s.timestamp_ns = t;
+	kalman_fusion_process_pose(c->kf, &s, nullptr, nullptr, 15);
+	std::lock_guard<std::mutex> lk(c->cap_lock);
+	c->opt_valid = true;
+	c->opt_pose = *pose;
+}
+void
+cb_push_leds(struct xrt_device *xdev, timepoint_ns t, const struct xrt_pose *P_xrworld_cam,
+             const struct t_constellation_cam_calib *cc, const struct t_constellation_led_obs *leds, size_t n)
+{
+	FakeController *c = reinterpret_cast<FakeController *>(xdev);
+	struct kalman_led_camera_view view = {cc->fx,
+	                                      cc->fy,
+	                                      cc->cx,
+	                                      cc->cy,
+	                                      P_xrworld_cam->orientation,
+	                                      P_xrworld_cam->position};
+	struct kalman_led_observation obs[64];
+	size_t m = n < 64 ? n : 64;
+	for (size_t i = 0; i < m; i++) {
+		obs[i].observed_px = leds[i].obs_px;
+		obs[i].led_obj = leds[i].led_obj;
+	}
+	struct xrt_vec2 var = {1.5f, 1.5f};
+	kalman_fusion_process_led_observations(c->kf, t, obs, m, &view, &var, 8.0f, true);
+}
+bool
+cb_get_unc(struct xrt_device *xdev, double *ps, double *os)
+{
+	return kalman_fusion_get_pose_uncertainty(reinterpret_cast<FakeController *>(xdev)->kf, ps, os);
+}
+void
+cb_noop_frame(struct xrt_device *, uint64_t, uint64_t)
+{
+}
+void
+cb_noop_bright(struct xrt_device *, uint8_t)
+{
+}
+
+// ---- reassemble the four cam tiles into the mosaic the tracker splits by ROI ----
+struct xrt_frame *
+assemble_mosaic(const MosaicFrame &mf, const struct t_constellation_camera_group &cams, uint64_t seq)
+{
+	int W = 0, H = 0;
+	for (int c = 0; c < cams.cam_count; c++) {
+		W = std::max(W, cams.cams[c].roi.offset.w + cams.cams[c].roi.extent.w);
+		H = std::max(H, cams.cams[c].roi.offset.h + cams.cams[c].roi.extent.h);
+	}
+	struct xrt_frame *f = nullptr;
+	u_frame_create_one_off(XRT_FORMAT_L8, (uint32_t)W, (uint32_t)H, &f);
+	memset(f->data, 0, f->size);
+	const uint16_t expo = 6000; // header row metadata; constellation reads exposure from data[6..7]
+	f->data[6] = (uint8_t)(expo >> 8);
+	f->data[7] = (uint8_t)(expo & 0xff);
+	for (int c = 0; c < cams.cam_count; c++) {
+		cv::Mat im = cv::imread(mf.cam_png[c], cv::IMREAD_GRAYSCALE);
+		if (im.empty()) {
+			continue;
+		}
+		const int ox = cams.cams[c].roi.offset.w, oy = cams.cams[c].roi.offset.h;
+		const int rw = std::min(im.cols, cams.cams[c].roi.extent.w);
+		const int rh = std::min(im.rows, cams.cams[c].roi.extent.h);
+		for (int r = 0; r < rh; r++) {
+			memcpy(f->data + (size_t)(oy + r) * f->stride + ox, im.ptr<uint8_t>(r), rw);
+		}
+	}
+	f->timestamp = mf.t_ns;
+	f->source_timestamp = mf.t_ns;
+	f->source_sequence = seq;
+	return f;
+}
+
 } // namespace
 
 int
@@ -268,54 +458,140 @@ main(int argc, char **argv)
 	if (argc < 6) {
 		fprintf(stderr,
 		        "usage: %s <euroc mav0 dir> <hmd-cameras.json> <controller json> <telemetry dir> "
-		        "<device_id 1=left 2=right>\n",
+		        "<device_id 1=left 2=right> [out.csv]\n",
 		        argv[0]);
 		return 2;
 	}
 	const std::string mav0 = argv[1], cam_json = argv[2], ctrl_json = argv[3], telem = argv[4];
 	const int device_id = atoi(argv[5]);
+	const std::string out_csv = argc > 6 ? argv[6] : "";
 
 	struct t_constellation_camera_group cams = {};
 	if (!load_camera_group(cam_json, &cams)) {
 		fprintf(stderr, "FAILED to load camera group\n");
 		return 1;
 	}
-	printf("camera group: %d cams\n", cams.cam_count);
-	for (int i = 0; i < cams.cam_count; i++) {
-		const struct t_camera_calibration *cal = &cams.cams[i].calibration;
-		printf("  cam%d %dx%d fx=%.1f fy=%.1f roi=(%d,%d %dx%d)\n", i, cal->image_size_pixels.w,
-		       cal->image_size_pixels.h, cal->intrinsics[0][0], cal->intrinsics[1][1],
-		       cams.cams[i].roi.offset.w, cams.cams[i].roi.offset.h, cams.cams[i].roi.extent.w,
-		       cams.cams[i].roi.extent.h);
+	std::vector<struct t_constellation_led> leds;
+	{
+		struct t_constellation_led_model m = {};
+		if (!load_led_model(ctrl_json, (uint8_t)device_id, &m)) {
+			fprintf(stderr, "FAILED to load LED model\n");
+			return 1;
+		}
+		leds.assign(m.leds, m.leds + m.num_leds);
+		t_constellation_led_model_clear(&m);
 	}
-
-	struct t_constellation_led_model led = {};
-	if (!load_led_model(ctrl_json, (uint8_t)device_id, &led)) {
-		fprintf(stderr, "FAILED to load LED model\n");
+	std::vector<HeadPose> gt = load_gt(mav0);
+	std::vector<MosaicFrame> frames = index_euroc(mav0, cams.cam_count);
+	std::vector<ImuRow> imu = load_imu(telem, device_id);
+	printf("inputs: %d cams, %zu LEDs, %zu gt head poses, %zu frames, %zu IMU (device %d)\n", cams.cam_count,
+	       leds.size(), gt.size(), frames.size(), imu.size(), device_id);
+	if (frames.empty() || imu.empty()) {
+		fprintf(stderr, "no frames or IMU to replay\n");
 		return 1;
 	}
-	printf("LED model: %u LEDs (e.g. led0 pos=%.4f,%.4f,%.4f)\n", led.num_leds, led.leds[0].pos.x,
-	       led.leds[0].pos.y, led.leds[0].pos.z);
 
-	std::vector<MosaicFrame> frames = index_euroc(mav0, cams.cam_count);
-	printf("euroc frames: %zu mosaic frames", frames.size());
-	if (!frames.empty()) {
-		double dur = (frames.back().t_ns - frames.front().t_ns) / 1e9;
-		printf(" over %.1fs (%.1f Hz)", dur, dur > 0 ? frames.size() / dur : 0.0);
-		cv::Mat im = cv::imread(frames.front().cam_png[0], cv::IMREAD_GRAYSCALE);
-		printf("; cam0 frame0 = %dx%d", im.cols, im.rows);
+	FakeHmd hmd = {};
+	hmd.base.get_tracked_pose = hmd_get_pose;
+	hmd.base.update_inputs = dev_noop_update;
+	hmd.base.destroy = dev_noop_destroy;
+	hmd.base.device_type = XRT_DEVICE_TYPE_GENERIC_TRACKER;
+	snprintf(hmd.base.str, sizeof(hmd.base.str), "offline-hmd");
+	hmd.gt = gt;
+
+	FakeController ctrl = {};
+	ctrl.kf = kalman_fusion_create();
+	ctrl.device_id = (uint8_t)device_id;
+	ctrl.leds = leds;
+	ctrl.base.get_tracked_pose = ctrl_get_pose;
+	ctrl.base.update_inputs = dev_noop_update;
+	ctrl.base.destroy = dev_noop_destroy;
+	ctrl.base.device_type =
+	    device_id == 1 ? XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER : XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER;
+	snprintf(ctrl.base.str, sizeof(ctrl.base.str), "offline-controller");
+
+	struct xrt_frame_context xfctx = {};
+	struct t_constellation_tracker *tracker = nullptr;
+	struct xrt_frame_sink *sink = nullptr;
+	if (t_constellation_tracker_create(&xfctx, &hmd.base, &cams, &tracker, &sink, nullptr) != 0) {
+		fprintf(stderr, "tracker create failed\n");
+		return 1;
 	}
-	printf("\n");
+	struct t_constellation_tracked_device_callbacks cbs = {};
+	cbs.get_led_model = cb_get_led_model;
+	cbs.notify_frame_received = cb_noop_frame;
+	cbs.push_observed_pose = cb_push_pose;
+	cbs.push_brightness_update = cb_noop_bright;
+	cbs.push_observed_leds = cb_push_leds;
+	cbs.get_pose_uncertainty = cb_get_unc;
+	t_constellation_tracker_add_device(tracker, &ctrl.base, &cbs);
 
-	std::vector<ImuRow> imu = load_imu(telem, device_id);
-	printf("controller IMU (device %d): %zu samples", device_id, imu.size());
-	if (!imu.empty()) {
-		double dur = (imu.back().t_ns - imu.front().t_ns) / 1e9;
-		printf(" over %.1fs (%.0f Hz)", dur, dur > 0 ? imu.size() / dur : 0.0);
+	FILE *csv = out_csv.empty() ? nullptr : fopen(out_csv.c_str(), "w");
+	if (csv != nullptr) {
+		fprintf(csv, "t_ns,opt_valid,opt_px,opt_py,opt_pz,opt_qx,opt_qy,opt_qz,opt_qw,"
+		             "pred_px,pred_py,pred_pz,pred_qx,pred_qy,pred_qz,pred_qw,pred_tracked\n");
 	}
-	printf("\n");
 
-	t_constellation_led_model_clear(&led);
-	printf("Stage A: all inputs loaded + validated.\n");
+	size_t ii = 0;
+	uint64_t seq = 0;
+	int opt_frames = 0, locked = 0;
+	for (const MosaicFrame &mf : frames) {
+		// Feed IMU up to this frame's time so the matcher's prior (get_prediction) is current.
+		while (ii < imu.size() && imu[ii].t_ns <= mf.t_ns) {
+			struct xrt_imu_sample s = {};
+			s.timestamp_ns = imu[ii].t_ns;
+			s.accel_m_s2 = {imu[ii].ax, imu[ii].ay, imu[ii].az};
+			s.gyro_rad_secs = {imu[ii].gx, imu[ii].gy, imu[ii].gz};
+			kalman_fusion_process_imu_data(ctrl.kf, &s, nullptr, nullptr);
+			ii++;
+		}
+		{
+			std::lock_guard<std::mutex> lk(ctrl.cap_lock);
+			ctrl.opt_valid = false;
+		}
+		struct xrt_frame *f = assemble_mosaic(mf, cams, seq++);
+		xrt_sink_push_frame(sink, f);
+		std::this_thread::sleep_for(std::chrono::milliseconds(8)); // let the fast thread process
+		xrt_frame_reference(&f, nullptr);                          // release after processing
+
+		struct xrt_space_relation fused = {};
+		kalman_fusion_get_prediction(ctrl.kf, mf.t_ns, &fused);
+		const bool ptracked = (fused.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
+		locked += ptracked ? 1 : 0;
+		bool ov;
+		struct xrt_pose op;
+		{
+			std::lock_guard<std::mutex> lk(ctrl.cap_lock);
+			ov = ctrl.opt_valid;
+			op = ctrl.opt_pose;
+		}
+		opt_frames += ov ? 1 : 0;
+		if (csv != nullptr) {
+			fprintf(csv, "%lld,%d,", (long long)mf.t_ns, ov ? 1 : 0);
+			if (ov) {
+				fprintf(csv, "%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,", op.position.x, op.position.y,
+				        op.position.z, op.orientation.x, op.orientation.y, op.orientation.z,
+				        op.orientation.w);
+			} else {
+				fprintf(csv, "nan,nan,nan,nan,nan,nan,nan,");
+			}
+			fprintf(csv, "%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,%d\n", fused.pose.position.x,
+			        fused.pose.position.y, fused.pose.position.z, fused.pose.orientation.x,
+			        fused.pose.orientation.y, fused.pose.orientation.z, fused.pose.orientation.w,
+			        ptracked ? 1 : 0);
+		}
+	}
+	if (csv != nullptr) {
+		fclose(csv);
+	}
+	printf("replay done: %zu frames | optical pose on %d (%.0f%%) | position-tracked on %d (%.0f%%)\n",
+	       frames.size(), opt_frames, 100.0 * opt_frames / frames.size(), locked,
+	       100.0 * locked / frames.size());
+	if (!out_csv.empty()) {
+		printf("wrote %s\n", out_csv.c_str());
+	}
+
+	xrt_frame_context_destroy_nodes(&xfctx); // stops the tracker threads
+	kalman_fusion_destroy(ctrl.kf);
 	return 0;
 }
