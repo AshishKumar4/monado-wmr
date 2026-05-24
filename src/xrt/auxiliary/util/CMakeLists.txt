@@ -45,6 +45,8 @@ add_library(
 	u_frame.h
 	u_future.h
 	u_future.cpp
+	u_g2_telemetry.c
+	u_g2_telemetry.h
 	u_generic_callbacks.hpp
 	u_git_tag.h
 	u_hand_tracking.c
