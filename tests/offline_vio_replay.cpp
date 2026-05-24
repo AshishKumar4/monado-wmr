@@ -24,6 +24,7 @@
 #include <fstream>
 
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <thread>
 
@@ -366,6 +367,66 @@ apply_gravity_fix(std::vector<HeadPose> &gt, const std::vector<ImuRow> &himu)
 	       up.y, up.z, gt.size());
 }
 
+// ---- G2_DUMP_FRAMES reader: per-cam controller PGMs (cam<id>_t<ts>_e<exp>_s<seq>_n<blobs>.pgm) ----
+// Group the 4 cams of one source frame by seq; the harness reassembles them into the mosaic by ROI.
+std::vector<MosaicFrame>
+index_pgm_dump(const std::string &dir, int cam_count)
+{
+	auto field = [](const std::string &n, const char *tag) -> long long {
+		size_t p = n.find(tag);
+		return p == std::string::npos ? -1 : atoll(n.c_str() + p + strlen(tag));
+	};
+	std::map<long long, MosaicFrame> by_seq;
+	std::error_code ec;
+	for (auto it = fs::directory_iterator(dir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+		const std::string name = it->path().filename().string();
+		if (name.rfind("cam", 0) != 0 || it->path().extension() != ".pgm") {
+			continue;
+		}
+		const int cam = name[3] - '0';
+		const long long ts = field(name, "_t"), seq = field(name, "_s");
+		if (cam < 0 || cam >= cam_count || ts < 0 || seq < 0) {
+			continue;
+		}
+		MosaicFrame &mf = by_seq[seq];
+		mf.t_ns = ts;
+		mf.cam_png[cam] = it->path().string();
+	}
+	std::vector<MosaicFrame> out;
+	for (auto &kv : by_seq) {
+		int have = 0;
+		for (int c = 0; c < cam_count; c++) {
+			have += kv.second.cam_png[c].empty() ? 0 : 1;
+		}
+		if (have == cam_count) {
+			out.push_back(kv.second);
+		}
+	}
+	std::sort(out.begin(), out.end(), [](const MosaicFrame &a, const MosaicFrame &b) { return a.t_ns < b.t_ns; });
+	return out;
+}
+
+// Head pose from the recorded HMD IMU (telemetry device 0): per-sample gravity-aligned orientation
+// (measured up -> +Y, position 0). Sufficient for the constellation's gravity prior + camera placement
+// when no SLAM head trajectory was recorded; yaw is unconstrained (fine — the matcher works in the
+// camera frame and the ESKF tracks the controller consistently in this gravity-aligned world).
+std::vector<HeadPose>
+head_poses_from_imu(const std::vector<ImuRow> &hmd_imu)
+{
+	std::vector<HeadPose> out;
+	const struct xrt_vec3 plusY = {0.0f, 1.0f, 0.0f};
+	for (const ImuRow &s : hmd_imu) {
+		struct xrt_vec3 up = {s.ax, s.ay, s.az};
+		math_vec3_normalize(&up);
+		HeadPose h{};
+		h.t_ns = s.t_ns;
+		h.pose.position = {0.0f, 0.0f, 0.0f};
+		math_quat_from_vec_a_to_vec_b(&up, &plusY, &h.pose.orientation);
+		out.push_back(h);
+	}
+	return out;
+}
+
 // ---- fake xrt_device shared no-ops ----
 xrt_result_t
 dev_noop_update(struct xrt_device *)
@@ -548,12 +609,34 @@ main(int argc, char **argv)
 		leds.assign(m.leds, m.leds + m.num_leds);
 		t_constellation_led_model_clear(&m);
 	}
-	std::vector<HeadPose> gt = load_gt(mav0);
-	apply_gravity_fix(gt, load_euroc_imu(mav0)); // align gt world to Y-up so the gravity prior is valid
-	std::vector<MosaicFrame> frames = index_euroc(mav0, cams.cam_count);
 	std::vector<ImuRow> imu = load_imu(telem, device_id);
-	printf("inputs: %d cams, %zu LEDs, %zu gt head poses, %zu frames, %zu IMU (device %d)\n", cams.cam_count,
-	       leds.size(), gt.size(), frames.size(), imu.size(), device_id);
+	// Two frame sources: a G2_DUMP_FRAMES dir of controller PGMs (real LED frames), or a euroc mav0
+	// dir (SLAM frames). Auto-detect by the euroc cam0/data layout.
+	const bool euroc_mode = fs::exists(mav0 + "/cam0/data");
+	std::vector<HeadPose> gt;
+	std::vector<MosaicFrame> frames;
+	if (euroc_mode) {
+		gt = load_gt(mav0);
+		apply_gravity_fix(gt, load_euroc_imu(mav0)); // align gt world to Y-up
+		frames = index_euroc(mav0, cams.cam_count);
+	} else {
+		frames = index_pgm_dump(mav0, cams.cam_count);     // real controller LED frames
+		gt = head_poses_from_imu(load_imu(telem, 0));       // gravity-align from the recorded HMD IMU
+	}
+	// Keep only frames within the controller-IMU window (drops the startup-outlier frames).
+	if (!imu.empty()) {
+		const int64_t lo = imu.front().t_ns - 100000000, hi = imu.back().t_ns + 100000000;
+		std::vector<MosaicFrame> kept;
+		for (const MosaicFrame &mf : frames) {
+			if (mf.t_ns >= lo && mf.t_ns <= hi) {
+				kept.push_back(mf);
+			}
+		}
+		frames.swap(kept);
+	}
+	printf("inputs: %d cams, %zu LEDs, %zu head poses, %zu frames, %zu IMU (device %d) [%s]\n",
+	       cams.cam_count, leds.size(), gt.size(), frames.size(), imu.size(), device_id,
+	       euroc_mode ? "euroc" : "pgm-dump");
 	if (frames.empty() || imu.empty()) {
 		fprintf(stderr, "no frames or IMU to replay\n");
 		return 1;
