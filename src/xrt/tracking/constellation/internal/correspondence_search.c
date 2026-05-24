@@ -297,6 +297,27 @@ correspondence_search_project_pose(struct correspondence_search *cs,
 		}
 	}
 
+	/* Orientation-prior veto (mirror-flip rejection). With a TRUSTWORTHY fusion prior, a candidate whose
+	 * full orientation grossly disagrees with the prior is a P3P mirror twin, not real motion: the gyro-
+	 * propagated prior is accurate to a few degrees over the inter-frame interval, so a >90 deg jump is
+	 * astronomically unlikely under it regardless of how well it reprojects (the two twins reproject
+	 * near-identically). The CORRECT twin is also generated as a candidate, so vetoing the flip here SELECTS
+	 * the right one rather than dropping the frame. Bound = the covariance-driven rot_error_thresh (norm);
+	 * legitimate frame-to-frame motion (<~10 deg) is far inside it, a flip (120-180 deg) far outside. Gated
+	 * on CS_FLAG_TRUST_PRIOR_ORIENT so cold acquisition / long-dropout re-acquire run unconstrained. */
+	if (mi->search_flags & CS_FLAG_TRUST_PRIOR_ORIENT) {
+		const struct xrt_quat *pq = &pose->orientation, *rq = &mi->pose_prior.orientation;
+		double dot = (double)pq->x * rq->x + (double)pq->y * rq->y + (double)pq->z * rq->z + (double)pq->w * rq->w;
+		double ang = 2.0 * acos(fmin(1.0, fabs(dot))); // geodesic angle candidate<->prior
+		const struct xrt_vec3 *re = mi->rot_error_thresh;
+		double bound = sqrt((double)re->x * re->x + (double)re->y * re->y + (double)re->z * re->z);
+		if (ang > bound) {
+			DEBUG("model %d orientation-prior veto: %.1f deg > %.1f deg (mirror-flip candidate)\n", mi->id,
+			      RAD_TO_DEG(ang), RAD_TO_DEG(bound));
+			return false;
+		}
+	}
+
 	struct pose_metrics score;
 
 	/* Check how many LEDs have matching blobs in this pose,

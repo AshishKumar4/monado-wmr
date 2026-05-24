@@ -31,6 +31,8 @@
 #include "internal/sample.h"
 
 DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
+/* Diagnostic: disable the orientation-prior mirror-flip veto (A/B the front-end disambiguation). */
+DEBUG_GET_ONCE_BOOL_OPTION(no_flip_veto, "G2_NO_FLIP_VETO", false)
 
 #define MIN_ROT_ERROR DEG_TO_RAD(30)
 #define MIN_POS_ERROR 0.10
@@ -884,6 +886,14 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 	/* Get the HMD's pose so we can calculate the camera view poses */
 	xrt_device_get_tracked_pose(ct->hmd_xdev, XRT_INPUT_GENERIC_TRACKER_POSE, xf->timestamp, &xsr_base_pose);
 
+	/* Record the live SLAM head pose for this frame (world, OpenXR) so the offline replay harness can
+	 * reproduce the true camera->world transform instead of an IMU-only reconstruction. */
+	if (g2_telem_enabled()) {
+		float head7[7];
+		telem_pack_pose(&xsr_base_pose.pose, head7);
+		g2_telem_head_pose((uint64_t)xf->timestamp, head7);
+	}
+
 	/* Split out camera views and collect blobs across all cameras */
 	assert(ct->cam_count <= XRT_TRACKING_MAX_SLAM_CAMS);
 	sample->n_views = ct->cam_count;
@@ -1006,11 +1016,17 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		 * when confident. */
 		float pos_bound = MIN_POS_ERROR, rot_bound = MIN_ROT_ERROR;
 		double pos_std = 0.0, rot_std = 0.0;
+		bool orient_trusted = false;
 		if (constellation_tracked_device_connection_get_pose_uncertainty(device->connection, &pos_std,
 		                                                                 &rot_std)) {
 			pos_bound = (float)fmin(fmax(PRIOR_GATE_SIGMA * pos_std, MIN_POS_ERROR), MAX_POS_ERROR);
 			rot_bound = (float)fmin(fmax(PRIOR_GATE_SIGMA * rot_std, MIN_ROT_ERROR), MAX_ROT_ERROR);
+			/* Trust the prior orientation to veto mirror-flips only while the fusion is tracking AND its
+			 * 3-sigma orientation uncertainty is below the gate ceiling. Past the ceiling (long dropout)
+			 * the prior is too uncertain to disambiguate, so the search runs unconstrained (cold reacquire). */
+			orient_trusted = (PRIOR_GATE_SIGMA * rot_std) < MAX_ROT_ERROR;
 		}
+		dev_state->prior_orient_trusted = orient_trusted && !debug_get_bool_option_no_flip_veto();
 		dev_state->prior_pos_error.x = dev_state->prior_pos_error.y = dev_state->prior_pos_error.z =
 		    pos_bound;
 		dev_state->prior_rot_error.x = dev_state->prior_rot_error.y = dev_state->prior_rot_error.z =
@@ -1176,6 +1192,10 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
 
 				enum correspondence_search_flags search_flags =
 				    CS_FLAG_STOP_FOR_STRONG_MATCH | CS_FLAG_HAVE_POSE_PRIOR | CS_FLAG_MATCH_GRAVITY;
+
+				/* Select the prior-consistent P3P twin (reject mirror-flips) when the prior is reliable. */
+				if (dev_state->prior_orient_trusted)
+					search_flags |= CS_FLAG_TRUST_PRIOR_ORIENT;
 
 				if (pass == 0) {
 					/* 1st pass - quick search only */

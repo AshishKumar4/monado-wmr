@@ -37,6 +37,10 @@ struct tracking_sample_device_state
 	struct xrt_vec3 prior_pos_error;
 	struct xrt_vec3 prior_rot_error;
 	float gravity_error_rad; /* Gravity vector uncertainty in radians 0..M_PI */
+	/* True when the fusion is tracking AND its orientation uncertainty is below the ceiling, i.e. the
+	 * prior orientation is reliable enough to disambiguate a P3P mirror-flip (select the correct twin).
+	 * False at cold start / after a long dropout, where the search must run unconstrained. */
+	bool prior_orient_trusted;
 
 	/* Last observed pose, in world space */
 	bool have_last_seen_pose;

@@ -125,6 +125,17 @@ struct g2_telem_event
 	float value;
 } G2_PACKED;
 
+//! head_pose stream row: the HMD (head) pose in the world, sampled at each controller frame. This is
+//! the live SLAM head pose the controller tracker uses to place its cameras in the world; recording it
+//! lets the offline replay harness reproduce the true camera->world transform (instead of an IMU-only
+//! reconstruction), which is required to faithfully replay the constellation front-end. t_mono_ns is the
+//! frame (observation) time the pose is valid for.
+struct g2_telem_head_pose
+{
+	uint64_t t_mono_ns;
+	float px, py, pz, qx, qy, qz, qw;
+} G2_PACKED;
+
 #if defined(_MSC_VER)
 #pragma pack(pop)
 #endif
@@ -149,7 +160,8 @@ enum g2_telem_stream
 	G2_TELEM_STREAM_POSE_ATTEMPT = 2,
 	G2_TELEM_STREAM_FUSION = 3,
 	G2_TELEM_STREAM_EVENT = 4,
-	G2_TELEM_STREAM_COUNT = 5,
+	G2_TELEM_STREAM_HEAD_POSE = 5,
+	G2_TELEM_STREAM_COUNT = 6,
 };
 
 
@@ -220,6 +232,13 @@ static const struct g2_field event_fields[] = {
     F(g2_telem_event, t_mono_ns, "u64"), F(g2_telem_event, device_id, "u8"),
     F(g2_telem_event, event_type, "u16"), F(g2_telem_event, value, "f32"),
 };
+
+static const struct g2_field head_pose_fields[] = {
+    F(g2_telem_head_pose, t_mono_ns, "u64"),
+    F(g2_telem_head_pose, px, "f32"), F(g2_telem_head_pose, py, "f32"), F(g2_telem_head_pose, pz, "f32"),
+    F(g2_telem_head_pose, qx, "f32"), F(g2_telem_head_pose, qy, "f32"), F(g2_telem_head_pose, qz, "f32"),
+    F(g2_telem_head_pose, qw, "f32"),
+};
 // clang-format on
 
 #define NF(arr) (sizeof(arr) / sizeof((arr)[0]))
@@ -236,6 +255,8 @@ static const struct g2_stream_desc g2_descs[G2_TELEM_STREAM_COUNT] = {
                                 NF(fusion_fields)},
     [G2_TELEM_STREAM_EVENT] = {"event", "event.bin", sizeof(struct g2_telem_event), 8192, event_fields,
                                NF(event_fields)},
+    [G2_TELEM_STREAM_HEAD_POSE] = {"head_pose", "head_pose.bin", sizeof(struct g2_telem_head_pose), 32768,
+                                   head_pose_fields, NF(head_pose_fields)},
 };
 
 
@@ -884,4 +905,23 @@ g2_telem_event(uint8_t device_id, uint64_t ts_ns, uint16_t event_type, float val
 	row.event_type = event_type;
 	row.value = value;
 	(void)ring_emit(&g_telem.rings[G2_TELEM_STREAM_EVENT], &row);
+}
+
+void
+g2_telem_head_pose(uint64_t ts_ns, const float pose[7])
+{
+	if (!g2_telem_enabled() || pose == NULL) {
+		return;
+	}
+	// t_mono_ns carries the frame (observation) time the head pose is valid for.
+	struct g2_telem_head_pose row = {0};
+	row.t_mono_ns = ts_ns;
+	row.px = pose[0];
+	row.py = pose[1];
+	row.pz = pose[2];
+	row.qx = pose[3];
+	row.qy = pose[4];
+	row.qz = pose[5];
+	row.qw = pose[6];
+	(void)ring_emit(&g_telem.rings[G2_TELEM_STREAM_HEAD_POSE], &row);
 }

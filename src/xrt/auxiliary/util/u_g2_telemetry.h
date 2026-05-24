@@ -107,6 +107,12 @@ g2_telem_fusion(uint8_t device_id,
 void
 g2_telem_event(uint8_t device_id, uint64_t ts_ns, uint16_t event_type, float value);
 
+/*! HMD (head) world pose at a controller frame, [px,py,pz, qx,qy,qz,qw]. @p ts_ns is the frame time the
+ *  pose is valid for. Recorded so the offline replay harness can reproduce the true camera->world
+ *  transform the live SLAM head pose provides (instead of an IMU-only reconstruction). */
+void
+g2_telem_head_pose(uint64_t ts_ns, const float pose[7]);
+
 #ifdef __cplusplus
 }
 #endif

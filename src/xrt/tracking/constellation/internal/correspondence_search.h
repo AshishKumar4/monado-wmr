@@ -30,6 +30,10 @@ enum correspondence_search_flags
 	    0x8, /* Allow matching against all blobs, not just unlabelled ones or for the current device */
 	CS_FLAG_HAVE_POSE_PRIOR = 0x10, /* If the input obj_cam_pose contains a valid prior */
 	CS_FLAG_MATCH_GRAVITY = 0x20,   /* Use the provided gravity vector to check pose verticality */
+	CS_FLAG_TRUST_PRIOR_ORIENT =
+	    0x40, /* Veto candidates whose full orientation grossly disagrees with the prior (mirror-flip
+	             rejection). Only set when the prior orientation is trustworthy; selects the correct P3P
+	             twin instead of dropping the frame. Requires CS_FLAG_HAVE_POSE_PRIOR. */
 };
 
 struct cs_image_point

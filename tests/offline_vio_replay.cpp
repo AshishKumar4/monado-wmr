@@ -280,6 +280,30 @@ struct HeadPose
 	struct xrt_pose pose;
 };
 
+// Recorded live SLAM head pose (telemetry head_pose.bin: packed rows u64 t_mono_ns + f32 px,py,pz,qx,qy,qz,qw
+// = 36 bytes, OpenXR world). This is the TRUE camera->world the constellation used live; using it makes the
+// replay faithful (vs the IMU-only reconstruction, which drifts and breaks prior-dependent paths). Empty if
+// the capture predates head-pose recording.
+std::vector<HeadPose>
+load_head_pose_telemetry(const std::string &telem)
+{
+	std::vector<HeadPose> v;
+	std::ifstream f(telem + "/head_pose.bin", std::ios::binary);
+	char buf[36];
+	while (f.read(buf, sizeof(buf))) {
+		uint64_t t = 0;
+		float p[7];
+		memcpy(&t, buf, 8);
+		memcpy(p, buf + 8, 28);
+		HeadPose h{};
+		h.t_ns = (int64_t)t;
+		h.pose.position = {p[0], p[1], p[2]};
+		h.pose.orientation = {p[3], p[4], p[5], p[6]};
+		v.push_back(h);
+	}
+	return v;
+}
+
 std::vector<HeadPose>
 load_gt(const std::string &mav0)
 {
@@ -627,8 +651,15 @@ main(int argc, char **argv)
 		apply_gravity_fix(gt, load_euroc_imu(mav0)); // align gt world to Y-up
 		frames = index_euroc(mav0, cams.cam_count);
 	} else {
-		frames = index_pgm_dump(mav0, cams.cam_count);     // real controller LED frames
-		gt = head_poses_from_imu(load_imu(telem, 0));       // gravity-align from the recorded HMD IMU
+		frames = index_pgm_dump(mav0, cams.cam_count); // real controller LED frames
+		gt = load_head_pose_telemetry(telem);          // true SLAM head pose, if the capture recorded it
+		if (gt.empty()) {
+			gt = head_poses_from_imu(load_imu(telem, 0)); // fallback: IMU-only reconstruction (drifts;
+			                                              // prior-dependent paths e.g. the flip veto are unfaithful)
+			printf("note: no head_pose.bin -> IMU-derived head pose (drifts; flip-veto A/B unreliable)\n");
+		} else {
+			printf("using RECORDED SLAM head pose (%zu samples) -> faithful camera->world\n", gt.size());
+		}
 	}
 	// Keep only frames within the controller-IMU window (drops the startup-outlier frames).
 	if (!imu.empty()) {
