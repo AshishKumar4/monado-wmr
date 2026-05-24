@@ -101,6 +101,18 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 		eskf_coast_experiment PRIVATE aux_math aux_tracking xrt-interfaces Threads::Threads
 									  ${OpenCV_LIBRARIES})
 	set_target_properties(eskf_coast_experiment PROPERTIES FOLDER monado_tests)
+
+	# Decoupled unit tests for the constellation PnP mirror-twin enumeration (synthetic geometry,
+	# known truth). A real ctest.
+	add_executable(tests_constellation_pnp tests_constellation_pnp.cpp)
+	target_link_libraries(
+		tests_constellation_pnp PRIVATE xrt-external-catch2 constellation_tracker aux_math aux_util
+										xrt-interfaces ${OpenCV_LIBRARIES})
+	target_include_directories(
+		tests_constellation_pnp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/tracking/constellation
+										${OpenCV_INCLUDE_DIRS})
+	add_test(NAME tests_constellation_pnp COMMAND tests_constellation_pnp --success --allow-running-no-tests)
+	set_target_properties(tests_constellation_pnp PROPERTIES FOLDER monado_tests)
 endif()
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
