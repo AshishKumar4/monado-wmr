@@ -48,6 +48,10 @@ struct tracking_sample_device_state
 
 	struct pose_metrics score;
 	struct pose_metrics_blob_match_info blob_match_info;
+
+	/* Bitmask of views whose matched LEDs have already been folded into the fusion this sample, so
+	 * the accepted + recover + prior-refine paths cannot fold the same view's LEDs twice. */
+	uint16_t led_emit_view_mask;
 };
 
 /* Information about 1 camera frame in this sample */

@@ -42,7 +42,9 @@ DEBUG_GET_ONCE_LOG_OPTION(aeg_log, "AEG_LOG", U_LOGGING_WARN)
 #define INITIAL_BRIGHTNESS 0.5
 #define INITIAL_MAX_BRIGHTNESS_STEP 0.1
 #define INITIAL_THRESHOLD 0.1
-#define GRID_COLS 32 //!< Amount of columns for the histogram sample grid
+#define GRID_COLS 32                      //!< Amount of columns for the histogram sample grid
+#define SATURATION_LEVEL 248              //!< Pixel intensity at/above which a pixel counts as blown out
+#define INITIAL_SATURATION_MAX_FRAC 0.02f //!< Tolerated blown-out fraction before forcing DARKEN
 
 //! AEG State machine states
 enum u_aeg_state
@@ -104,6 +106,12 @@ struct u_autoexpgain
 	//! Scores further than `threshold` from the target score will trigger a
 	//! `brightness` update.
 	float threshold;
+
+	//! Fraction of blown-out pixels (>= SATURATION_LEVEL) above which the image is forced toward
+	//! DARKEN regardless of mean. Defends the mean metric against a small bright region (e.g. a
+	//! window) that would otherwise read as "too dark" and be exposed until it saturates.
+	float saturation_max_frac;
+	float current_saturation; //!< Last measured blown-out fraction (read-only UI)
 
 	//! A camera might take a couple of frames until the new exposure/gain sets in
 	//! the image. Knowing how many (this variable) helps in avoiding overshooting
@@ -371,6 +379,22 @@ get_score(struct u_autoexpgain *aeg, struct xrt_frame *xf)
 	score = (mean - target_mean) / range_size;
 	score = CLAMP(score, -1, 1);
 
+	// Mean targeting is blind to a small bright region: a window's low overall mean reads as "too
+	// dark", so the controller raises exposure and the window blows out — destroying the very
+	// features SLAM needs there. Add the anti-saturation half of HDR exposure control (Zhang et al.,
+	// ICRA'17): if more than `saturation_max_frac` of sampled pixels are blown out, force the score
+	// positive (DARKEN) in proportion to the excess, overriding the mean. Reuses the histogram above.
+	int saturated = 0;
+	for (int i = SATURATION_LEVEL; i < LEVELS; i++) {
+		saturated += histogram[i];
+	}
+	float sat_frac = samples_count > 0 ? (float)saturated / samples_count : 0.0f;
+	aeg->current_saturation = sat_frac;
+	if (sat_frac > aeg->saturation_max_frac) {
+		float sat_score = (sat_frac - aeg->saturation_max_frac) / (1.0f - aeg->saturation_max_frac);
+		score = fmaxf(score, CLAMP(sat_score, 0.0f, 1.0f));
+	}
+
 	return score;
 }
 
@@ -446,6 +470,7 @@ u_autoexpgain_create(enum u_aeg_strategy strategy, bool enabled_from_start, int 
 	aeg->max_brightness_step = INITIAL_MAX_BRIGHTNESS_STEP;
 
 	aeg->threshold = INITIAL_THRESHOLD;
+	aeg->saturation_max_frac = INITIAL_SATURATION_MAX_FRAC;
 	aeg->frame_delay = frame_delay;
 
 	brightness_to_expgain(aeg, INITIAL_BRIGHTNESS, &aeg->exposure, &aeg->gain);
@@ -476,11 +501,17 @@ u_autoexpgain_add_vars(struct u_autoexpgain *aeg, void *root, char *prefix)
 	(void)snprintf(tmp, sizeof(tmp), "%sScore threshold", prefix);
 	u_var_add_f32(root, &aeg->threshold, tmp);
 
+	(void)snprintf(tmp, sizeof(tmp), "%sSaturation limit (frac)", prefix);
+	u_var_add_f32(root, &aeg->saturation_max_frac, tmp);
+
 	(void)snprintf(tmp, sizeof(tmp), "%sMax brightness step", prefix);
 	u_var_add_f32(root, &aeg->max_brightness_step, tmp);
 
 	(void)snprintf(tmp, sizeof(tmp), "%sImage score", prefix);
 	u_var_add_ro_f32(root, &aeg->current_score, tmp);
+
+	(void)snprintf(tmp, sizeof(tmp), "%sSaturated fraction", prefix);
+	u_var_add_ro_f32(root, &aeg->current_saturation, tmp);
 
 	(void)snprintf(tmp, sizeof(tmp), "%sIntensity histogram", prefix);
 	u_var_add_histogram_f32(root, &aeg->histogram_ui, tmp);

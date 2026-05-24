@@ -21,7 +21,9 @@
 #if CV_MAJOR_VERSION >= 4
 #include <opencv2/calib3d/calib3d_c.h>
 #endif
+#include <cmath>
 #include <iostream>
+#include <vector>
 
 using namespace std;
 
@@ -52,6 +54,39 @@ undistort_blob_points(std::vector<cv::Point2f> in_points,
 		t_camera_models_undistort(&calib->calib, in_points[i].x, in_points[i].y, &out_points[i].x,
 		                          &out_points[i].y);
 	}
+}
+
+/* Re-gate then Levenberg-Marquardt refine: reproject (rvec,tvec) over all correspondences, keep the
+ * ones within `thresh`, and LM-refine over that set in place. Returns the inlier count used. Shared by
+ * the polish + re-gate passes so the project-filter-refine logic lives in one place. */
+static int
+refine_lm_over_inliers(const std::vector<cv::Point3f> &p3d,
+                       const std::vector<cv::Point2f> &p2d,
+                       const cv::Mat &K,
+                       const cv::Mat &D,
+                       cv::Mat &rvec,
+                       cv::Mat &tvec,
+                       double thresh)
+{
+	std::vector<cv::Point2f> proj;
+	cv::projectPoints(p3d, rvec, tvec, K, D, proj);
+
+	std::vector<cv::Point3f> in3d;
+	std::vector<cv::Point2f> in2d;
+	in3d.reserve(p3d.size());
+	in2d.reserve(p2d.size());
+	for (size_t k = 0; k < p3d.size(); k++) {
+		const cv::Point2f d = proj[k] - p2d[k];
+		if (std::hypot(d.x, d.y) <= thresh) {
+			in3d.push_back(p3d[k]);
+			in2d.push_back(p2d[k]);
+		}
+	}
+	if (in3d.size() < 4) {
+		return (int)in3d.size();
+	}
+	cv::solvePnPRefineLM(in3d, in2d, K, D, rvec, tvec);
+	return (int)in3d.size();
 }
 
 bool
@@ -144,8 +179,20 @@ ransac_pnp_pose(struct xrt_pose *pose,
 	cv::solvePnPRansac(list_points3d, list_points2d_undistorted, dummyK, dummyD, rvec, tvec, false, iterationsCount,
 	                   reprojectionError, confidence, inliers, flags);
 
+	/* SQPnP-RANSAC gives a good global estimate, but the LM reprojection refinement is what drives
+	 * the per-LED error down (the weak 6-7-inlier poses were accepted at ~2 px). Re-gate + refine
+	 * twice (IRLS-style): the first pass tightens the pose, the second folds back any point the
+	 * tightened pose now fits. */
+	int final_inliers = inliers.rows;
+	if (final_inliers >= 4) {
+		refine_lm_over_inliers(list_points3d, list_points2d_undistorted, dummyK, dummyD, rvec, tvec,
+		                       reprojectionError);
+		final_inliers = refine_lm_over_inliers(list_points3d, list_points2d_undistorted, dummyK, dummyD, rvec,
+		                                       tvec, reprojectionError);
+	}
+
 	if (num_inliers)
-		*num_inliers = inliers.rows;
+		*num_inliers = final_inliers;
 
 	struct xrt_vec3 v;
 	double angle = sqrt(rvec.dot(rvec));

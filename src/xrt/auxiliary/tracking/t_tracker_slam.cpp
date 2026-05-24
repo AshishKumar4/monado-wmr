@@ -13,6 +13,7 @@
 #include "xrt/xrt_frameserver.h"
 
 #include "util/u_debug.h"
+#include "util/u_g2_telemetry.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "util/u_sink.h"
@@ -40,6 +41,8 @@
 #include <opencv2/core/mat.hpp>
 #include <opencv2/core/version.hpp>
 
+#include <cmath>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -771,6 +774,35 @@ flush_poses(TrackerSlam &t)
 		xrt_quat nrot{data.ox, data.oy, data.oz, data.ow};
 		xrt_vec3 nvel{data.vx, data.vy, data.vz};
 
+		// Divergence guard: Basalt can emit a non-finite or wildly-displaced pose when visual
+		// landmarks degenerate (a saturated window -> backsubstitution NaN). Pushing it permanently
+		// corrupts the relation history (the head then "diverges forever until reset"). Drop bad
+		// poses; after a sustained run, reset the tracker so the head self-heals. Head-side analogue
+		// of the controller optical-jump gate.
+		static int slam_consec_bad = 0;
+		static const int SLAM_MAX_CONSEC_BAD = 30; // ~1 s of bad poses before forcing a reset
+		bool pose_finite = std::isfinite(npos.x) && std::isfinite(npos.y) && std::isfinite(npos.z) &&
+		                   std::isfinite(nrot.x) && std::isfinite(nrot.y) && std::isfinite(nrot.z) &&
+		                   std::isfinite(nrot.w) && std::isfinite(nvel.x) && std::isfinite(nvel.y) &&
+		                   std::isfinite(nvel.z);
+		bool pose_insane = pose_finite && m_vec3_len(npos) > 1000.0f; // room-scale; >1 km = diverged
+		if (!pose_finite || pose_insane) {
+			slam_consec_bad++;
+			SLAM_WARN("Dropping divergent SLAM pose (finite=%d |p|=%.1f m) %d/%d", pose_finite,
+			          pose_finite ? (double)m_vec3_len(npos) : 0.0, slam_consec_bad, SLAM_MAX_CONSEC_BAD);
+			if (slam_consec_bad >= SLAM_MAX_CONSEC_BAD) {
+				if (t.vit.tracker_reset(t.tracker) != VIT_SUCCESS) {
+					SLAM_WARN("Auto-reset of diverged VIT tracker failed");
+				} else {
+					SLAM_INFO("Auto-reset VIT tracker after sustained divergence");
+				}
+				slam_consec_bad = 0;
+			}
+			t.vit.pose_destroy(pose);
+			continue;
+		}
+		slam_consec_bad = 0;
+
 		// Last relation
 		xrt_space_relation lr = XRT_SPACE_RELATION_ZERO;
 		int64_t lts;
@@ -1419,6 +1451,11 @@ t_slam_node_destroy(struct xrt_frame_node *node)
 	t_ptr->vit.tracker_destroy(t_ptr->tracker);
 	t_vit_bundle_unload(&t_ptr->vit);
 
+	/* Telemetry shutdown is NOT done here: this SLAM frame node is destroyed
+	 * before the other telemetry producers (controllers, WMR source), so flushing
+	 * here could race a still-running producer. Ownership moved to wmr_hmd_destroy(),
+	 * which runs after all producers have stopped (BLOCKER-1 / MAJOR-4). */
+
 	delete t_ptr;
 }
 
@@ -1541,7 +1578,21 @@ t_slam_create(struct xrt_frame_context *xfctx,
 
 	xrt_frame_context_add(xfctx, &t.node);
 
-	t.euroc_recorder = euroc_recorder_create(xfctx, NULL, t.cam_count, false);
+	// Auto-start raw EuRoC recording when G2_RECORD=<dir> is set in the environment.
+	// Uses the same record-from-start path the debug GUI button drives, recording on the
+	// same monotonic timebase as the telemetry/frames. Otherwise behaves as before.
+	const char *g2_record_dir = getenv("G2_RECORD");
+	bool g2_record = g2_record_dir != NULL && g2_record_dir[0] != '\0';
+	if (g2_record) {
+		SLAM_INFO("G2_RECORD set: auto-recording EuRoC dataset to '%s'", g2_record_dir);
+	}
+	t.euroc_recorder = euroc_recorder_create(xfctx, g2_record ? g2_record_dir : NULL, t.cam_count, g2_record);
+
+	// Bring up telemetry if G2_TELEMETRY=<dir> is set (no-op otherwise). Idempotent:
+	// wmr_hmd_create() already calls this; only the first caller wins. Kept here so a
+	// standalone/non-WMR SLAM path still gets telemetry. Shutdown is owned by
+	// wmr_hmd_destroy() (runs after all producers stop -- BLOCKER-1 / MAJOR-4).
+	g2_telem_init(getenv("G2_TELEMETRY"));
 
 	t.last_imu_ts = INT64_MIN;
 	t.last_cam_ts = vector<timepoint_ns>(t.cam_count, INT64_MIN);

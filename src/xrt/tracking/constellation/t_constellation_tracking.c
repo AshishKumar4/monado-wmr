@@ -7,6 +7,7 @@
  * @ingroup constellation
  */
 #include <inttypes.h>
+#include <math.h>
 #include <stdio.h>
 
 #include "os/os_threading.h"
@@ -16,6 +17,7 @@
 
 #include "util/u_debug.h"
 #include "util/u_frame.h"
+#include "util/u_g2_telemetry.h"
 #include "util/u_logging.h"
 #include "util/u_sink.h"
 #include "util/u_trace_marker.h"
@@ -32,6 +34,18 @@ DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
 
 #define MIN_ROT_ERROR DEG_TO_RAD(30)
 #define MIN_POS_ERROR 0.10
+
+/* Covariance-driven prior-consistency gate: size the prior tolerance by the fusion's LIVE 1-sigma
+ * uncertainty (PRIOR_GATE_SIGMA sigmas), instead of a fixed value. MIN_*_ERROR above are the FLOORS
+ * (so when the fusion is confident the gate is no looser, and no tighter, than before -> no
+ * regression; flips are rejected by the large rotation error they produce regardless). MAX_*_ERROR
+ * are the CEILINGS that bound how far the gate widens after an optical dropout, when the fusion
+ * inflates its covariance -> the matcher then accepts the prior-refined frames it used to drop to the
+ * slow ab-initio search (the idle). Bigger re-acquisitions beyond the ceiling go through that search,
+ * not this gate. One statistical knob (the sigma multiplier); the rest are physical floors/ceilings. */
+#define PRIOR_GATE_SIGMA 3.0 /* ~99.7% per axis */
+#define MAX_POS_ERROR 0.60
+#define MAX_ROT_ERROR DEG_TO_RAD(60)
 
 #define CT_TRACE(c, ...) U_LOG_IFL_T(c->log_level, __VA_ARGS__)
 #define CT_DEBUG(c, ...) U_LOG_IFL_D(c->log_level, __VA_ARGS__)
@@ -56,6 +70,78 @@ pose_flip_YZ(const struct xrt_pose *in, struct xrt_pose *dest)
 	struct xrt_pose tmp;
 	math_pose_transform(&P_YZ_flip, in, &tmp);
 	math_pose_transform(&tmp, &P_YZ_flip, dest);
+}
+
+/* Map an xrt_device type to the telemetry device_id (0=HMD, 1=left, 2=right). */
+static uint8_t
+telem_device_id(const struct xrt_device *xdev)
+{
+	if (xdev == NULL)
+		return 0;
+	switch (xdev->device_type) {
+	case XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER: return 1;
+	case XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER: return 2;
+	default: return 0;
+	}
+}
+
+/* Pack an xrt_pose into the [px,py,pz, qx,qy,qz,qw] layout telemetry expects. */
+static void
+telem_pack_pose(const struct xrt_pose *p, float out[7])
+{
+	out[0] = p->position.x;
+	out[1] = p->position.y;
+	out[2] = p->position.z;
+	out[3] = p->orientation.x;
+	out[4] = p->orientation.y;
+	out[5] = p->orientation.z;
+	out[6] = p->orientation.w;
+}
+
+void
+t_constellation_camera_group_dump_json(const struct t_constellation_camera_group *cams, FILE *f)
+{
+	if (cams == NULL || f == NULL) {
+		return;
+	}
+	fprintf(f, "{\n");
+	fprintf(f, "  \"format\": \"g2-constellation-cameras\",\n");
+	fprintf(f, "  \"version\": 1,\n");
+	fprintf(f, "  \"cam_count\": %d,\n", cams->cam_count);
+	fprintf(f, "  \"cameras\": [\n");
+	for (int i = 0; i < cams->cam_count; i++) {
+		const struct t_constellation_camera *c = &cams->cams[i];
+		const struct t_camera_calibration *cal = &c->calibration;
+		fprintf(f, "    {\n");
+		fprintf(f, "      \"index\": %d,\n", i);
+		fprintf(f, "      \"slam_tracking_index\": %zu,\n", c->slam_tracking_index);
+		fprintf(f, "      \"width\": %d,\n", cal->image_size_pixels.w);
+		fprintf(f, "      \"height\": %d,\n", cal->image_size_pixels.h);
+		fprintf(f,
+		        "      \"intrinsics\": [[%.12g,%.12g,%.12g],[%.12g,%.12g,%.12g],[%.12g,%.12g,%.12g]],\n",
+		        cal->intrinsics[0][0], cal->intrinsics[0][1], cal->intrinsics[0][2], cal->intrinsics[1][0],
+		        cal->intrinsics[1][1], cal->intrinsics[1][2], cal->intrinsics[2][0], cal->intrinsics[2][1],
+		        cal->intrinsics[2][2]);
+		fprintf(f, "      \"distortion_model\": \"%s\",\n",
+		        t_stringify_camera_distortion_model(cal->distortion_model));
+		fprintf(f, "      \"distortion\": [");
+		for (int k = 0; k < XRT_DISTORTION_MAX_DIM; k++) {
+			fprintf(f, "%s%.12g", k ? "," : "", cal->distortion_parameters_as_array[k]);
+		}
+		fprintf(f, "],\n");
+		fprintf(f,
+		        "      \"P_imu_cam\": {\"position\": [%.12g,%.12g,%.12g], "
+		        "\"orientation\": [%.12g,%.12g,%.12g,%.12g]},\n",
+		        c->P_imu_cam.position.x, c->P_imu_cam.position.y, c->P_imu_cam.position.z,
+		        c->P_imu_cam.orientation.x, c->P_imu_cam.orientation.y, c->P_imu_cam.orientation.z,
+		        c->P_imu_cam.orientation.w);
+		fprintf(f, "      \"roi\": {\"x\": %d, \"y\": %d, \"w\": %d, \"h\": %d},\n", c->roi.offset.w,
+		        c->roi.offset.h, c->roi.extent.w, c->roi.extent.h);
+		fprintf(f, "      \"blob_min_threshold\": %u, \"blob_detect_threshold\": %u, \"min_threshold\": %u\n",
+		        c->blob_min_threshold, c->blob_detect_threshold, c->min_threshold);
+		fprintf(f, "    }%s\n", (i + 1 < cams->cam_count) ? "," : "");
+	}
+	fprintf(f, "  ]\n}\n");
 }
 
 struct t_constellation_tracked_device_connection
@@ -205,6 +291,21 @@ constellation_tracked_device_connection_notify_pose(struct t_constellation_track
 }
 
 static void
+constellation_tracked_device_connection_notify_leds(struct t_constellation_tracked_device_connection *ctdc,
+                                                    timepoint_ns frame_mono_ns,
+                                                    const struct xrt_pose *P_xrworld_cam,
+                                                    const struct t_constellation_cam_calib *cam_calib,
+                                                    const struct t_constellation_led_obs *leds,
+                                                    size_t led_count)
+{
+	os_mutex_lock(&ctdc->lock);
+	if (!ctdc->disconnected && ctdc->cb->push_observed_leds) {
+		ctdc->cb->push_observed_leds(ctdc->xdev, frame_mono_ns, P_xrworld_cam, cam_calib, leds, led_count);
+	}
+	os_mutex_unlock(&ctdc->lock);
+}
+
+static void
 constellation_tracked_device_connection_notify_brightness_update(struct t_constellation_tracked_device_connection *ctdc,
                                                                  uint8_t average_brightness)
 {
@@ -224,6 +325,22 @@ constellation_tracked_device_connection_get_led_model(struct t_constellation_tra
 	os_mutex_lock(&ctdc->lock);
 	if (!ctdc->disconnected && ctdc->cb->get_led_model) {
 		ret = ctdc->cb->get_led_model(ctdc->xdev, led_model);
+	}
+	os_mutex_unlock(&ctdc->lock);
+
+	return ret;
+}
+
+static bool
+constellation_tracked_device_connection_get_pose_uncertainty(struct t_constellation_tracked_device_connection *ctdc,
+                                                             double *position_std,
+                                                             double *orientation_std)
+{
+	bool ret = false;
+
+	os_mutex_lock(&ctdc->lock);
+	if (!ctdc->disconnected && ctdc->cb->get_pose_uncertainty) {
+		ret = ctdc->cb->get_pose_uncertainty(ctdc->xdev, position_std, orientation_std);
 	}
 	os_mutex_unlock(&ctdc->lock);
 
@@ -317,12 +434,66 @@ mark_matching_blobs(struct t_constellation_tracker *ct,
 	}
 }
 
+/* Feed this view's matched LEDs to the controller fusion as per-LED reprojection observations.
+ * Caller must have matched dev_state->blob_match_info to the folded pose. Deduplicated per view via
+ * led_emit_view_mask. Frames: led_obj = P_device_model . P_YZ(led->pos) (model->device, OpenCV->OpenXR)
+ * and the extrinsic is P_cam_world(CV) . P_YZ, so the filter reproduces the constellation projection. */
+static void
+emit_view_led_observations(struct tracking_sample_device_state *dev_state,
+                           struct constellation_tracker_device *device,
+                           struct constellation_tracker_camera_state *cam,
+                           struct tracking_sample_frame *view,
+                           int view_id,
+                           timepoint_ns sample_ts)
+{
+	if (view_id < 0 || view_id >= 16 || (dev_state->led_emit_view_mask & (1u << view_id)) != 0) {
+		return; // out of range, or already folded this view this sample
+	}
+
+	struct t_constellation_led_obs led_obs[MAX_OBJECT_LEDS];
+	int n_led_obs = 0;
+	for (int i = 0; i < dev_state->blob_match_info.num_visible_leds; i++) {
+		struct pose_metrics_visible_led_info *visible_led = &dev_state->blob_match_info.visible_leds[i];
+		if (visible_led->matched_blob == NULL) {
+			continue;
+		}
+		float nx = 0.f, ny = 0.f;
+		t_camera_models_undistort(&cam->camera_model.calib, visible_led->matched_blob->x,
+		                          visible_led->matched_blob->y, &nx, &ny);
+		// Undistorted normalized ray -> undistorted PIXEL via the real pinhole intrinsics, so the
+		// fusion reprojects in physical pixels and its noise/gate are focal-independent.
+		led_obs[n_led_obs].obs_px =
+		    (struct xrt_vec2){cam->camera_model.calib.fx * nx + cam->camera_model.calib.cx,
+		                      cam->camera_model.calib.fy * ny + cam->camera_model.calib.cy};
+		// led->pos is LED-MODEL frame; the fusion tracks the DEVICE pose, so map model->device after
+		// the OpenCV->OpenXR YZ flip (mirrors the forward model flip(P_xrworld_device . P_device_model)).
+		struct xrt_vec3 led_flip = {visible_led->led->pos.x, -visible_led->led->pos.y,
+		                            -visible_led->led->pos.z};
+		math_pose_transform_point(&device->led_model.P_device_model, &led_flip,
+		                          &led_obs[n_led_obs].led_obj);
+		n_led_obs++;
+	}
+	if (n_led_obs == 0) {
+		return;
+	}
+
+	const struct xrt_pose P_YZ = {{1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}};
+	struct xrt_pose P_xrworld_cam;
+	math_pose_transform(&view->P_cam_world, &P_YZ, &P_xrworld_cam);
+	const struct t_constellation_cam_calib cam_calib = {cam->camera_model.calib.fx, cam->camera_model.calib.fy,
+	                                                    cam->camera_model.calib.cx, cam->camera_model.calib.cy};
+	constellation_tracked_device_connection_notify_leds(device->connection, sample_ts, &P_xrworld_cam,
+	                                                    &cam_calib, led_obs, (size_t)n_led_obs);
+	dev_state->led_emit_view_mask |= (1u << view_id);
+}
+
 static void
 submit_device_pose(struct t_constellation_tracker *ct,
                    struct tracking_sample_device_state *dev_state,
                    struct constellation_tracking_sample *sample,
                    int view_id,
-                   struct xrt_pose *P_cam_obj)
+                   struct xrt_pose *P_cam_obj,
+                   bool is_recovered)
 {
 	struct constellation_tracker_camera_state *cam = ct->cam + view_id;
 	struct tracking_sample_frame *view = sample->views + view_id;
@@ -336,8 +507,8 @@ submit_device_pose(struct t_constellation_tracker *ct,
 
 	struct xrt_pose refine_pose = *P_cam_obj;
 
-	int num_leds_out;
-	int num_inliers;
+	int num_leds_out = 0;
+	int num_inliers = 0;
 
 	if (!ransac_pnp_pose(&refine_pose, view->bwobs->blobs, view->bwobs->num_blobs, &device->led_model,
 	                     &cam->camera_model, &num_leds_out, &num_inliers)) {
@@ -357,6 +528,30 @@ submit_device_pose(struct t_constellation_tracker *ct,
 	os_mutex_lock(&cam->bw_lock);
 	blobwatch_update_labels(cam->bw, view->bwobs, device->led_model.id);
 	os_mutex_unlock(&cam->bw_lock);
+
+	/* Telemetry: an accepted optical pose. Pose is camera-relative [p,q].
+	 * A pose that came in via the labelled-blob re-acquisition path is marked
+	 * outcome=2 (recovered) so analysts can distinguish recoveries from normal
+	 * accepts (MAJOR-5); all others are outcome=1 (accepted). */
+	if (g2_telem_enabled()) {
+		uint8_t dev_id = telem_device_id(device->connection->xdev);
+		bool is_new_lock = !dev_state->found_device_pose;
+		float pose7[7];
+		telem_pack_pose(P_cam_obj, pose7);
+		g2_telem_pose_attempt(dev_id, (uint8_t)view_id, (uint64_t)sample->timestamp,
+		                      (uint8_t)score->visible_leds, (uint8_t)score->matched_blobs,
+		                      (uint8_t)num_inliers, (float)score->reprojection_error, pose7,
+		                      /* outcome */ is_recovered ? 2 /* recovered */ : 1 /* accepted */);
+		/* First accepted view for this device in this sample == lock (re)acquired. */
+		if (is_new_lock) {
+			g2_telem_event(dev_id, (uint64_t)sample->timestamp, 1 /* lock_acquired */, 0.0f);
+		}
+	}
+
+	/* Fold this view's matched LEDs into the fusion (tightly-coupled per-LED ESKF). Done per accepted
+	 * view, independent of the single "winning view" last_seen bookkeeping below, so every view that
+	 * matched contributes its LEDs (the helper's per-view mask dedups against the sub-threshold paths). */
+	emit_view_led_observations(dev_state, device, cam, view, view_id, sample->timestamp);
 
 	if (!dev_state->found_device_pose) {
 		math_pose_transform(&view->P_world_cam, P_cam_obj, &dev_state->final_pose);
@@ -441,7 +636,8 @@ submit_device_pose(struct t_constellation_tracker *ct,
 		struct xrt_pose P_xrworld_device;
 		math_pose_transform(&P_xrworld_model, &device->led_model.P_model_device, &P_xrworld_device);
 
-		// calculate the average brightness of all the matched blobs
+		// Average matched-blob brightness for the LED-intensity / brightness feedback. (The per-LED
+		// fusion feed is emitted by emit_view_led_observations above, per view.)
 		uint32_t average_brightness = 0;
 		int matched_blobs = 0;
 		for (int i = 0; i < dev_state->blob_match_info.num_visible_leds; i++) {
@@ -531,7 +727,7 @@ device_try_global_pose(struct t_constellation_tracker *ct,
 		                                      &cam->camera_model, NULL);
 
 		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD | POSE_MATCH_LED_IDS)) {
-			submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj_candidate);
+			submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj_candidate, false /* not a recovery */);
 			ret = true;
 		}
 	}
@@ -539,14 +735,115 @@ device_try_global_pose(struct t_constellation_tracker *ct,
 	return ret;
 }
 
-/* Try and recover the pose from labelled blobs */
+/* Solve a device pose for one view from the blobs currently labelled for this device: RANSAC-PnP
+ * seeded by the prior, scored against the prior, and submitted if it is a GOOD match. Shared by the
+ * recover-from-labelled-blobs and prior-refine fast paths, which differ only in how the blobs got
+ * labelled (frame-to-frame tracking vs prior projection) and in the telemetry outcome. Returns true
+ * if a pose was submitted. */
+static bool
+device_solve_view_from_labelled(struct t_constellation_tracker *ct,
+                                struct tracking_sample_device_state *dev_state,
+                                struct constellation_tracking_sample *sample,
+                                int view_id,
+                                bool is_recovery)
+{
+	struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
+	struct t_constellation_led_model *leds_model = &device->led_model;
+	struct tracking_sample_frame *view = sample->views + view_id;
+	struct constellation_tracker_camera_state *cam = ct->cam + view_id;
+	blobservation *bwobs = view->bwobs;
+	const uint8_t telem_dev = telem_device_id(device->connection->xdev);
+
+	/* Need enough blobs labelled for THIS device to constrain a PnP solve. */
+	int num_blobs = 0;
+	for (int index = 0; index < bwobs->num_blobs; index++) {
+		if (LED_OBJECT_ID(bwobs->blobs[index].led_id) == leds_model->id) {
+			num_blobs++;
+		}
+	}
+	if (num_blobs < 4) {
+		return false;
+	}
+
+	struct xrt_pose P_cam_obj_prior;
+	math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
+
+	if (is_recovery) {
+		/* Telemetry: a recovery attempt from labelled blobs for this device/view. */
+		g2_telem_event(telem_dev, (uint64_t)sample->timestamp, 2 /* recover_attempt */, (float)num_blobs);
+	}
+
+	struct xrt_pose P_cam_obj = P_cam_obj_prior;
+	if (!ransac_pnp_pose(&P_cam_obj, bwobs->blobs, bwobs->num_blobs, leds_model, &cam->camera_model, NULL, NULL)) {
+		CT_DEBUG(ct, "Camera %d RANSAC-PnP for device %d from %d blobs failed", view_id, leds_model->id,
+		         num_blobs);
+		if (g2_telem_enabled()) {
+			float pose7[7];
+			telem_pack_pose(&P_cam_obj, pose7);
+			g2_telem_pose_attempt(telem_dev, (uint8_t)view_id, (uint64_t)sample->timestamp, 0,
+			                      (uint8_t)num_blobs, 0, 0.0f, pose7, 0 /* rejected */);
+		}
+		return false;
+	}
+
+	pose_metrics_evaluate_pose_with_prior(&dev_state->score, &P_cam_obj, true, &P_cam_obj_prior,
+	                                      &dev_state->prior_pos_error, &dev_state->prior_rot_error, bwobs->blobs,
+	                                      bwobs->num_blobs, &device->led_model, &cam->camera_model, NULL);
+
+	if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD)) {
+		CT_DEBUG(ct, "Camera %d %s pose for device %d from %d blobs", view_id,
+		         is_recovery ? "recovered" : "prior-refined", leds_model->id, num_blobs);
+		/* submit_device_pose emits the accepted pose_attempt (outcome 2=recovered vs 1=accepted). */
+		submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj, is_recovery);
+		return true;
+	}
+
+	/* Sub-threshold capture: pose not accepted, but the PnP solve is geometrically consistent, so
+	 * fold its matched LEDs (each gated per-LED in the fusion) — partial/dropout frames still inform
+	 * tracking instead of being discarded. */
+	pose_metrics_match_pose_to_blobs(&P_cam_obj, bwobs->blobs, bwobs->num_blobs, leds_model,
+	                                 &cam->camera_model, &dev_state->blob_match_info);
+	emit_view_led_observations(dev_state, device, cam, view, view_id, sample->timestamp);
+
+	if (g2_telem_enabled()) {
+		float pose7[7];
+		telem_pack_pose(&P_cam_obj, pose7);
+		g2_telem_pose_attempt(telem_dev, (uint8_t)view_id, (uint64_t)sample->timestamp,
+		                      (uint8_t)dev_state->score.visible_leds, (uint8_t)dev_state->score.matched_blobs, 0,
+		                      (float)dev_state->score.reprojection_error, pose7, 0 /* rejected */);
+	}
+	return false;
+}
+
+/* Try and recover the pose from blobs already labelled for this device by frame-to-frame tracking. */
 static bool
 device_try_recover_pose(struct t_constellation_tracker *ct,
                         struct tracking_sample_device_state *dev_state,
                         struct constellation_tracking_sample *sample)
 {
+	for (int view_id = 0; view_id < sample->n_views; view_id++) {
+		struct tracking_sample_frame *view = sample->views + view_id;
+		if (view->bwobs == NULL || view->bwobs->num_blobs == 0) {
+			continue;
+		}
+		if (device_solve_view_from_labelled(ct, dev_state, sample, view_id, true /* recovery */)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Prior-refine fast path: seed blob labels from the IMU-predicted pose — project the prior into each
+ * view and label the blobs the LEDs land on — then solve. This lets a slightly-off prior be pulled to
+ * a full PnP solve instead of falling through to the slow ab-initio search: the main cure for the low
+ * accept rate and the re-acquisition dropout/snap. Mislabels from a bad prior are rejected by the
+ * prior-consistency gate inside device_solve_view_from_labelled, so it only ever helps. */
+static bool
+device_try_prior_refine(struct t_constellation_tracker *ct,
+                        struct tracking_sample_device_state *dev_state,
+                        struct constellation_tracking_sample *sample)
+{
 	struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
-	struct t_constellation_led_model *leds_model = &device->led_model;
 
 	for (int view_id = 0; view_id < sample->n_views; view_id++) {
 		struct tracking_sample_frame *view = sample->views + view_id;
@@ -556,69 +853,18 @@ device_try_recover_pose(struct t_constellation_tracker *ct,
 			continue;
 		}
 
-		struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
-		blobservation *bwobs = view->bwobs;
-
-		/* See if we still have enough labelled blobs to try to re-acquire the pose without a
-		 * full search */
-		int num_blobs = 0;
-		for (int index = 0; index < bwobs->num_blobs; index++) {
-			struct blob *b = bwobs->blobs + index;
-			if (LED_OBJECT_ID(b->led_id) == leds_model->id) {
-				num_blobs++;
-			}
-		}
-		if (num_blobs < 4) {
-			continue;
-		}
-
 		struct xrt_pose P_cam_obj_prior;
 		math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
 
-		CT_DEBUG(ct,
-		         "Camera %d trying to reacquire device %d from %u blobs and cam-relative pose %f %f %f %f pos "
-		         "%f %f %f "
-		         "global prior pose %f %f %f %f pos %f %f %f",
-		         view_id, leds_model->id, num_blobs, P_cam_obj_prior.orientation.x,
-		         P_cam_obj_prior.orientation.y, P_cam_obj_prior.orientation.z, P_cam_obj_prior.orientation.w,
-		         P_cam_obj_prior.position.x, P_cam_obj_prior.position.y, P_cam_obj_prior.position.z,
-		         dev_state->P_world_obj_prior.orientation.x, dev_state->P_world_obj_prior.orientation.y,
-		         dev_state->P_world_obj_prior.orientation.z, dev_state->P_world_obj_prior.orientation.w,
-		         dev_state->P_world_obj_prior.position.x, dev_state->P_world_obj_prior.position.y,
-		         dev_state->P_world_obj_prior.position.z);
+		/* Label this view's blobs from where the predicted pose says the LEDs project. */
+		pose_metrics_match_pose_to_blobs(&P_cam_obj_prior, view->bwobs->blobs, view->bwobs->num_blobs,
+		                                 &device->led_model, &cam->camera_model, &dev_state->blob_match_info);
+		mark_matching_blobs(ct, &P_cam_obj_prior, view->bwobs, &device->led_model, &dev_state->blob_match_info);
 
-		struct xrt_pose P_cam_obj = P_cam_obj_prior;
-
-		if (!ransac_pnp_pose(&P_cam_obj, bwobs->blobs, bwobs->num_blobs, leds_model, &cam->camera_model, NULL,
-		                     NULL)) {
-			CT_DEBUG(ct, "Camera %d RANSAC-PnP for device %d from %u blobs failed", view_id, leds_model->id,
-			         num_blobs);
-			continue;
-		}
-
-		pose_metrics_evaluate_pose_with_prior(&dev_state->score, &P_cam_obj, true, &P_cam_obj_prior,
-		                                      &dev_state->prior_pos_error, &dev_state->prior_rot_error,
-		                                      bwobs->blobs, bwobs->num_blobs, &device->led_model,
-		                                      &cam->camera_model, NULL);
-
-		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD)) {
-			CT_DEBUG(ct, "Camera %d RANSAC-PnP recovered pose for device %d from %u blobs", view_id,
-			         leds_model->id, num_blobs);
-			submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj);
+		if (device_solve_view_from_labelled(ct, dev_state, sample, view_id, false /* normal accept */)) {
 			return true;
 		}
-		CT_DEBUG(ct,
-		         "Camera %d device %d had %d prior blobs, but failed match with flags 0x%x. "
-		         "Yielded pose %f %f %f %f pos %f %f %f (match %d of %d visible) rot_error %f %f %f pos_error "
-		         "%f %f %f",
-		         view_id, leds_model->id, num_blobs, dev_state->score.match_flags, P_cam_obj.orientation.x,
-		         P_cam_obj.orientation.y, P_cam_obj.orientation.z, P_cam_obj.orientation.w,
-		         P_cam_obj.position.x, P_cam_obj.position.y, P_cam_obj.position.z,
-		         dev_state->score.matched_blobs, dev_state->score.visible_leds, dev_state->score.orient_error.x,
-		         dev_state->score.orient_error.y, dev_state->score.orient_error.z, dev_state->score.pos_error.x,
-		         dev_state->score.pos_error.y, dev_state->score.pos_error.z);
 	}
-
 	return false;
 }
 
@@ -680,8 +926,14 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		u_frame_create_roi(xf, cam->roi, &view->vframe);
 		view->bw = cam->bw;
 
+		/* The actual exposure for this frame is encoded in the full frame's pixel header
+		 * (wmr_camera.c: data[6..7]); read it from xf, not the ROI sub-frame which excludes
+		 * the header row. Same value for all cameras on a controller frame. */
+		uint16_t frame_exposure =
+		    (xf->data != NULL && xf->size > 7) ? (uint16_t)((xf->data[6] << 8) | xf->data[7]) : 0;
+
 		os_mutex_lock(&cam->bw_lock);
-		blobwatch_process(cam->bw, view->vframe, &view->bwobs);
+		blobwatch_process(cam->bw, view->vframe, frame_exposure, 0, &view->bwobs);
 		os_mutex_unlock(&cam->bw_lock);
 
 		if (view->bwobs == NULL) {
@@ -745,11 +997,24 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		// Incoming controller pose is in OpenXR. Flip it to OpenCV for all our operations
 		pose_flip_YZ(&P_xrworld_model, &dev_state->P_world_obj_prior);
 
-		//! @todo: Get actual error bounds from fusion
+		/* Covariance-driven prior gate: set the prior-consistency tolerance from the fusion's live
+		 * 1-sigma uncertainty (PRIOR_GATE_SIGMA sigmas), clamped to [MIN_*_ERROR, MAX_*_ERROR]. A
+		 * single scalar sigma applied isotropically is the frame-robust choice (the fusion covariance
+		 * is world-frame; these bounds are used in the matcher's frame). When the fusion isn't tracking
+		 * yet, fall back to the fixed floor. This widens the gate after an optical dropout (so
+		 * prior-refine accepts frames it would otherwise drop to the slow search) and keeps it tight
+		 * when confident. */
+		float pos_bound = MIN_POS_ERROR, rot_bound = MIN_ROT_ERROR;
+		double pos_std = 0.0, rot_std = 0.0;
+		if (constellation_tracked_device_connection_get_pose_uncertainty(device->connection, &pos_std,
+		                                                                 &rot_std)) {
+			pos_bound = (float)fmin(fmax(PRIOR_GATE_SIGMA * pos_std, MIN_POS_ERROR), MAX_POS_ERROR);
+			rot_bound = (float)fmin(fmax(PRIOR_GATE_SIGMA * rot_std, MIN_ROT_ERROR), MAX_ROT_ERROR);
+		}
 		dev_state->prior_pos_error.x = dev_state->prior_pos_error.y = dev_state->prior_pos_error.z =
-		    MIN_POS_ERROR;
+		    pos_bound;
 		dev_state->prior_rot_error.x = dev_state->prior_rot_error.y = dev_state->prior_rot_error.z =
-		    MIN_ROT_ERROR;
+		    rot_bound;
 		dev_state->gravity_error_rad = MIN_ROT_ERROR;
 
 		dev_state->have_last_seen_pose = device->have_last_seen_pose;
@@ -790,6 +1055,14 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		if (device_try_recover_pose(ct, dev_state, sample)) {
 			CT_DEBUG(ct, "Found fast match search for device %d in view %d from labelled blobs",
 			         device->led_model.id, dev_state->found_pose_view_id);
+			continue;
+		}
+		/* Last fast option before the slow ab-initio search: re-label the blobs from the predicted
+		 * pose and solve. Catches the common "prior slightly off, blobs present, tracking labels
+		 * lost" case that the verbatim-prior checks above miss — the main accept-rate/dropout win. */
+		if (device_try_prior_refine(ct, dev_state, sample)) {
+			CT_DEBUG(ct, "Refined device %d from the predicted pose in view %d", device->led_model.id,
+			         dev_state->found_pose_view_id);
 			continue;
 		}
 		if (!dev_state->found_device_pose) {
@@ -921,7 +1194,7 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
 				        &view->cam_gravity_vector, dev_state->gravity_error_rad, &dev_state->score)) {
 					CT_DEBUG(ct, "Found a pose on cam %u device %d long search pass %d", view_id,
 					         device->led_model.id, pass);
-					submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj);
+					submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj, false /* not a recovery */);
 					dev_found[d] = true;
 					break;
 				}
@@ -932,8 +1205,15 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
 	for (int d = 0; d < sample->n_devices; d++) {
 		if (!dev_found[d]) {
 			// if a long analysis did not find the device at all, then we push that it has no brightness
-			constellation_tracked_device_connection_notify_brightness_update(
-			    ct->devices[sample->devices[d].dev_index].connection, 0);
+			struct constellation_tracker_device *lost_dev = &ct->devices[sample->devices[d].dev_index];
+			constellation_tracked_device_connection_notify_brightness_update(lost_dev->connection, 0);
+
+			/* Telemetry: a device that was previously tracked could not be found at all
+			 * in this frame (fast + long search both failed) -> lock lost. */
+			if (sample->devices[d].have_last_seen_pose) {
+				g2_telem_event(telem_device_id(lost_dev->connection->xdev),
+				               (uint64_t)sample->timestamp, 0 /* lock_lost */, 0.0f);
+			}
 
 			// update the controller masks for this controller to mark it as not active
 			if (ct->controller_masks_sink) {
@@ -1097,7 +1377,7 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
 		t_camera_model_params_from_t_camera_calibration(&cam_cfg->calibration, &cam->camera_model.calib);
 
 		os_mutex_init(&cam->bw_lock);
-		cam->bw = blobwatch_new(cam_cfg->blob_min_threshold, cam_cfg->blob_detect_threshold);
+		cam->bw = blobwatch_new(cam_cfg->blob_min_threshold, cam_cfg->blob_detect_threshold, (uint8_t)i);
 		cam->cs = correspondence_search_new(&cam->camera_model);
 	}
 

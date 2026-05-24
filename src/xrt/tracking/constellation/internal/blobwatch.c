@@ -13,10 +13,12 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "util/u_logging.h"
+#include "util/u_g2_telemetry.h"
 
 #include "blobwatch.h"
 
@@ -98,7 +100,15 @@ struct blobwatch
 	uint32_t next_blob_id;
 	uint8_t pixel_threshold;         /* Minimum pixel magnitude considered non-black */
 	uint8_t blob_required_threshold; /* Minimum pixel magnitude a blob must contain somewhere to be retained */
+	uint8_t cam_id;                  /* Camera index this blobwatch processes (for telemetry) */
 	int blob_max_wh;
+
+	/* Blob qualification: reject non-LED shapes (window edges, reflections, streaks). An LED images
+	 * as a small, roughly round, well-filled spot, so reject blobs too elongated or too sparse for
+	 * their bounding box. Lenient defaults; set 0 to disable a test. Tunable so a bright-room capture
+	 * can refine them. */
+	float blob_min_fill;   /* min area/(w*h): ~0.78 for a filled disk, far lower for a streak/edge */
+	float blob_min_aspect; /* min(w,h)/max(w,h): ~1 for an LED, low for a streak */
 
 	bool debug;
 
@@ -115,7 +125,7 @@ struct blobwatch
  * Returns the newly allocated blobwatch structure.
  */
 blobwatch *
-blobwatch_new(uint8_t pixel_threshold, uint8_t blob_required_threshold)
+blobwatch_new(uint8_t pixel_threshold, uint8_t blob_required_threshold, uint8_t cam_id)
 {
 	blobwatch *bw = malloc(sizeof(*bw));
 	int i;
@@ -125,6 +135,7 @@ blobwatch_new(uint8_t pixel_threshold, uint8_t blob_required_threshold)
 
 	memset(bw, 0, sizeof(*bw));
 	bw->next_blob_id = 1;
+	bw->cam_id = cam_id;
 
 	/* Minimum pixel magnitude to be included in a blob at all */
 	bw->pixel_threshold = pixel_threshold;
@@ -137,6 +148,8 @@ blobwatch_new(uint8_t pixel_threshold, uint8_t blob_required_threshold)
 	/* Don't store blobs that are too big to be LEDs sensibly
 	 * (arbitrary 35 pixel cut-off. FIXME: revisit this number) */
 	bw->blob_max_wh = 35;
+	bw->blob_min_fill = 0.30f;
+	bw->blob_min_aspect = 0.30f;
 
 	bw->last_observation = NULL;
 	bw->debug = true;
@@ -241,6 +254,24 @@ extent_to_blobs(blobwatch *bw, blobservation *ob, struct extent *e, int y, struc
 	/* Check width and height against the blob "maximum size" */
 	if (y - e->top > bw->blob_max_wh || e->right - e->left > bw->blob_max_wh)
 		return;
+
+	/* Reject non-LED shapes: an LED images as a small, roughly round, well-filled spot, so a very
+	 * elongated or sparse blob is a window edge / reflection / streak, not an LED. This is the main
+	 * defence against bright-room false blobs that pollute the constellation matcher. */
+	{
+		const int blob_w = e->right - e->left + 1;
+		const int blob_h = y - e->top + 1;
+		const int lo = min(blob_w, blob_h);
+		const int hi = max(blob_w, blob_h);
+		if (bw->blob_min_aspect > 0.0f && hi > 0 && (float)lo / (float)hi < bw->blob_min_aspect) {
+			ob->dropped_shape_blobs++;
+			return;
+		}
+		if (bw->blob_min_fill > 0.0f && (float)e->area / (float)(blob_w * blob_h) < bw->blob_min_fill) {
+			ob->dropped_shape_blobs++;
+			return;
+		}
+	}
 
 	/* In the future we could generate multiple blobs from one extent if we detect
 	 * it as multiple LEDs */
@@ -384,6 +415,7 @@ process_frame(blobwatch *bw, blobservation *ob, struct xrt_frame *frame)
 
 	ob->num_blobs = 0;
 	ob->dropped_dark_blobs = 0;
+	ob->dropped_shape_blobs = 0;
 
 	uint8_t *line = frame->data;
 	process_scanline(line, bw, 0, &el1, NULL, frame, ob);
@@ -427,12 +459,48 @@ copy_matching_blob(struct blob *to, struct blob *from)
  * to the blobwatch via blobwatch_release_observation()
  */
 void
-blobwatch_process(blobwatch *bw, struct xrt_frame *frame, blobservation **output)
+blobwatch_process(blobwatch *bw, struct xrt_frame *frame, uint16_t exposure, uint16_t gain, blobservation **output)
 {
 	blobservation *ob = POP_QUEUE(&bw->observation_q);
 	assert(ob != NULL);
 
 	process_frame(bw, ob, frame);
+
+	/* Optional: dump the actual controller-tracking frame (what the constellation tracker
+	 * sees) as PGM, for offline exposure tuning / inspection — the EuRoC recorder only
+	 * captures the SLAM-exposure frames. Enabled by G2_DUMP_FRAMES=<dir>; rate-limited. */
+	{
+		static const char *dump_dir = NULL;
+		static bool dump_init = false;
+		static uint32_t dump_ctr = 0;
+		if (!dump_init) {
+			dump_dir = getenv("G2_DUMP_FRAMES");
+			dump_init = true;
+		}
+		if (dump_dir != NULL && dump_dir[0] != '\0' && (dump_ctr++ % 15) == 0 && frame->data != NULL &&
+		    frame->width > 0 && frame->stride >= frame->width) {
+			char path[512];
+			snprintf(path, sizeof(path), "%s/cam%u_e%u_%010lu_n%u.pgm", dump_dir, bw->cam_id,
+			         (unsigned)exposure, (unsigned long)frame->source_sequence, (unsigned)ob->num_blobs);
+			FILE *fp = fopen(path, "wb");
+			if (fp != NULL) {
+				fprintf(fp, "P5\n%u %u\n255\n", frame->width, frame->height);
+				for (uint32_t y = 0; y < frame->height; y++) {
+					fwrite(frame->data + (size_t)y * frame->stride, 1, frame->width, fp);
+				}
+				fclose(fp);
+			}
+		}
+	}
+
+	/* Telemetry: one row per processed frame per camera. n_blobs is what we just
+	 * produced; frame_seq comes from the source frame. hw_ts_ns uses frame->timestamp,
+	 * the monotonic-converted frame time (NOT the raw device-clock source_timestamp),
+	 * so it shares the common clock with every other stream's t_mono_ns (MAJOR-3).
+	 * exposure is the authoritative per-frame value read from the camera's pixel header
+	 * (plumbed in by the caller); gain is the commanded value (0 if unknown). */
+	g2_telem_frame(bw->cam_id, (uint64_t)frame->timestamp, (uint32_t)frame->source_sequence,
+	               (uint16_t)ob->num_blobs, exposure, gain, 0);
 
 	/* Return observed blobs */
 	if (output) {

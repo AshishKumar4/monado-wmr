@@ -80,17 +80,18 @@ struct blobservation
 	uint8_t tracked[MAX_BLOBS_PER_FRAME];
 
 	int dropped_dark_blobs;
+	int dropped_shape_blobs;
 };
 
 typedef struct blobwatch blobwatch;
 typedef struct blobservation blobservation;
 
 blobwatch *
-blobwatch_new(uint8_t pixel_threshold, uint8_t blob_required_threshold);
+blobwatch_new(uint8_t pixel_threshold, uint8_t blob_required_threshold, uint8_t cam_id);
 void
 blobwatch_free(blobwatch *bw);
 void
-blobwatch_process(blobwatch *bw, struct xrt_frame *frame, blobservation **output);
+blobwatch_process(blobwatch *bw, struct xrt_frame *frame, uint16_t exposure, uint16_t gain, blobservation **output);
 void
 blobwatch_update_labels(blobwatch *bw, blobservation *ob, uint8_t device_id);
 void
