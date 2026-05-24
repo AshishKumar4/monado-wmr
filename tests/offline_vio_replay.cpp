@@ -299,6 +299,73 @@ load_gt(const std::string &mav0)
 	return v;
 }
 
+// euroc head IMU (mav0/imu0/data.csv: t, wx,wy,wz, ax,ay,az)
+std::vector<ImuRow>
+load_euroc_imu(const std::string &mav0)
+{
+	std::vector<ImuRow> out;
+	std::ifstream csv(mav0 + "/imu0/data.csv");
+	std::string line;
+	std::getline(csv, line);
+	while (std::getline(csv, line)) {
+		long long t = 0;
+		double wx, wy, wz, ax, ay, az;
+		if (sscanf(line.c_str(), "%lld,%lf,%lf,%lf,%lf,%lf,%lf", &t, &wx, &wy, &wz, &ax, &ay, &az) == 7) {
+			ImuRow r{};
+			r.t_ns = t;
+			r.ax = (float)ax;
+			r.ay = (float)ay;
+			r.az = (float)az;
+			out.push_back(r);
+		}
+	}
+	return out;
+}
+
+// Align the gt world to OpenXR Y-up. The euroc gt world is gravity-aligned but in a different
+// convention than the live get_tracked_pose supplied, so the constellation's gravity prior (which gates
+// the ab-initio search) is wrong. Derive the constant correction R_fix that maps the gt world's gravity-
+// up to +Y from the head IMU's measured gravity (frame-independent), and apply it to every head pose.
+void
+apply_gravity_fix(std::vector<HeadPose> &gt, const std::vector<ImuRow> &himu)
+{
+	if (gt.empty() || himu.empty()) {
+		return;
+	}
+	std::vector<float> vx, vy, vz;
+	size_t gi = 0;
+	for (const ImuRow &s : himu) {
+		while (gi + 1 < gt.size() &&
+		       llabs(gt[gi + 1].t_ns - s.t_ns) <= llabs(gt[gi].t_ns - s.t_ns)) {
+			gi++;
+		}
+		struct xrt_vec3 a = {s.ax, s.ay, s.az}; // specific force ~ world-up in the head-IMU frame
+		math_vec3_normalize(&a);
+		struct xrt_vec3 up_world;
+		math_quat_rotate_vec3(&gt[gi].pose.orientation, &a, &up_world); // -> up in the gt world frame
+		vx.push_back(up_world.x);
+		vy.push_back(up_world.y);
+		vz.push_back(up_world.z);
+	}
+	auto med = [](std::vector<float> &v) {
+		std::sort(v.begin(), v.end());
+		return v[v.size() / 2];
+	};
+	struct xrt_vec3 up = {med(vx), med(vy), med(vz)}; // median is robust to motion accel
+	math_vec3_normalize(&up);
+	struct xrt_quat Rfix;
+	struct xrt_vec3 plusY = {0.0f, 1.0f, 0.0f};
+	math_quat_from_vec_a_to_vec_b(&up, &plusY, &Rfix);
+	struct xrt_pose fix = {Rfix, {0.0f, 0.0f, 0.0f}};
+	for (HeadPose &h : gt) {
+		struct xrt_pose corrected;
+		math_pose_transform(&fix, &h.pose, &corrected);
+		h.pose = corrected;
+	}
+	printf("gravity fix: gt-world up was (%.3f,%.3f,%.3f) -> rotated to +Y across %zu head poses\n", up.x,
+	       up.y, up.z, gt.size());
+}
+
 // ---- fake xrt_device shared no-ops ----
 xrt_result_t
 dev_noop_update(struct xrt_device *)
@@ -482,6 +549,7 @@ main(int argc, char **argv)
 		t_constellation_led_model_clear(&m);
 	}
 	std::vector<HeadPose> gt = load_gt(mav0);
+	apply_gravity_fix(gt, load_euroc_imu(mav0)); // align gt world to Y-up so the gravity prior is valid
 	std::vector<MosaicFrame> frames = index_euroc(mav0, cams.cam_count);
 	std::vector<ImuRow> imu = load_imu(telem, device_id);
 	printf("inputs: %d cams, %zu LEDs, %zu gt head poses, %zu frames, %zu IMU (device %d)\n", cams.cam_count,
