@@ -37,7 +37,9 @@
 #include "xrt/xrt_frame.h"
 #include "xrt/xrt_tracking.h"
 #include "math/m_api.h"
+#include "math/m_imu_3dof.h"
 #include "util/u_frame.h"
+#include "util/u_g2_telemetry.h"
 #include "tracking/t_constellation_tracking.h"
 #include "tracking/t_led_models.h"
 #include "tracking/t_tracker_kalman_fusion_c.h"
@@ -406,24 +408,29 @@ index_pgm_dump(const std::string &dir, int cam_count)
 	return out;
 }
 
-// Head pose from the recorded HMD IMU (telemetry device 0): per-sample gravity-aligned orientation
-// (measured up -> +Y, position 0). Sufficient for the constellation's gravity prior + camera placement
-// when no SLAM head trajectory was recorded; yaw is unconstrained (fine — the matcher works in the
-// camera frame and the ESKF tracks the controller consistently in this gravity-aligned world).
+// Head ORIENTATION from the recorded HMD IMU (telemetry device 0) via Monado's 3DOF filter: gyro
+// integration (gives yaw) + gravity anchoring (roll/pitch). Far better than a gravity-only up-align,
+// which has no yaw and leaves the camera world misoriented -> systematically wrong matcher prior (it
+// drove the harness's spurious ~76-deg orientation error vs live's ~3 deg). Position is left 0 (no SLAM
+// head trajectory; the matcher works in the camera frame, and the ESKF tracks the controller
+// consistently in this gravity-aligned, slowly-yaw-drifting world).
 std::vector<HeadPose>
 head_poses_from_imu(const std::vector<ImuRow> &hmd_imu)
 {
 	std::vector<HeadPose> out;
-	const struct xrt_vec3 plusY = {0.0f, 1.0f, 0.0f};
+	struct m_imu_3dof dof;
+	m_imu_3dof_init(&dof, M_IMU_3DOF_USE_GRAVITY_DUR_300MS);
 	for (const ImuRow &s : hmd_imu) {
-		struct xrt_vec3 up = {s.ax, s.ay, s.az};
-		math_vec3_normalize(&up);
+		const struct xrt_vec3 a = {s.ax, s.ay, s.az};
+		const struct xrt_vec3 g = {s.gx, s.gy, s.gz};
+		m_imu_3dof_update(&dof, (uint64_t)s.t_ns, &a, &g);
 		HeadPose h{};
 		h.t_ns = s.t_ns;
 		h.pose.position = {0.0f, 0.0f, 0.0f};
-		math_quat_from_vec_a_to_vec_b(&up, &plusY, &h.pose.orientation);
+		h.pose.orientation = dof.rot;
 		out.push_back(h);
 	}
+	m_imu_3dof_close(&dof);
 	return out;
 }
 
@@ -661,6 +668,11 @@ main(int argc, char **argv)
 	    device_id == 1 ? XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER : XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER;
 	snprintf(ctrl.base.str, sizeof(ctrl.base.str), "offline-controller");
 
+	// Optional: emit a standard telemetry capture of the replay (G2_REPLAY_TELEMETRY=<dir>), so the
+	// constellation's pose_attempt/frame/event streams are written and the existing analysis tools
+	// (analyze.py, plot_session.py, imu_vs_optical_drift.py) work on the replay just like a live session.
+	g2_telem_init(getenv("G2_REPLAY_TELEMETRY"));
+
 	struct xrt_frame_context xfctx = {};
 	struct t_constellation_tracker *tracker = nullptr;
 	struct xrt_frame_sink *sink = nullptr;
@@ -743,6 +755,7 @@ main(int argc, char **argv)
 	}
 
 	xrt_frame_context_destroy_nodes(&xfctx); // stops the tracker threads
+	g2_telem_shutdown();                     // flush + close the replay telemetry (no-op if disabled)
 	kalman_fusion_destroy(ctrl.kf);
 	return 0;
 }
