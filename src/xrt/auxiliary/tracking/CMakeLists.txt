@@ -14,6 +14,10 @@ add_library(
 	t_openvr_tracker.cpp
 	t_openvr_tracker.h
 	t_tracking.h
+	t_tracker_kalman_fusion.hpp
+	t_tracker_kalman_fusion.cpp
+	t_tracker_kalman_fusion_c.cpp
+	t_tracker_kalman_fusion_c.h
 	)
 target_link_libraries(
 	aux_tracking
@@ -43,6 +47,10 @@ if(XRT_HAVE_OPENCV)
 			t_helper_debug_sink.hpp
 			t_hsv_filter.c
 			t_kalman.cpp
+			t_tracker_kalman_fusion.hpp
+			t_tracker_kalman_fusion.cpp
+			t_tracker_kalman_fusion_c.h
+			t_tracker_kalman_fusion_c.cpp
 		)
 	if(XRT_BUILD_DRIVER_PSMV)
 		target_sources(aux_tracking PRIVATE t_tracker_psmv_fusion.hpp t_tracker_psmv.cpp)

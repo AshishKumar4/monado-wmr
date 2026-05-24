@@ -129,7 +129,7 @@ gravity_correction(struct m_imu_3dof *f,
 	 */
 
 	float accel_length = m_vec3_len(*accel);
-	bool is_accel = fabsf(accel_length - 9.82f) >= gravity_tolerance;
+	bool is_accel = fabsf(accel_length - (float)MATH_GRAVITY_M_S2) >= gravity_tolerance;
 	bool is_rotating = gyro_length >= gyro_tolerance;
 	if (is_accel || is_rotating) {
 		f->grav.level_timestamp_ns = timestamp_ns;
@@ -151,7 +151,7 @@ gravity_correction(struct m_imu_3dof *f,
 		                     timestamp_ns - dur_ns, // Start time
 		                     timestamp_ns,          // End time
 		                     &accel_mean);          // Results
-		if ((m_vec3_len(accel_mean) - 9.82f) < gravity_tolerance) {
+		if (fabsf(m_vec3_len(accel_mean) - (float)MATH_GRAVITY_M_S2) < gravity_tolerance) {
 			/*
 			 * Calculate a cross product between what the device
 			 * thinks is up and what gravity indicates is down.
