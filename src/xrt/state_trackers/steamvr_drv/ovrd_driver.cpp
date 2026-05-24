@@ -32,6 +32,7 @@ extern "C" {
 #include "util/u_builders.h"
 #include "util/u_hand_tracking.h"
 
+#include "xrt/xrt_config_have.h"
 #include "xrt/xrt_space.h"
 #include "xrt/xrt_system.h"
 #include "xrt/xrt_defines.h"
@@ -39,6 +40,11 @@ extern "C" {
 #include "xrt/xrt_instance.h"
 
 #include "b_ovrd_generated_bindings.h"
+
+#ifdef XRT_HAVE_XCB
+#include <xcb/xcb.h>
+#include <xcb/randr.h>
+#endif
 }
 #include "math/m_vec3.h"
 
@@ -61,6 +67,69 @@ DEBUG_GET_ONCE_NUM_OPTION(scale_percentage, "XRT_COMPOSITOR_SCALE_PERCENTAGE", 1
 // Debug define(s), always off.
 #undef DUMP_POSE
 #undef DUMP_POSE_CONTROLLERS
+
+/*
+ * Some HMDs (notably Windows Mixed Reality headsets) only present their native
+ * video mode on the DisplayPort connector a short time after the device is
+ * activated over USB — the panel powers up and the display re-enumerates a few
+ * seconds later. SteamVR's vrcompositor scans X RandR exactly once at startup
+ * to find a direct-mode display matching the driver-reported HMD resolution; if
+ * it scans before the native mode is enumerated, the RandR lease fails and the
+ * compositor cannot start.
+ *
+ * To make the SteamVR driver robust, Init() blocks until the HMD's native mode
+ * is present in X RandR. Fully generic: it waits for whatever resolution the
+ * Monado HMD device reports, so it works for any headset; it is a fast no-op
+ * for HMDs that enumerate immediately, and returns false without delay on
+ * sessions with no X (Wayland/headless) so the caller proceeds regardless.
+ */
+static bool
+ovrd_wait_for_hmd_randr_mode(uint32_t want_w, uint32_t want_h, int timeout_ms)
+{
+#ifdef XRT_HAVE_XCB
+	const char *display_env = getenv("DISPLAY");
+	xcb_connection_t *conn = xcb_connect(display_env, NULL);
+	if (conn == NULL || xcb_connection_has_error(conn) != 0) {
+		if (conn != NULL) {
+			xcb_disconnect(conn);
+		}
+		return false;
+	}
+
+	xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(conn)).data;
+	const int poll_ms = 100;
+	bool found = false;
+
+	for (int waited = 0; waited <= timeout_ms && !found; waited += poll_ms) {
+		xcb_randr_get_screen_resources_cookie_t cookie =
+		    xcb_randr_get_screen_resources(conn, screen->root);
+		xcb_randr_get_screen_resources_reply_t *res =
+		    xcb_randr_get_screen_resources_reply(conn, cookie, NULL);
+		if (res != NULL) {
+			xcb_randr_mode_info_t *modes = xcb_randr_get_screen_resources_modes(res);
+			int mode_count = xcb_randr_get_screen_resources_modes_length(res);
+			for (int i = 0; i < mode_count; i++) {
+				if (modes[i].width == want_w && modes[i].height == want_h) {
+					found = true;
+					break;
+				}
+			}
+			free(res);
+		}
+		if (!found) {
+			os_nanosleep((int64_t)poll_ms * 1000 * 1000);
+		}
+	}
+
+	xcb_disconnect(conn);
+	return found;
+#else
+	(void)want_w;
+	(void)want_h;
+	(void)timeout_ms;
+	return false;
+#endif
+}
 
 
 /*
@@ -713,25 +782,39 @@ public:
 			break;
 		}
 		case XRT_DEVICE_HP_REVERB_G2_CONTROLLER: {
+			// The SteamVR component paths below MUST match the input
+			// sources declared in the generated HP Reverb G2 input
+			// profile (hp_mixed_reality_controller_profile.json):
+			// /input/{trigger,grip,joystick,menu,system,x,y,a,b} and
+			// /output/haptic. A path not declared in that profile is
+			// silently ignored by SteamVR — which is why the joystick
+			// (was wrongly /input/thumbstick), the menu button, the
+			// X/Y buttons and haptics previously did nothing, leaving
+			// the controller usable only as a bare tracked pose.
 			AddControl("/input/trigger/value", XRT_INPUT_G2_CONTROLLER_TRIGGER_VALUE, NULL);
 			AddControl("/input/grip/value", XRT_INPUT_G2_CONTROLLER_SQUEEZE_VALUE, NULL);
 
+			AddControl("/input/menu/click", XRT_INPUT_G2_CONTROLLER_MENU_CLICK, NULL);
 			AddControl("/input/system/click", XRT_INPUT_G2_CONTROLLER_HOME_CLICK, NULL);
 
+			// G2 controllers are handed: the left has X/Y face buttons,
+			// the right has A/B. Map each to its own profile path.
 			if (m_hand == XRT_HAND_LEFT) {
-				AddControl("/input/a/click", XRT_INPUT_G2_CONTROLLER_X_CLICK, NULL);
-				AddControl("/input/b/click", XRT_INPUT_G2_CONTROLLER_Y_CLICK, NULL);
+				AddControl("/input/x/click", XRT_INPUT_G2_CONTROLLER_X_CLICK, NULL);
+				AddControl("/input/y/click", XRT_INPUT_G2_CONTROLLER_Y_CLICK, NULL);
 			} else {
 				AddControl("/input/a/click", XRT_INPUT_G2_CONTROLLER_A_CLICK, NULL);
 				AddControl("/input/b/click", XRT_INPUT_G2_CONTROLLER_B_CLICK, NULL);
 			}
-			AddControl("/input/thumbstick/click", XRT_INPUT_G2_CONTROLLER_THUMBSTICK_CLICK, NULL);
 
 			struct MonadoInputComponent x = {true, true, false};
 			struct MonadoInputComponent y = {true, false, true};
 
-			AddControl("/input/thumbstick/x", XRT_INPUT_G2_CONTROLLER_THUMBSTICK, &x);
-			AddControl("/input/thumbstick/y", XRT_INPUT_G2_CONTROLLER_THUMBSTICK, &y);
+			AddControl("/input/joystick/click", XRT_INPUT_G2_CONTROLLER_THUMBSTICK_CLICK, NULL);
+			AddControl("/input/joystick/x", XRT_INPUT_G2_CONTROLLER_THUMBSTICK, &x);
+			AddControl("/input/joystick/y", XRT_INPUT_G2_CONTROLLER_THUMBSTICK, &y);
+
+			AddOutputControl(XRT_OUTPUT_NAME_G2_CONTROLLER_HAPTIC, "/output/haptic");
 			break;
 		}
 		case XRT_DEVICE_XBOX_CONTROLLER: break;     // TODO
@@ -1650,6 +1733,38 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 	m_xhmd = m_xsysd->static_roles.head;
 
 	ovrd_log("Selected HMD %s\n", m_xhmd->str);
+
+	// Block until the HMD's native video mode is enumerated by X RandR before
+	// returning from Init(). vrserver brings up vrcompositor immediately after
+	// the driver loads, and on X11 vrcompositor scans RandR once to find a
+	// direct-mode display matching the driver-reported HMD resolution. WMR
+	// headsets only expose their native mode a few seconds after USB
+	// activation, so without this wait vrcompositor scans too early and the
+	// direct-mode lease fails.
+	//
+	// On Wayland, vrcompositor acquires the HMD via the wp_drm_lease_device_v1
+	// protocol — not X RandR — so the wait is irrelevant and would burn the
+	// full timeout for no benefit (the HMD is hidden from XWayland by the
+	// compositor's non-desktop filtering). Skip the wait when a Wayland session
+	// is detected.
+	if (m_xhmd->hmd != NULL && m_xhmd->hmd->screens[0].w_pixels > 0) {
+		uint32_t want_w = (uint32_t)m_xhmd->hmd->screens[0].w_pixels;
+		uint32_t want_h = (uint32_t)m_xhmd->hmd->screens[0].h_pixels;
+		const char *wl = getenv("WAYLAND_DISPLAY");
+		if (wl != NULL && wl[0] != '\0') {
+			ovrd_log("Wayland session detected (WAYLAND_DISPLAY=%s); skipping X RandR "
+			         "wait for HMD mode %ux%u — vrcompositor leases via DRM.\n",
+			         wl, want_w, want_h);
+		} else {
+			ovrd_log("Waiting for HMD display mode %ux%u to enumerate in X RandR...\n",
+			         want_w, want_h);
+			bool ready = ovrd_wait_for_hmd_randr_mode(want_w, want_h, 20000);
+			ovrd_log("HMD display mode %ux%u in RandR: %s\n", want_w, want_h,
+			         ready ? "present — vrcompositor can lease it"
+			               : "not seen (timeout/no-X) — proceeding anyway");
+		}
+	}
+
 	m_MonadoDeviceDriver = new CDeviceDriver_Monado(m_xinst, m_xhmd);
 	//! @todo provide a serial number
 	vr::VRServerDriverHost()->TrackedDeviceAdded(m_xhmd->str, vr::TrackedDeviceClass_HMD, m_MonadoDeviceDriver);
@@ -1694,8 +1809,15 @@ CServerDriver_Monado::Cleanup()
 	xrt_system_devices_destroy(&m_xsysd);
 	xrt_system_destroy(&m_xsys);
 	m_xhmd = NULL;
-	m_left->m_xdev = NULL;
-	m_right->m_xdev = NULL;
+	// m_left/m_right exist only if controller roles were assigned during Init(); WMR assigns
+	// them a moment later, so these are commonly NULL even while the controllers are tracked.
+	// Cleanup() lacked this guard -> NULL-deref core dump on every shutdown.
+	if (m_left != NULL) {
+		m_left->m_xdev = NULL;
+	}
+	if (m_right != NULL) {
+		m_right->m_xdev = NULL;
+	}
 
 	if (m_xinst) {
 		xrt_instance_destroy(&m_xinst);
