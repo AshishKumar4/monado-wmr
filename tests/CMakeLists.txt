@@ -24,6 +24,9 @@ set(tests
     tests_pose
     tests_vec3_angle
 	)
+if(XRT_HAVE_OPENCV)
+	list(APPEND tests tests_kalman_fusion)
+endif()
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_comp_client_d3d11)
 endif()
@@ -70,6 +73,14 @@ target_link_libraries(tests_pose PRIVATE aux_math)
 target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)
+
+if(XRT_HAVE_OPENCV)
+	target_link_libraries(tests_kalman_fusion PRIVATE aux_math aux_tracking Threads::Threads ${OpenCV_LIBRARIES})
+	target_include_directories(tests_kalman_fusion PRIVATE ${OpenCV_INCLUDE_DIRS})
+	# Path to the committed real-session .replay fixtures; the real-data corpus replay test loads
+	# these at runtime and no-ops gracefully if the directory is absent.
+	target_compile_definitions(tests_kalman_fusion PRIVATE G2_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+endif()
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(
