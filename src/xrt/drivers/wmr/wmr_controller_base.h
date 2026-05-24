@@ -16,13 +16,13 @@
 
 #include "os/os_threading.h"
 #include "math/m_clock_tracking.h"
-#include "math/m_imu_3dof.h"
 #include "util/u_device.h"
 #include "util/u_logging.h"
 #include "util/u_var.h"
 #include "xrt/xrt_device.h"
 #include "tracking/t_led_models.h"
 #include "tracking/t_constellation_tracking.h"
+#include "tracking/t_tracker_kalman_fusion_c.h"
 
 #include "wmr_common.h"
 #include "wmr_controller_protocol.h"
@@ -171,8 +171,6 @@ struct wmr_controller_base
 	struct xrt_pose last_tracked_pose;
 	//! Last LED brightness report from optical controller tracking
 	uint16_t last_brightness_report;
-	//! debug boolean - enable yaw updates
-	bool update_yaw_from_optical;
 
 	//!< Command counter for timesync and keep-alives. conn_lock
 	uint8_t cmd_counter;
@@ -197,10 +195,16 @@ struct wmr_controller_base
 	struct u_var_draggable_u16 timesync_val2_uvar;
 	struct u_var_draggable_u16 timesync_time_offset_uvar;
 
-	//! Main fusion calculator.
-	struct m_imu_3dof fusion;
-	//! The last angular velocity from the IMU, for prediction.
-	struct xrt_vec3 last_angular_velocity;
+	//! Tightly-coupled per-LED + IMU fusion: owns the reported controller pose (position + orientation).
+	struct KalmanFusionInterfaceWrapper *kalman_fusion;
+
+	//! Controller serial, kept for the per-unit IMU calibration cache (load at config-read, save at deinit).
+	char imu_cal_serial[16 + 1];
+
+	//! Constant controller-IMU vs headset-camera clock offset (ns) added to optical timestamps before
+	//! fusion (default 0, env G2_CTRL_TD_NS). The OOSM handles variable processing lag; this is the
+	//! residual fixed sensor-pair skew, exposed for calibration without assuming a value.
+	int64_t ctrl_optical_td_ns;
 };
 
 bool

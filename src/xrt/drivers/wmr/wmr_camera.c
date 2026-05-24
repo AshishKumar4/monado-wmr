@@ -532,12 +532,27 @@ wmr_camera_open(struct wmr_camera_open_config *config)
 		ceg->aeg = u_autoexpgain_create(U_AEG_STRATEGY_TRACKING, enable_aeg, frame_delay);
 	}
 
-	// Set exposure & gain for controller tracking
-	for (int i = cam->tcam_count; i < cam->tcam_count; i++) {
+	// Set exposure & gain for controller tracking.
+	// NB: the loop bound was `i = cam->tcam_count` (== end) so it never ran — the short
+	// controller/LED exposure was never programmed, leaving controller frames at the long
+	// SLAM exposure (room-bright), which starved constellation tracking. Start from 0.
+	// Exposure/gain are env-overridable (G2_CTRL_EXPOSURE / G2_CTRL_GAIN) so the LED-vs-room
+	// balance can be swept at runtime without a rebuild. Default 400us / gain 1.
+	uint16_t ctrl_exposure = DEFAULT_CTRL_EXPOSURE;
+	uint8_t ctrl_gain = DEFAULT_CTRL_GAIN;
+	const char *exp_env = getenv("G2_CTRL_EXPOSURE");
+	const char *gain_env = getenv("G2_CTRL_GAIN");
+	if (exp_env && *exp_env) {
+		ctrl_exposure = (uint16_t)atoi(exp_env);
+	}
+	if (gain_env && *gain_env) {
+		ctrl_gain = (uint8_t)atoi(gain_env);
+	}
+	WMR_CAM_INFO(cam, "Controller-tracking exposure=%u gain=%u", ctrl_exposure, ctrl_gain);
+	for (int i = 0; i < cam->tcam_count; i++) {
 		const struct wmr_camera_config *config = &cam->tcam_confs[i];
 
-		bool status =
-		    wmr_camera_set_ctrl_exposure_gain(cam, config->location, DEFAULT_CTRL_EXPOSURE, DEFAULT_CTRL_GAIN);
+		bool status = wmr_camera_set_ctrl_exposure_gain(cam, config->location, ctrl_exposure, ctrl_gain);
 		if (status != 0) {
 			WMR_CAM_ERROR(cam,
 			              "Failed to set exposure and gain for controller tracking frames on camera %d", i);

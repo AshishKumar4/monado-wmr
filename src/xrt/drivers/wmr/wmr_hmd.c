@@ -37,6 +37,8 @@
 #include "util/u_trace_marker.h"
 #include "util/u_distortion_mesh.h"
 #include "util/u_sink.h"
+#include "util/u_file.h"
+#include "util/u_g2_telemetry.h"
 
 #ifdef XRT_OS_LINUX
 #include "util/u_linux.h"
@@ -467,9 +469,17 @@ hololens_handle_sensors_all(struct wmr_hmd *wh, const unsigned char *buffer, int
 	wh->fusion.last_angular_velocity = calib_gyro[3];
 	os_mutex_unlock(&wh->fusion.mutex);
 
-	// SLAM tracking
+	// SLAM tracking. Defensive: Basalt assumes a strictly-increasing IMU timeline, so bump on
+	// any collision before pushing. (In captured 1 kHz data this never fires — the 4 per-packet
+	// firmware ticks are ~1 ms apart with 0 duplicates — but a stale/duplicate USB packet would
+	// otherwise feed dt==0 to preintegration; cheap to guard.)
+	static timepoint_ns last_pushed_imu_ns = 0;
 	for (int i = 0; i < IMU_SAMPLES_PER_PACKET; i++) {
 		timepoint_ns t = wh->packet.gyro_timestamp[i] * WMR_MS_HOLOLENS_NS_PER_TICK;
+		if (t <= last_pushed_imu_ns) {
+			t = last_pushed_imu_ns + 1;
+		}
+		last_pushed_imu_ns = t;
 		wmr_source_push_imu_packet(wh->tracking.source, t, raw_accel[i], raw_gyro[i]);
 	}
 }
@@ -1240,6 +1250,13 @@ wmr_hmd_destroy(struct xrt_device *xdev)
 	// Destroy SLAM source and tracker
 	xrt_frame_context_destroy_nodes(&wh->tracking.xfctx);
 
+	/* All telemetry producers (HMD reader thread, controller read threads, the
+	 * constellation analysis thread, the WMR source/SLAM frame nodes) have now
+	 * been stopped above, so it is safe to flush + close telemetry here. This is
+	 * the lifecycle that provably outlives every producer (BLOCKER-1 / MAJOR-4).
+	 * Idempotent: a no-op if telemetry was never enabled or already shut down. */
+	g2_telem_shutdown();
+
 	// Destroy the fusion.
 	m_imu_3dof_close(&wh->fusion.i3dof);
 
@@ -1512,6 +1529,16 @@ wmr_hmd_fill_constellation_calibration(struct wmr_hmd *wh)
 		                                               .blob_min_threshold = BLOB_PIXEL_THRESHOLD_WMR,
 		                                               .blob_detect_threshold = BLOB_THRESHOLD_MIN_WMR,
 		                                               .slam_tracking_index = i};
+	}
+
+	/* Persist the per-unit camera calibration the constellation tracker is built from, so the controller
+	 * VIO can be replayed offline against recorded raw frames (this calib otherwise lives only in headset
+	 * flash). Written to the config dir every launch (idempotent); a write failure is non-fatal. */
+	FILE *cam_json = u_file_open_file_in_config_dir_subpath("wmr", "hmd-cameras.json", "w");
+	if (cam_json != NULL) {
+		t_constellation_camera_group_dump_json(out, cam_json);
+		fclose(cam_json);
+		WMR_INFO(wh, "Wrote HMD camera calibration to config dir (wmr/hmd-cameras.json)");
 	}
 }
 
@@ -1901,6 +1928,13 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 	wh->base.device_type = XRT_DEVICE_TYPE_HMD;
 	wh->log_level = log_level;
 
+	/* Bring up G2 telemetry as early as the HMD device exists, so the
+	 * constellation/controller taps record even when SLAM is inactive
+	 * (WMR_SLAM=false or any SLAM bring-up failure). g2_telem_init() is
+	 * idempotent: the SLAM tracker also calls it, but only the first wins
+	 * (BLOCKER-1). Shut down in wmr_hmd_destroy() after all producers stop. */
+	g2_telem_init(getenv("G2_TELEMETRY"));
+
 	wh->base.supported.compositor_info = true;
 
 	wh->hid_hololens_sensors_dev = hid_holo;
@@ -1961,7 +1995,10 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 
 	wh->pose = (struct xrt_pose)XRT_POSE_IDENTITY;
 	wh->offset = (struct xrt_pose)XRT_POSE_IDENTITY;
-	wh->average_imus = true;
+	// false: feed all IMU_SAMPLES_PER_PACKET (4) samples per USB packet into fusion (~1000 Hz)
+	// instead of averaging them to one (~250 Hz). Zero extra USB cost; the samples are already
+	// in every packet. The calibration imu_frequency (wmr_hmd.c ~1463) auto-adjusts to match.
+	wh->average_imus = false;
 	wh->tracked_offset_ms = (struct u_var_draggable_f32){
 	    .val = 0.0,
 	    .min = -40.0,
@@ -1998,6 +2035,14 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 	exts.w_pixels = (uint32_t)wh->config.eye_params[0].display_size.x;
 	exts.h_pixels = (uint32_t)wh->config.eye_params[0].display_size.y;
 	u_extents_2d_split_side_by_side(&wh->base, &exts);
+
+	// WMR panels (Reverb G1/G2, Odyssey, Odyssey+, ...) run at 90 Hz.
+	// u_extents_2d_split_side_by_side() does not set the frame interval, so
+	// without this it stays 0 — and a downstream consumer (the SteamVR driver
+	// bridge) computes refresh = 1/0 = infinite and falls back to 60 Hz,
+	// which mis-paces frames against the 90 Hz panel and causes judder.
+	wh->base.hmd->screens[0].nominal_frame_interval_ns =
+	    (uint64_t)(1000000000.0 / 90.0);
 
 	// Fill in blend mode - just opqaue, unless we get Hololens support one day.
 	size_t idx = 0;

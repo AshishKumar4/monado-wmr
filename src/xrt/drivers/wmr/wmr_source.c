@@ -15,6 +15,7 @@
 #include "math/m_clock_tracking.h"
 #include "math/m_filter_fifo.h"
 #include "util/u_debug.h"
+#include "util/u_g2_telemetry.h"
 #include "util/u_sink.h"
 #include "util/u_var.h"
 #include "util/u_trace_marker.h"
@@ -140,7 +141,7 @@ receive_imu_sample(struct xrt_imu_sink *sink, struct xrt_imu_sample *s)
 
 	// Convert hardware timestamp into monotonic clock. Update offset estimate hw2mono.
 	// Note this is only done with IMU samples as they have the smallest USB transmission time.
-	const float IMU_FREQ = 250.f; //!< @todo use 1000 if "average_imus" is false
+	const float IMU_FREQ = 1000.f; // HMD IMU is 1000 Hz now that average_imus=false (4 samples/packet)
 	timepoint_ns now_hw = s->timestamp_ns;
 	timepoint_ns now_mono = (timepoint_ns)os_monotonic_get_ns();
 	timepoint_ns ts = m_clock_offset_a2b(IMU_FREQ, now_hw, now_mono, &ws->hw2mono);
@@ -149,7 +150,7 @@ receive_imu_sample(struct xrt_imu_sink *sink, struct xrt_imu_sample *s)
 	 * Check if the timepoint does time travel, we get one or two
 	 * old samples when the device has not been cleanly shut down.
 	 */
-	if (ws->last_imu_ns > ts) {
+	if (ws->last_imu_ns >= ts) { // >= : also drop a duplicate timestamp (dt==0) before it reaches SLAM
 		WMR_WARN(ws, "Received sample from the past, new: %" PRIu64 ", last: %" PRIu64 ", diff: %" PRIu64, ts,
 		         s->timestamp_ns, ts - s->timestamp_ns);
 		return;
@@ -168,6 +169,10 @@ receive_imu_sample(struct xrt_imu_sink *sink, struct xrt_imu_sample *s)
 	struct xrt_vec3 accel = {(float)a.x, (float)a.y, (float)a.z};
 	m_ff_vec3_f32_push(ws->gyro_ff, &gyro, ts);
 	m_ff_vec3_f32_push(ws->accel_ff, &accel, ts);
+
+	// Telemetry: HMD IMU sample (device_id 0). hw_ts_ns is the monotonic-converted
+	// sensor ts (ts), in the common clock shared by every stream (MAJOR-3).
+	g2_telem_imu(0, (uint64_t)ts, accel.x, accel.y, accel.z, gyro.x, gyro.y, gyro.z);
 
 	if (ws->out_slam_sinks.imu) {
 		xrt_sink_push_imu(ws->out_slam_sinks.imu, s);

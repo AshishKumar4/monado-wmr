@@ -27,6 +27,7 @@
 #include "util/u_time.h"
 #include "util/u_debug.h"
 #include "util/u_device.h"
+#include "util/u_g2_telemetry.h"
 #include "util/u_trace_marker.h"
 
 #include "wmr_common.h"
@@ -63,6 +64,13 @@ wmr_controller_base(struct xrt_device *p)
 	return (struct wmr_controller_base *)p;
 }
 
+/* Telemetry device_id for a controller: 1=left, 2=right (0 reserved for HMD). */
+static inline uint8_t
+wmr_controller_telem_id(struct wmr_controller_base *wcb)
+{
+	return (wcb->base.device_type == XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER) ? 2 : 1;
+}
+
 /* Called from subclasses' handle_input_packet method, with data_lock */
 void
 wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
@@ -93,14 +101,22 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 	 * mode it can come back with a different clock epoch
 	 */
 	if (wcb->last_imu_timestamp_ns > (uint64_t)mono_time_ns) {
+		/* Backwards-in-time delta, in the same monotonic domain on both sides. */
+		int64_t back_ns = (int64_t)wcb->last_imu_timestamp_ns - (int64_t)mono_time_ns;
 		WMR_WARN(wcb,
-		         "Received sample from the past, new: %" PRIu64 ", last: %" PRIu64 ", diff: %" PRIu64
-		         ". resetting clock tracking",
-		         mono_time_ns, now_hw_ns, mono_time_ns - now_hw_ns);
-		// Reinit. The 3dof fusion will assert if time goes backward
+		         "Received sample from the past, new: %" PRIu64 ", last: %" PRIu64 ", diff: %" PRId64
+		         " ns. resetting clock tracking",
+		         mono_time_ns, wcb->last_imu_timestamp_ns, back_ns);
+		/* Telemetry: IMU went backwards in time -> anomaly (fusion is being reset).
+		 * value is the backwards delta in MILLISECONDS: an ns delta does not fit
+		 * f32's ~24-bit mantissa for large clock jumps (MINOR-2); ms keeps it
+		 * meaningful. The schema documents value's unit for this event type. */
+		g2_telem_event(wmr_controller_telem_id(wcb), (uint64_t)mono_time_ns, 4 /* imu_anomaly */,
+		               (float)((double)back_ns / 1.0e6));
+		// Drop this sample and reset clock tracking so the next sample re-establishes the epoch.
+		// The UKF keeps its state (it tolerates the gap; a non-monotonic sample is never fed to it).
 		wcb->last_imu_timestamp_ns = 0;
 		wcb->last_imu_device_timestamp_ns = 0;
-		m_imu_3dof_init(&wcb->fusion, M_IMU_3DOF_USE_GRAVITY_DUR_20MS);
 		m_clock_windowed_skew_tracker_reset(wcb->hw2mono_clock);
 		m_clock_windowed_skew_tracker_push(wcb->hw2mono_clock, rx_mono_ns, now_hw_ns);
 		return;
@@ -114,11 +130,24 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 		wcb->timesync_led_intensity = MIN(wcb->timesync_led_intensity + 10, 399);
 	}
 
-	m_imu_3dof_update(&wcb->fusion, mono_time_ns, &imu_sample->acc, &imu_sample->gyro);
 	wcb->last_imu_timestamp_ns = mono_time_ns;
 	wcb->last_imu_device_timestamp_ns = now_hw_ns;
-	wcb->last_angular_velocity = imu_sample->gyro;
 	wcb->last_imu = *imu_sample;
+
+	/* Telemetry: controller IMU sample. hw_ts_ns uses mono_time_ns, the monotonic-
+	 * converted sample time, so it shares the common clock with the HMD IMU and every
+	 * other stream (MAJOR-3 -- no raw device ticks in hw_ts_ns). */
+	g2_telem_imu(wmr_controller_telem_id(wcb), (uint64_t)mono_time_ns, imu_sample->acc.x, imu_sample->acc.y,
+	             imu_sample->acc.z, imu_sample->gyro.x, imu_sample->gyro.y, imu_sample->gyro.z);
+
+	struct xrt_imu_sample k_imu_sample = {
+	    .timestamp_ns = mono_time_ns,
+	    .gyro_rad_secs = {imu_sample->gyro.x, imu_sample->gyro.y, imu_sample->gyro.z},
+	    .accel_m_s2 = {imu_sample->acc.x, imu_sample->acc.y, imu_sample->acc.z}};
+	// Pass NULL variances so the fusion uses its tuned, test-validated
+	// internal defaults — keeping the real driver's behaviour identical to
+	// what the t_tracker_kalman_fusion test suite verifies.
+	kalman_fusion_process_imu_data(wcb->kalman_fusion, &k_imu_sample, NULL, NULL);
 }
 
 static void
@@ -449,6 +478,98 @@ write_calibration_cache(struct wmr_controller_base *wcb, char *cache_filename, u
 	fclose(f);
 }
 
+/* Cross-session IMU calibration cache (per controller serial). The converged gyro/accel bias + accel
+ * scale are quasi-constant per unit, so persisting them and seeding the next session makes the first
+ * second accurate (before any stance) and survives a large physical bias. Plain text, one line:
+ *   version  bg_x bg_y bg_z  ba_x ba_y ba_z  scale  count
+ */
+static void
+imu_cal_filename(const char *serial, char *out, size_t out_size)
+{
+	snprintf(out, out_size, "imu-cal-%s.txt", serial);
+	for (char *c = out; *c != '\0'; c++) {
+		if (!isalnum(*c) && *c != '.' && *c != '-' && *c != '_') {
+			*c = '_';
+		}
+	}
+}
+
+static void
+imu_cal_load(struct wmr_controller_base *wcb, const char *serial)
+{
+	if (wcb->kalman_fusion == NULL || serial[0] == '\0') {
+		return;
+	}
+	char fn[64];
+	imu_cal_filename(serial, fn, sizeof(fn));
+	FILE *f = u_file_open_file_in_config_dir_subpath("wmr", fn, "r");
+	if (f == NULL) {
+		return;
+	}
+	int ver = 0, count = 0;
+	double bg[3], ba[3], scale = 1.0;
+	int n = fscanf(f, "%d %lf %lf %lf %lf %lf %lf %lf %d", &ver, &bg[0], &bg[1], &bg[2], &ba[0], &ba[1], &ba[2],
+	               &scale, &count);
+	fclose(f);
+	/* Reject an implausible cache (e.g. a bias mis-estimated by a poorly-tracked session): real MEMS
+	 * gyro bias << 0.1 rad/s, accel bias << 0.5 m/s^2, scale within ~10%. Bounds mirror the filter's. */
+	bool plausible = (n == 9 && ver == 1 && scale > 0.9 && scale < 1.1);
+	for (int i = 0; i < 3 && plausible; i++) {
+		if (fabs(bg[i]) > 0.1 || fabs(ba[i]) > 0.5) {
+			plausible = false;
+		}
+	}
+	if (plausible) {
+		kalman_fusion_set_imu_calibration(wcb->kalman_fusion, bg, ba, scale);
+		WMR_INFO(wcb, "Loaded IMU calibration prior (serial %s, accel scale %.4f, %d sessions)", serial,
+		         scale, count);
+	} else if (n == 9) {
+		WMR_WARN(wcb, "Ignoring implausible IMU calibration cache (serial %s) - will recalibrate", serial);
+	}
+}
+
+static void
+imu_cal_save(struct wmr_controller_base *wcb, const char *serial)
+{
+	if (wcb->kalman_fusion == NULL || serial[0] == '\0') {
+		return;
+	}
+	double bg[3], ba[3], scale = 1.0;
+	if (!kalman_fusion_get_imu_calibration(wcb->kalman_fusion, bg, ba, &scale)) {
+		return; // no calibrated stance this session -> estimate not trustworthy, keep the old cache
+	}
+	char fn[64];
+	imu_cal_filename(serial, fn, sizeof(fn));
+
+	/* EMA-blend the session estimate into the existing cache (robust to one bad session; tracks slow
+	 * hardware drift over the device's life). First time, take the session value outright. */
+	double obg[3] = {0, 0, 0}, oba[3] = {0, 0, 0}, oscale = 1.0;
+	int over = 0, ocount = 0;
+	FILE *rf = u_file_open_file_in_config_dir_subpath("wmr", fn, "r");
+	if (rf != NULL) {
+		int n = fscanf(rf, "%d %lf %lf %lf %lf %lf %lf %lf %d", &over, &obg[0], &obg[1], &obg[2], &oba[0],
+		               &oba[1], &oba[2], &oscale, &ocount);
+		fclose(rf);
+		if (n != 9 || over != 1) {
+			ocount = 0;
+		}
+	}
+	const double a = (ocount > 0) ? 0.25 : 1.0;
+	for (int i = 0; i < 3; i++) {
+		bg[i] = (1.0 - a) * obg[i] + a * bg[i];
+		ba[i] = (1.0 - a) * oba[i] + a * ba[i];
+	}
+	scale = (1.0 - a) * oscale + a * scale;
+
+	FILE *wf = u_file_open_file_in_config_dir_subpath("wmr", fn, "w");
+	if (wf != NULL) {
+		fprintf(wf, "1 %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d\n", bg[0], bg[1], bg[2], ba[0], ba[1], ba[2],
+		        scale, ocount + 1);
+		fclose(wf);
+		WMR_INFO(wcb, "Saved IMU calibration (serial %s, accel scale %.4f)", serial, scale);
+	}
+}
+
 static bool
 read_controller_config(struct wmr_controller_base *wcb)
 {
@@ -514,6 +635,12 @@ read_controller_config(struct wmr_controller_base *wcb)
 	}
 	free(cache_filename);
 
+	// Seed the IMU fusion with this unit's persisted calibration prior (created at line 677, so it
+	// exists by now). Keep the serial for the matching save at deinit.
+	strncpy(wcb->imu_cal_serial, serial_no, sizeof(wcb->imu_cal_serial) - 1);
+	wcb->imu_cal_serial[sizeof(wcb->imu_cal_serial) - 1] = '\0';
+	imu_cal_load(wcb, wcb->imu_cal_serial);
+
 	WMR_DEBUG(wcb, "Parsed %d LED entries from controller calibration", wcb->config.led_count);
 	return true;
 }
@@ -529,6 +656,7 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	struct wmr_controller_base *wcb = wmr_controller_base(xdev);
 
 	struct xrt_relation_chain xrc = {0};
+	struct xrt_space_relation relation = {0};
 
 	m_relation_chain_push_pose(&xrc, &wcb->P_aim);
 	if (name == XRT_INPUT_G2_CONTROLLER_GRIP_POSE || name == XRT_INPUT_ODYSSEY_CONTROLLER_GRIP_POSE ||
@@ -536,51 +664,13 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 		m_relation_chain_push_pose(&xrc, &wcb->P_aim_grip);
 	}
 
-	/* Apply the controller rotation */
-	struct xrt_pose pose = {{0, 0, 0, 1}, {0, 1.2, -0.5}};
-	if (xdev->device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
-		pose.position.x = -0.2;
-	} else {
-		pose.position.x = 0.2;
-	}
-
-	// Variables needed for prediction.
-	int64_t last_imu_timestamp_ns = 0;
-	struct xrt_space_relation relation = {0};
-	relation.relation_flags = (enum xrt_space_relation_flags)(
-	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
-	    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
-	    XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT);
-
-	// Start with the static pose above, then apply IMU + tracking
-	relation.pose = pose;
-
-	// Copy data while holding the lock.
-	os_mutex_lock(&wcb->data_lock);
-	relation.pose.orientation = wcb->fusion.rot;
-	relation.angular_velocity = wcb->last_angular_velocity;
-	last_imu_timestamp_ns = wcb->last_imu_timestamp_ns;
-
-	if (wcb->last_tracked_pose_ts != 0) {
-		relation.pose.position = wcb->last_tracked_pose.position;
-	}
-	os_mutex_unlock(&wcb->data_lock);
+	// Position + orientation both come from the tightly-coupled per-LED fusion (the UKF).
+	kalman_fusion_get_prediction(wcb->kalman_fusion, at_timestamp_ns, &relation);
 
 	m_relation_chain_push_relation(&xrc, &relation);
-	m_relation_chain_resolve(&xrc, &relation);
+	m_relation_chain_resolve(&xrc, out_relation);
 
-	// No prediction needed.
-	if (at_timestamp_ns < last_imu_timestamp_ns) {
-		*out_relation = relation;
-		return XRT_SUCCESS;
-	}
-
-	int64_t prediction_ns = at_timestamp_ns - last_imu_timestamp_ns;
-	double prediction_s = time_ns_to_s(prediction_ns);
-
-	m_predict_relation(&relation, prediction_s, out_relation);
 	wcb->pose = out_relation->pose;
-
 	return XRT_SUCCESS;
 }
 
@@ -613,8 +703,10 @@ wmr_controller_base_deinit(struct wmr_controller_base *wcb)
 	os_mutex_destroy(&wcb->conn_lock);
 	os_mutex_destroy(&wcb->data_lock);
 
-	// Destroy the fusion.
-	m_imu_3dof_close(&wcb->fusion);
+	if (wcb->kalman_fusion) {
+		imu_cal_save(wcb, wcb->imu_cal_serial); // persist this unit's converged IMU calibration (EMA)
+		kalman_fusion_destroy(wcb->kalman_fusion);
+	}
 }
 
 /*
@@ -641,6 +733,12 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	// 1 second seems to be enough to smooth things
 	const int IMU_ARRIVAL_FREQ = 200;
 	wcb->hw2mono_clock = m_clock_windowed_skew_tracker_alloc(IMU_ARRIVAL_FREQ);
+
+	// Constant controller-IMU vs headset-camera clock offset (ns), added to optical timestamps before
+	// fusion. The OOSM handles the variable processing lag; this is the residual fixed sensor-pair
+	// skew. Default 0 (no value assumed) — calibratable via G2_CTRL_TD_NS.
+	const char *td_env = getenv("G2_CTRL_TD_NS");
+	wcb->ctrl_optical_td_ns = (td_env != NULL) ? (int64_t)atoll(td_env) : 0;
 
 	if (controller_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
 		snprintf(wcb->base.str, ARRAY_SIZE(wcb->base.str), "WMR Left Controller");
@@ -676,7 +774,7 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 
 	wcb->thumbstick_deadzone = 0.15;
 
-	m_imu_3dof_init(&wcb->fusion, M_IMU_3DOF_USE_GRAVITY_DUR_20MS);
+	wcb->kalman_fusion = kalman_fusion_create();
 
 	if (os_mutex_init(&wcb->conn_lock) != 0 || os_mutex_init(&wcb->data_lock) != 0) {
 		WMR_ERROR(wcb, "WMR Controller: Failed to init mutex!");
@@ -726,8 +824,6 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	const unsigned char wmr_controller_imu_on_cmd[64] = {0x06, 0x03, 0x02, 0xe1, 0x02};
 	wmr_controller_send_bytes(wcb, wmr_controller_imu_on_cmd, sizeof(wmr_controller_imu_on_cmd));
 
-	wcb->update_yaw_from_optical = true;
-
 	wcb->timesync_counter = 2;
 	wcb->timesync_led_intensity = 200;
 	wcb->timesync_val2 = 500;
@@ -747,7 +843,6 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	u_var_add_gui_header(wcb, NULL, "IMU");
 	u_var_add_ro_vec3_f32(wcb, &wcb->last_imu.acc, "imu.accel");
 	u_var_add_ro_vec3_f32(wcb, &wcb->last_imu.gyro, "imu.gyro");
-	u_var_add_ro_quat_f32(wcb, &wcb->fusion.rot, "fusion.rot");
 	u_var_add_i32(wcb, &wcb->last_imu.temperature, "imu.temperature");
 	u_var_add_ro_u64(wcb, &wcb->last_imu_timestamp_ns, "Last CPU IMU TS");
 	u_var_add_ro_u64(wcb, &wcb->last_imu_device_timestamp_ns, "Last device IMU TS");
@@ -755,8 +850,12 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	u_var_add_gui_header(wcb, NULL, "Optical Tracking");
 	u_var_add_pose(wcb, &wcb->last_tracked_pose, "Last observed pose");
 	u_var_add_ro_i64(wcb, &wcb->last_tracked_pose_ts, "Last observed pose TS");
-	u_var_add_bool(wcb, &wcb->update_yaw_from_optical, "Update yaw using tracking");
 	u_var_add_ro_u16(wcb, &wcb->last_brightness_report, "Last observed average LED brightness");
+
+	u_var_add_gui_header(wcb, NULL, "Kalman Fusion");
+	kalman_fusion_add_ui(wcb->kalman_fusion, wcb,
+	                     (wcb->base.device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) ? "wmr_left"
+	                                                                                     : "wmr_right");
 
 	u_var_add_gui_header(wcb, NULL, "LED Sync");
 	u_var_add_draggable_u16(wcb, &wcb->timesync_led_intensity_uvar, "LED intensity");
@@ -1102,6 +1201,17 @@ wmr_controller_base_get_led_model(struct xrt_device *xdev, struct t_constellatio
 	return true;
 }
 
+static bool
+wmr_controller_base_get_pose_uncertainty(struct xrt_device *xdev, double *position_std, double *orientation_std)
+{
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
+	if (wcb->kalman_fusion == NULL) {
+		return false;
+	}
+	// The fusion reads its published snapshot wait-free, so no data_lock is needed here.
+	return kalman_fusion_get_pose_uncertainty(wcb->kalman_fusion, position_std, orientation_std);
+}
+
 static void
 wmr_controller_base_push_brightness_update(struct xrt_device *xdev, uint8_t average_brightness)
 {
@@ -1121,56 +1231,167 @@ wmr_controller_base_push_brightness_update(struct xrt_device *xdev, uint8_t aver
 	os_mutex_unlock(&wcb->data_lock);
 }
 
+// Per-LED measurement noise + gate, in camera PIXELS (the obs are undistorted pixels under the view's
+// real intrinsics, so these are focal-independent). LED_PIXEL_VAR is the blob-centroid variance (the
+// benchmark's validated value); MAX_INNOV_PX rejects a mislabelled LED whose reprojection is farther
+// than this from the filter's predicted pose.
+#define ESKF_LED_PIXEL_VAR 1.5f // px^2
+#define ESKF_MAX_INNOV_PX 8.0f  // px
+
+// Tightly-coupled per-LED optical feed (the ESKF). Translates the constellation's neutral per-view
+// payload into the fusion's structs and folds each LED. The blobs are undistorted to pixels and the
+// view carries the camera's REAL pinhole intrinsics, so the measurement noise + gate are in physical
+// pixels (focal-independent); the extrinsic carries the OpenXR<->OpenCV YZ flip.
+static void
+wmr_controller_base_push_observed_leds(struct xrt_device *xdev,
+                                       timepoint_ns frame_mono_ns,
+                                       const struct xrt_pose *P_xrworld_cam,
+                                       const struct t_constellation_cam_calib *cam_calib,
+                                       const struct t_constellation_led_obs *leds,
+                                       size_t led_count)
+{
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
+	if (wcb->kalman_fusion == NULL || P_xrworld_cam == NULL || cam_calib == NULL || leds == NULL ||
+	    led_count == 0) {
+		return;
+	}
+
+	// Real pinhole intrinsics for this view (the obs are undistorted pixels under exactly these).
+	struct kalman_led_camera_view view = {
+	    .fx = cam_calib->fx,
+	    .fy = cam_calib->fy,
+	    .cx = cam_calib->cx,
+	    .cy = cam_calib->cy,
+	    .cam_world_orient = P_xrworld_cam->orientation,
+	    .cam_world_pos = P_xrworld_cam->position,
+	};
+
+	// Copy into the fusion's struct (identical layout, different field names). 64 == the
+	// constellation's MAX_OBJECT_LEDS upper bound; clamp defensively.
+	struct kalman_led_observation obs[64];
+	size_t n = led_count < 64 ? led_count : 64;
+	for (size_t i = 0; i < n; i++) {
+		obs[i].observed_px = leds[i].obs_px;
+		obs[i].led_obj = leds[i].led_obj;
+	}
+
+	struct xrt_vec2 led_var = {ESKF_LED_PIXEL_VAR, ESKF_LED_PIXEL_VAR};
+
+	os_mutex_lock(&wcb->data_lock);
+	// Tightly-coupled per-LED fold (primary optical path); the gate skips a mislabelled LED whose
+	// reprojection is far from the filter's predicted pose. Returns LEDs folded (-1 if awaiting bootstrap).
+	// td: align the optical capture time onto the IMU clock before fusion (default 0).
+	float folded = kalman_fusion_process_led_observations(wcb->kalman_fusion,
+	                                                      frame_mono_ns + wcb->ctrl_optical_td_ns, obs, n,
+	                                                      &view, &led_var, ESKF_MAX_INNOV_PX, /*feed=*/true);
+	os_mutex_unlock(&wcb->data_lock);
+
+	// Per-frame fold health for log diagnosis: event 7 = LEDs folded (0 = all gated), event 8 = LEDs
+	// submitted. folded < 0 => awaiting bootstrap.
+	if (g2_telem_enabled() && folded >= 0.0f) {
+		uint8_t id = wmr_controller_telem_id(wcb);
+		g2_telem_event(id, (uint64_t)frame_mono_ns, 7 /* eskf_fold_count */, folded);
+		g2_telem_event(id, (uint64_t)frame_mono_ns, 8 /* eskf_leds_seen */, (float)n);
+	}
+}
+
 static void
 wmr_controller_base_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame_mono_ns, const struct xrt_pose *pose)
 {
 	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
 	os_mutex_lock(&wcb->data_lock);
 
+	/* Snapshot the PREVIOUS optical anchor before we overwrite it, so the fusion
+	 * telemetry can mirror the kalman optical-jump gate at this call site (the
+	 * gate itself lives in t_tracker_kalman_fusion.cpp and is not modified). */
+	struct xrt_vec3 prev_optical_pos = wcb->last_tracked_pose.position;
+	timepoint_ns prev_optical_ts = wcb->last_tracked_pose_ts;
+
 	wcb->last_tracked_pose_ts = frame_mono_ns;
 	wcb->last_tracked_pose = *pose;
 
-	if (wcb->update_yaw_from_optical) {
-#if 1
-		// Apply 5% of observed orientation yaw to 3dof fusion
-		// FIXME: Do better
-		struct xrt_quat delta;
-		math_quat_unrotate(&wcb->fusion.rot, &pose->orientation, &delta);
-		delta.x = delta.z = 0.0; // We only want Yaw
+	/* Fusion telemetry: capture the REPORTED (UKF) predicted pose before this optical
+	 * observation is folded in, so each residual measures the actual output error:
+	 *   - pos_residual = optical vs kalman-predicted position (real SLAM<->IMU drift).
+	 *   - rot_residual = optical vs kalman-predicted orientation. */
+	// td: align the optical capture time onto the IMU clock for fusion + the residual (default 0).
+	const timepoint_ns fusion_ts = frame_mono_ns + wcb->ctrl_optical_td_ns;
+	struct xrt_space_relation predicted_rel = {0};
+	kalman_fusion_get_prediction(wcb->kalman_fusion, fusion_ts, &predicted_rel);
+	struct xrt_vec3 predicted_pos = predicted_rel.pose.position;
+	struct xrt_quat predicted_rot = predicted_rel.pose.orientation;
 
-		if (fabs(delta.y) > sin(DEG_TO_RAD(5)) / 2) {
-			delta.y = sin(0.10 * asinf(delta.y)); // 10% correction
-			math_quat_normalize(&delta);
+	// Always hand the PnP pose to the fusion. The ESKF decides how to use it (dual-mode, see
+	// t_tracker_kalman_fusion.cpp process_pose): bootstrap while untracked; reference-only while per-LED
+	// is actively folding (so the same LEDs are never double-counted); and a snap-re-anchor when the
+	// filter has diverged and per-LED can no longer pull it back (per-LED reprojection is too nonlinear
+	// to fix a large error — only a PnP re-solve can). This is the live divergence-recovery path.
+	// NULL variances => tuned defaults.
+	struct xrt_pose_sample sample = {.pose = *pose, .timestamp_ns = fusion_ts};
+	kalman_fusion_process_pose(wcb->kalman_fusion, &sample, NULL, NULL, 15);
 
-			struct xrt_quat prev = wcb->fusion.rot;
-			math_quat_rotate(&wcb->fusion.rot, &delta, &wcb->fusion.rot);
+	/* Telemetry: optical observation vs the UKF-predicted state (what get_tracked_pose reports).
+	 *   - pos_residual_m  = |optical position - UKF-predicted position|
+	 *   - rot_residual_deg = angle between optical orientation and UKF-predicted orientation */
+	if (g2_telem_enabled()) {
+		struct xrt_vec3 pos_diff = {pose->position.x - predicted_pos.x, pose->position.y - predicted_pos.y,
+		                            pose->position.z - predicted_pos.z};
+		float pos_residual_m = m_vec3_len(pos_diff);
 
-			if (wcb->log_level <= U_LOGGING_DEBUG) {
-				struct xrt_quat post_delta;
-				math_quat_unrotate(&wcb->fusion.rot, &pose->orientation, &post_delta);
-				post_delta.x = post_delta.z = 0.0;  // We only want Yaw
-				post_delta.y = 0.10 * post_delta.y; // 5%
-				math_quat_normalize(&post_delta);
+		struct xrt_quat resid_q;
+		math_quat_unrotate(&predicted_rot, &pose->orientation, &resid_q);
+		math_quat_normalize(&resid_q);
+		float w = resid_q.w < -1.0f ? -1.0f : (resid_q.w > 1.0f ? 1.0f : resid_q.w);
+		float rot_residual_deg = (float)RAD_TO_DEG(2.0 * acosf(fabsf(w)));
 
-				WMR_DEBUG(wcb,
-				          "Applying delta yaw rotation of %f degrees delta quat %f,%f,%f,%f from "
-				          "%f,%f,%f,%f to "
-				          "%f,%f,%f,%f. delta after correction: %f,%f,%f,%f",
-				          RAD_TO_DEG(2 * asinf(delta.y)), delta.x, delta.y, delta.z, delta.w, prev.x,
-				          prev.y, prev.z, prev.w, wcb->fusion.rot.x, wcb->fusion.rot.y,
-				          wcb->fusion.rot.z, wcb->fusion.rot.w, post_delta.x, post_delta.y,
-				          post_delta.z, post_delta.w);
+		float optical_pose[7] = {pose->position.x,    pose->position.y,    pose->position.z,
+		                         pose->orientation.x, pose->orientation.y, pose->orientation.z,
+		                         pose->orientation.w};
+		float predicted_pose[7] = {predicted_pos.x, predicted_pos.y, predicted_pos.z, predicted_rot.x,
+		                           predicted_rot.y, predicted_rot.z, predicted_rot.w};
+
+		/* Mirror the kalman_fusion outcome at this call site so the documented
+		 * fusion outcomes have a producer (MAJOR-5). The gate constants and the
+		 * residual_limit (15) match t_tracker_kalman_fusion.cpp, which owns the
+		 * actual decision; this is a faithful read-only reproduction (that file
+		 * is not modified). uint8_t outcome: 0=rejected, 1=accepted, 2=reset. */
+		uint8_t outcome = 1 /* accepted */;
+
+		/* Optical-jump gate: a candidate that moved further from the last optical
+		 * anchor than a controller could physically travel is rejected (not fused).
+		 * Constants mirror KalmanFusion: OPTICAL_MAX_SPEED_M_S=12, JUMP_SLACK=0.5 m. */
+		const float OPTICAL_MAX_SPEED_M_S = 12.0f;
+		const float OPTICAL_JUMP_SLACK_M = 0.5f;
+		bool jump_rejected = false;
+		if (prev_optical_ts != 0) {
+			float dt = (float)((double)(frame_mono_ns - prev_optical_ts) / 1.0e9);
+			if (dt < 0.0f) {
+				dt = 0.0f;
 			}
-		} else {
-			math_quat_normalize(&delta);
-
-			WMR_DEBUG(wcb, "Applying full yaw correction of %f degrees. delta quat %f,%f,%f,%f",
-			          RAD_TO_DEG(2 * asinf(delta.y)), delta.x, delta.y, delta.z, delta.w);
-			math_quat_rotate(&wcb->fusion.rot, &delta, &wcb->fusion.rot);
+			float max_jump = OPTICAL_MAX_SPEED_M_S * dt + OPTICAL_JUMP_SLACK_M;
+			struct xrt_vec3 jvec = {pose->position.x - prev_optical_pos.x,
+			                        pose->position.y - prev_optical_pos.y,
+			                        pose->position.z - prev_optical_pos.z};
+			if (m_vec3_len(jvec) > max_jump) {
+				jump_rejected = true;
+			}
 		}
-#else
-		wcb->fusion.rot = pose->orientation;
-#endif
+
+		if (jump_rejected) {
+			outcome = 0 /* rejected */;
+			/* event_type=3 optical_jump_rejected; value = jump magnitude in m. */
+			struct xrt_vec3 jvec = {pose->position.x - prev_optical_pos.x,
+			                        pose->position.y - prev_optical_pos.y,
+			                        pose->position.z - prev_optical_pos.z};
+			g2_telem_event(wmr_controller_telem_id(wcb), (uint64_t)frame_mono_ns,
+			               3 /* optical_jump_rejected */, m_vec3_len(jvec));
+		} else if (pos_residual_m > 15.0f /* residual_limit */) {
+			/* Residual too large -> the filter reset (catastrophic). */
+			outcome = 2 /* reset */;
+		}
+
+		g2_telem_fusion(wmr_controller_telem_id(wcb), (uint64_t)frame_mono_ns, optical_pose, predicted_pose,
+		                pos_residual_m, rot_residual_deg, outcome);
 	}
 
 	os_mutex_unlock(&wcb->data_lock);
@@ -1180,7 +1401,9 @@ static struct t_constellation_tracked_device_callbacks tracking_callbacks = {
     .get_led_model = wmr_controller_base_get_led_model,
     .notify_frame_received = wmr_controller_base_notify_frame,
     .push_observed_pose = wmr_controller_base_push_observed_pose,
+    .push_observed_leds = wmr_controller_base_push_observed_leds,
     .push_brightness_update = wmr_controller_base_push_brightness_update,
+    .get_pose_uncertainty = wmr_controller_base_get_pose_uncertainty,
 };
 
 void
