@@ -775,8 +775,16 @@ device_solve_view_from_labelled(struct t_constellation_tracker *ct,
 		g2_telem_event(telem_dev, (uint64_t)sample->timestamp, 2 /* recover_attempt */, (float)num_blobs);
 	}
 
+	/* Solve, and on the near-coplanar few-LED geometry that causes the mirror two-fold ambiguity, also
+	 * recover the second (twin) pose. Reprojection cannot separate the twins (both fit the blobs), so we
+	 * pick the one consistent with the IMU/fusion prior — committing the validated hypothesis this frame
+	 * rather than dropping a flipped solve. (prior_must_match below makes "GOOD" == prior-consistent, so a
+	 * flipped candidate simply fails to score GOOD and the correct twin wins.) */
 	struct xrt_pose P_cam_obj = P_cam_obj_prior;
-	if (!ransac_pnp_pose(&P_cam_obj, bwobs->blobs, bwobs->num_blobs, leds_model, &cam->camera_model, NULL, NULL)) {
+	struct xrt_pose twin_pose;
+	bool has_twin = false;
+	if (!ransac_pnp_pose_with_twin(&P_cam_obj, bwobs->blobs, bwobs->num_blobs, leds_model, &cam->camera_model,
+	                               NULL, NULL, &twin_pose, &has_twin)) {
 		CT_DEBUG(ct, "Camera %d RANSAC-PnP for device %d from %d blobs failed", view_id, leds_model->id,
 		         num_blobs);
 		if (g2_telem_enabled()) {
@@ -791,6 +799,22 @@ device_solve_view_from_labelled(struct t_constellation_tracker *ct,
 	pose_metrics_evaluate_pose_with_prior(&dev_state->score, &P_cam_obj, true, &P_cam_obj_prior,
 	                                      &dev_state->prior_pos_error, &dev_state->prior_rot_error, bwobs->blobs,
 	                                      bwobs->num_blobs, &device->led_model, &cam->camera_model, NULL);
+
+	/* Mirror-twin disambiguation: prefer the prior-consistent twin (selects the correct mode, kills the
+	 * flip, and recovers a frame the single-solution path would have dropped). */
+	if (has_twin) {
+		struct pose_metrics twin_score;
+		pose_metrics_evaluate_pose_with_prior(&twin_score, &twin_pose, true, &P_cam_obj_prior,
+		                                      &dev_state->prior_pos_error, &dev_state->prior_rot_error,
+		                                      bwobs->blobs, bwobs->num_blobs, &device->led_model,
+		                                      &cam->camera_model, NULL);
+		const bool primary_good = POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD);
+		const bool twin_good = POSE_HAS_FLAGS(&twin_score, POSE_MATCH_GOOD);
+		if (twin_good && (!primary_good || pose_metrics_score_is_better_pose(&dev_state->score, &twin_score))) {
+			dev_state->score = twin_score;
+			P_cam_obj = twin_pose;
+		}
+	}
 
 	if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD)) {
 		CT_DEBUG(ct, "Camera %d %s pose for device %d from %d blobs", view_id,
