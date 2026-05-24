@@ -15,6 +15,10 @@
 
 #include "xrt/xrt_device.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* This is the angle that Rift CV1 LEDs are visible at. Let's see if
  * it works for other controller types... */
 #define LED_ANGLE 82
@@ -101,3 +105,7 @@ struct t_constellation_search_model *
 t_constellation_search_model_new(struct t_constellation_led_model *led_model);
 void
 t_constellation_search_model_free(struct t_constellation_search_model *model);
+
+#ifdef __cplusplus
+}
+#endif

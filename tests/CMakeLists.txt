@@ -82,6 +82,19 @@ if(XRT_HAVE_OPENCV)
 	target_compile_definitions(tests_kalman_fusion PRIVATE G2_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 endif()
 
+# Offline controller-VIO replay harness: drives the real constellation tracker + ESKF over recorded raw
+# frames + controller IMU (for front-end iteration + IMU<->visual drift study, headless). A tool, not a
+# ctest. Needs the constellation tracker (built with the WMR/rift_s constellation drivers) + OpenCV.
+if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
+	add_executable(offline_vio_replay offline_vio_replay.cpp)
+	target_link_libraries(
+		offline_vio_replay
+		PRIVATE constellation_tracker aux_tracking aux_util aux_math aux_os xrt-interfaces
+				Threads::Threads ${OpenCV_LIBRARIES})
+	target_include_directories(offline_vio_replay PRIVATE ${OpenCV_INCLUDE_DIRS})
+	set_target_properties(offline_vio_replay PROPERTIES FOLDER monado_tests)
+endif()
+
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(
 		tests_levenbergmarquardt
