@@ -466,22 +466,32 @@ blobwatch_process(blobwatch *bw, struct xrt_frame *frame, uint16_t exposure, uin
 
 	process_frame(bw, ob, frame);
 
-	/* Optional: dump the actual controller-tracking frame (what the constellation tracker
-	 * sees) as PGM, for offline exposure tuning / inspection — the EuRoC recorder only
-	 * captures the SLAM-exposure frames. Enabled by G2_DUMP_FRAMES=<dir>; rate-limited. */
+	/* Optional: dump the actual controller-tracking frame (what the constellation tracker sees) as
+	 * PGM — the real short-exposure LED images, which the EuRoC recorder does NOT capture (it taps the
+	 * SLAM-exposure stream). Enabled by G2_DUMP_FRAMES=<dir>. Default dumps EVERY frame (needed for a
+	 * faithful offline VIO replay); set G2_DUMP_FRAMES_STRIDE=N to dump 1-in-N (e.g. 15 for sparse
+	 * inspection, less capture-time I/O). */
 	{
 		static const char *dump_dir = NULL;
 		static bool dump_init = false;
 		static uint32_t dump_ctr = 0;
+		static uint32_t dump_stride = 1;
 		if (!dump_init) {
 			dump_dir = getenv("G2_DUMP_FRAMES");
+			const char *stride_s = getenv("G2_DUMP_FRAMES_STRIDE");
+			if (stride_s != NULL && stride_s[0] != '\0' && atoi(stride_s) > 0) {
+				dump_stride = (uint32_t)atoi(stride_s);
+			}
 			dump_init = true;
 		}
-		if (dump_dir != NULL && dump_dir[0] != '\0' && (dump_ctr++ % 15) == 0 && frame->data != NULL &&
-		    frame->width > 0 && frame->stride >= frame->width) {
+		if (dump_dir != NULL && dump_dir[0] != '\0' && (dump_ctr++ % dump_stride) == 0 &&
+		    frame->data != NULL && frame->width > 0 && frame->stride >= frame->width) {
 			char path[512];
-			snprintf(path, sizeof(path), "%s/cam%u_e%u_%010lu_n%u.pgm", dump_dir, bw->cam_id,
-			         (unsigned)exposure, (unsigned long)frame->source_sequence, (unsigned)ob->num_blobs);
+			// Encode cam, frame timestamp (ns, for IMU alignment in offline replay), exposure (the real
+			// controller exposure the matcher needs), source seq (groups the 4 cams of one frame), blobs.
+			snprintf(path, sizeof(path), "%s/cam%u_t%020lld_e%u_s%010lu_n%u.pgm", dump_dir, bw->cam_id,
+			         (long long)frame->timestamp, (unsigned)exposure,
+			         (unsigned long)frame->source_sequence, (unsigned)ob->num_blobs);
 			FILE *fp = fopen(path, "wb");
 			if (fp != NULL) {
 				fprintf(fp, "P5\n%u %u\n255\n", frame->width, frame->height);
