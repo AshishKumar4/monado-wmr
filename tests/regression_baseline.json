@@ -1,0 +1,23 @@
+{
+  "capture": "20260524-200416-headpose",
+  "column": "opt",
+  "_note": "edited & maintained by Claude, presented as-is. Regenerate: regression_check.py --update",
+  "metrics": {
+    "1": {
+      "yield_pct": 65.29680365296804,
+      "wrong_branch_pct": 24.828263002944063,
+      "flip_rate_pct": 10.0,
+      "fly_frac_beyond_reach": 4.662004662004662,
+      "anchor_tilt_flip_pct": 11.159650516282763,
+      "anchor_yaw_flip_pct": 1.0325655281969817
+    },
+    "2": {
+      "yield_pct": 73.74200722824575,
+      "wrong_branch_pct": 13.644088370963825,
+      "flip_rate_pct": 7.546093898498384,
+      "fly_frac_beyond_reach": 2.6767200754005653,
+      "anchor_tilt_flip_pct": 5.617283950617284,
+      "anchor_yaw_flip_pct": 1.4197530864197532
+    }
+  }
+}

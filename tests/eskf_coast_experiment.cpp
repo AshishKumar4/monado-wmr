@@ -30,11 +30,17 @@
  *        compare against it. Robust percentiles (median/p95) further bound any residual outliers.
  *
  * Usage: eskf_coast_experiment <file.replay> [withhold_seconds=0] [recover_seconds=2.0]
+ *          [--intrinsics M_g[9] T_a[9]]
+ *
+ * --intrinsics seeds the optically-derived IMU intrinsics (gyro M_g then accel T_a, 18 row-major
+ * doubles) through the SAME kalman_fusion_set_imu_intrinsics the driver's cache loader uses, so an
+ * identity-vs-computed A/B exercises the production correction path. Omitted = identity (uncorrected).
  */
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 #include "xrt/xrt_defines.h"
@@ -80,7 +86,10 @@ int
 main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s <file.replay> [withhold_seconds=0] [recover_seconds=2.0]\n", argv[0]);
+		fprintf(stderr,
+		        "usage: %s <file.replay> [withhold_seconds=0] [recover_seconds=2.0] "
+		        "[--intrinsics M_g[9] T_a[9]]\n",
+		        argv[0]);
 		return 2;
 	}
 	g2replay::Dataset ds;
@@ -92,13 +101,47 @@ main(int argc, char **argv)
 		fprintf(stderr, "replay has no imu (%zu) or pose (%zu)\n", ds.imu.size(), ds.pose.size());
 		return 1;
 	}
-	const double withhold_s = (argc > 2) ? atof(argv[2]) : 0.0;
+
+	// Optional intrinsics: gyro M_g[9] then accel T_a[9], row-major, applied through the production
+	// cache-load path. Parsed first so it may sit anywhere after the replay path.
+	double mg[9], ta[9];
+	bool have_intrinsics = false;
+	std::vector<char *> pos; // the positional args (replay, withhold, recover) once --intrinsics is removed
+	pos.push_back(argv[0]);
+	for (int i = 1; i < argc; i++) {
+		if (std::string(argv[i]) == "--intrinsics") {
+			if (i + 18 >= argc) {
+				fprintf(stderr, "--intrinsics needs 18 doubles (M_g[9] T_a[9])\n");
+				return 2;
+			}
+			for (int k = 0; k < 9; k++) {
+				mg[k] = atof(argv[i + 1 + k]);
+				ta[k] = atof(argv[i + 10 + k]);
+			}
+			have_intrinsics = true;
+			i += 18;
+		} else {
+			pos.push_back(argv[i]);
+		}
+	}
+	const int npos = (int)pos.size();
+	const double withhold_s = (npos > 2) ? atof(pos[2]) : 0.0;
 	const int64_t withhold_ns = (int64_t)(withhold_s * 1e9);
-	const int64_t recover_ns = (int64_t)((argc > 3 ? atof(argv[3]) : 2.0) * 1e9);
+	const int64_t recover_ns = (int64_t)((npos > 3 ? atof(pos[3]) : 2.0) * 1e9);
 	const int64_t t0 = ds.imu.front().t_ns;
 	const int64_t bootstrap_ns = t0 + (int64_t)(BOOTSTRAP_S * 1e9);
 
 	struct KalmanFusionInterfaceWrapper *kf = kalman_fusion_create();
+	if (have_intrinsics) {
+		kalman_fusion_set_imu_intrinsics(kf, mg, ta); // production cache-load path; identity = no-op
+		// Confirm the filter ACCEPTED them (passed the plausibility guard) and now holds a real
+		// correction — the activation read-back the offline tool's output must satisfy.
+		double rmg[9], rta[9];
+		const bool applied = kalman_fusion_get_imu_intrinsics(kf, rmg, rta);
+		printf("# intrinsics applied=%s  M_g=[%.4f %.4f %.4f; %.4f %.4f %.4f; %.4f %.4f %.4f]\n",
+		       applied ? "yes" : "REJECTED(identity)", rmg[0], rmg[1], rmg[2], rmg[3], rmg[4], rmg[5],
+		       rmg[6], rmg[7], rmg[8]);
+	}
 
 	std::vector<Sample> samples;
 	int folded = 0, rejected_truth = 0, withheld = 0;
@@ -148,7 +191,7 @@ main(int argc, char **argv)
 					continue;
 				}
 				struct xrt_space_relation rel = {};
-				kalman_fusion_get_prediction(kf, p.t_ns, &rel);
+				kalman_fusion_get_prediction(kf, p.t_ns, &rel, nullptr);
 				if (rel.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) {
 					const float pr[3] = {rel.pose.position.x, rel.pose.position.y, rel.pose.position.z};
 					const float pq[4] = {rel.pose.orientation.x, rel.pose.orientation.y,
@@ -167,7 +210,7 @@ main(int argc, char **argv)
 			ps.pose.position = {p.px, p.py, p.pz};
 			ps.pose.orientation = {p.qx, p.qy, p.qz, p.qw};
 			ps.timestamp_ns = p.t_ns;
-			kalman_fusion_process_pose(kf, &ps, nullptr, nullptr, 15);
+			kalman_fusion_process_pose(kf, &ps, nullptr, nullptr, 15, nullptr);
 			last_fold_ns = p.t_ns;
 			last_fold_pos[0] = tp[0];
 			last_fold_pos[1] = tp[1];
@@ -190,8 +233,9 @@ main(int argc, char **argv)
 	const char *labels[] = {"  0- 20ms", " 20- 50ms", " 50-100ms", "100-200ms", "200-350ms",
 	                        "350-500ms", "0.5-1.0s ", "1.0-2.0s ", "  >2.0s  "};
 
-	printf("# %s  withhold=%.2fs  folded=%d  samples=%zu  rejected-bad-truth=%d  withheld=%d\n", argv[1],
-	       withhold_s, folded, samples.size(), rejected_truth, withheld);
+	printf("# %s  intrinsics=%s  withhold=%.2fs  folded=%d  samples=%zu  rejected-bad-truth=%d  withheld=%d\n",
+	       pos[1], have_intrinsics ? "on" : "identity", withhold_s, folded, samples.size(), rejected_truth,
+	       withheld);
 	printf("# gap          n  frozen%%   pos drift (cm)            ori err (deg)\n");
 	printf("# %-10s %5s %7s   med    p95    max     med    p95   flips>45deg\n", "", "", "");
 	double lo = 0;

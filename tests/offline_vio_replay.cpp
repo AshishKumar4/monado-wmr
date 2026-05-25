@@ -510,13 +510,29 @@ struct FakeController
 	std::mutex cap_lock;
 	bool opt_valid = false;
 	struct xrt_pose opt_pose {};
+	struct FakeHmd *hmd = nullptr; // body-lock reference (mirrors the production wcb->hmd_xdev)
 };
+
+// Live head pose at time @p t (same world frame as the controller) — the body-lock reference + arm-reach
+// gate origin, exactly as the production driver queries the HMD's tracked pose.
+static const struct xrt_pose *
+ctrl_head_pose(FakeController *c, int64_t t, struct xrt_pose *out)
+{
+	if (c->hmd == nullptr) {
+		return nullptr;
+	}
+	struct xrt_space_relation rel = {};
+	hmd_get_pose(reinterpret_cast<struct xrt_device *>(c->hmd), XRT_INPUT_GENERIC_TRACKER_POSE, t, &rel);
+	*out = rel.pose;
+	return out;
+}
 
 xrt_result_t
 ctrl_get_pose(struct xrt_device *xdev, enum xrt_input_name, int64_t t, struct xrt_space_relation *rel)
 {
 	FakeController *c = reinterpret_cast<FakeController *>(xdev);
-	kalman_fusion_get_prediction(c->kf, t, rel); // the IMU-dead-reckoned prior the matcher refines
+	struct xrt_pose hp;
+	kalman_fusion_get_prediction(c->kf, t, rel, ctrl_head_pose(c, t, &hp)); // IMU prior the matcher refines
 	return XRT_SUCCESS;
 }
 
@@ -537,7 +553,8 @@ cb_push_pose(struct xrt_device *xdev, timepoint_ns t, const struct xrt_pose *pos
 	struct xrt_pose_sample s = {};
 	s.pose = *pose;
 	s.timestamp_ns = t;
-	kalman_fusion_process_pose(c->kf, &s, nullptr, nullptr, 15);
+	struct xrt_pose hp;
+	kalman_fusion_process_pose(c->kf, &s, nullptr, nullptr, 15, ctrl_head_pose(c, t, &hp));
 	std::lock_guard<std::mutex> lk(c->cap_lock);
 	c->opt_valid = true;
 	c->opt_pose = *pose;
@@ -559,13 +576,31 @@ cb_push_leds(struct xrt_device *xdev, timepoint_ns t, const struct xrt_pose *P_x
 		obs[i].observed_px = leds[i].obs_px;
 		obs[i].led_obj = leds[i].led_obj;
 	}
-	struct xrt_vec2 var = {1.5f, 1.5f};
-	kalman_fusion_process_led_observations(c->kf, t, obs, m, &view, &var, 8.0f, true);
+	// NULL variance => the filter's own LED_PIXEL_STD² (single source of truth, == production driver).
+	struct xrt_pose hp;
+	kalman_fusion_process_led_observations(c->kf, t, obs, m, &view, nullptr, 8.0f, true,
+	                                       ctrl_head_pose(c, t, &hp));
 }
 bool
 cb_get_unc(struct xrt_device *xdev, double *ps, double *os)
 {
 	return kalman_fusion_get_pose_uncertainty(reinterpret_cast<FakeController *>(xdev)->kf, ps, os);
+}
+bool
+cb_predict_gate(struct xrt_device *xdev, const struct xrt_pose *P_xrworld_cam,
+                const struct t_constellation_cam_calib *cc, const struct xrt_vec3 *led_obj, float out_zhat[2],
+                float out_S[4])
+{
+	FakeController *c = reinterpret_cast<FakeController *>(xdev);
+	struct kalman_led_camera_view view = {cc->fx,
+	                                      cc->fy,
+	                                      cc->cx,
+	                                      cc->cy,
+	                                      P_xrworld_cam->orientation,
+	                                      P_xrworld_cam->position};
+	struct kalman_led_observation obs = {};
+	obs.led_obj = *led_obj; // observed_px unused by the gate predictor
+	return kalman_fusion_predict_led_gate(c->kf, &obs, &view, out_zhat, out_S);
 }
 void
 cb_noop_frame(struct xrt_device *, uint64_t, uint64_t)
@@ -692,6 +727,7 @@ main(int argc, char **argv)
 	ctrl.kf = kalman_fusion_create();
 	ctrl.device_id = (uint8_t)device_id;
 	ctrl.leds = leds;
+	ctrl.hmd = &hmd; // body-lock reference (mirrors wmr_controller_attach_to_hmd's wcb->hmd_xdev)
 	ctrl.base.get_tracked_pose = ctrl_get_pose;
 	ctrl.base.update_inputs = dev_noop_update;
 	ctrl.base.destroy = dev_noop_destroy;
@@ -718,12 +754,14 @@ main(int argc, char **argv)
 	cbs.push_brightness_update = cb_noop_bright;
 	cbs.push_observed_leds = cb_push_leds;
 	cbs.get_pose_uncertainty = cb_get_unc;
+	cbs.predict_led_gate = cb_predict_gate;
 	t_constellation_tracker_add_device(tracker, &ctrl.base, &cbs);
 
 	FILE *csv = out_csv.empty() ? nullptr : fopen(out_csv.c_str(), "w");
 	if (csv != nullptr) {
 		fprintf(csv, "t_ns,opt_valid,opt_px,opt_py,opt_pz,opt_qx,opt_qy,opt_qz,opt_qw,"
-		             "pred_px,pred_py,pred_pz,pred_qx,pred_qy,pred_qz,pred_qw,pred_tracked\n");
+		             "pred_px,pred_py,pred_pz,pred_qx,pred_qy,pred_qz,pred_qw,pred_tracked,"
+		             "hmd_px,hmd_py,hmd_pz,pred_to_hmd_m\n");
 	}
 
 	size_t ii = 0;
@@ -744,12 +782,30 @@ main(int argc, char **argv)
 			ctrl.opt_valid = false;
 		}
 		struct xrt_frame *f = assemble_mosaic(mf, cams, seq++);
+		// Completion BARRIER (replaces the old fixed 8ms sleep, which was a race: a frame whose
+		// ab-initio search ran past 8ms was read as "no optical pose" -> the yield % became
+		// machine-load-dependent, audit H1). The tracker increments frames_completed exactly once per
+		// frame at every pipeline exit; we drive one frame at a time, so only one is ever in flight.
+		// Spin-wait (with a tiny yield/sleep) until THIS frame is fully processed before reading opt_*.
+		const uint64_t done_before = t_constellation_tracker_debug_frames_completed(tracker);
 		xrt_sink_push_frame(sink, f);
-		std::this_thread::sleep_for(std::chrono::milliseconds(8)); // let the fast thread process
-		xrt_frame_reference(&f, nullptr);                          // release after processing
+		{
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+			while (t_constellation_tracker_debug_frames_completed(tracker) < done_before + 1) {
+				if (std::chrono::steady_clock::now() > deadline) {
+					fprintf(stderr, "WARN: frame %lld completion barrier timed out\n",
+					        (long long)mf.t_ns);
+					break;
+				}
+				std::this_thread::sleep_for(std::chrono::microseconds(100));
+			}
+		}
+		xrt_frame_reference(&f, nullptr); // release after processing
 
 		struct xrt_space_relation fused = {};
-		kalman_fusion_get_prediction(ctrl.kf, mf.t_ns, &fused);
+		struct xrt_pose hp_pred;
+		const struct xrt_pose *hp_pred_ptr = ctrl_head_pose(&ctrl, mf.t_ns, &hp_pred);
+		kalman_fusion_get_prediction(ctrl.kf, mf.t_ns, &fused, hp_pred_ptr);
 		const bool ptracked = (fused.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
 		locked += ptracked ? 1 : 0;
 		bool ov;
@@ -769,10 +825,19 @@ main(int argc, char **argv)
 			} else {
 				fprintf(csv, "nan,nan,nan,nan,nan,nan,nan,");
 			}
-			fprintf(csv, "%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,%d\n", fused.pose.position.x,
+			fprintf(csv, "%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,%d,", fused.pose.position.x,
 			        fused.pose.position.y, fused.pose.position.z, fused.pose.orientation.x,
 			        fused.pose.orientation.y, fused.pose.orientation.z, fused.pose.orientation.w,
 			        ptracked ? 1 : 0);
+			if (hp_pred_ptr != nullptr) {
+				const double dx = fused.pose.position.x - hp_pred_ptr->position.x;
+				const double dy = fused.pose.position.y - hp_pred_ptr->position.y;
+				const double dz = fused.pose.position.z - hp_pred_ptr->position.z;
+				fprintf(csv, "%.5f,%.5f,%.5f,%.5f\n", hp_pred_ptr->position.x, hp_pred_ptr->position.y,
+				        hp_pred_ptr->position.z, std::sqrt(dx * dx + dy * dy + dz * dz));
+			} else {
+				fprintf(csv, "nan,nan,nan,nan\n");
+			}
 		}
 	}
 	if (csv != nullptr) {

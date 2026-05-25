@@ -94,6 +94,27 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 	target_include_directories(offline_vio_replay PRIVATE ${OpenCV_INCLUDE_DIRS})
 	set_target_properties(offline_vio_replay PROPERTIES FOLDER monado_tests)
 
+	# Standing regression guardrail: replays the faithful capture through offline_vio_replay and fails if a
+	# flip / wrong-branch / yield metric regresses past tolerance vs tests/regression_baseline.json. The
+	# runner skips cleanly (exit 0) when the capture, the harness binary, or the scoring deps are absent, so
+	# a capture-less / dep-less build never breaks. Prefer the analysis conda env if present, else Python3.
+	find_program(
+		G2_REGRESSION_PYTHON
+		NAMES python
+		HINTS "$ENV{HOME}/miniconda3/envs/g2vr/bin"
+		NO_DEFAULT_PATH)
+	if(NOT G2_REGRESSION_PYTHON)
+		set(G2_REGRESSION_PYTHON ${Python3_EXECUTABLE})
+	endif()
+	add_test(
+		NAME regression_benchmark
+		COMMAND ${G2_REGRESSION_PYTHON}
+				${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/telemetry/regression_check.py
+				--bin $<TARGET_FILE:offline_vio_replay> --baseline
+				${CMAKE_CURRENT_SOURCE_DIR}/regression_baseline.json)
+	set_tests_properties(regression_benchmark PROPERTIES ENVIRONMENT "PYTHONNOUSERSITE=1" LABELS
+															 g2_regression)
+
 	# Inertial coast-drift experiment: real ESKF on recorded IMU + optical, with withheld-optical
 	# windows, to measure out-of-view dead-reckon drift (a tool, not a ctest).
 	add_executable(eskf_coast_experiment eskf_coast_experiment.cpp)
@@ -113,7 +134,32 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 										${OpenCV_INCLUDE_DIRS})
 	add_test(NAME tests_constellation_pnp COMMAND tests_constellation_pnp --success --allow-running-no-tests)
 	set_target_properties(tests_constellation_pnp PROPERTIES FOLDER monado_tests)
+
+	# Decoupled, adversarial unit tests for the blob-detection layer (saturated-centroid recovery,
+	# per-blob R, reflection rejection). Synthetic frames, known truth.
+	add_executable(tests_blobwatch tests_blobwatch.cpp)
+	target_link_libraries(
+		tests_blobwatch PRIVATE xrt-external-catch2 constellation_tracker aux_math aux_util
+								xrt-interfaces ${OpenCV_LIBRARIES})
+	target_include_directories(
+		tests_blobwatch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/tracking/constellation
+								${OpenCV_INCLUDE_DIRS})
+	add_test(NAME tests_blobwatch COMMAND tests_blobwatch --success --allow-running-no-tests)
+	set_target_properties(tests_blobwatch PROPERTIES FOLDER monado_tests)
 endif()
+
+# Standalone telemetry stress + correctness test (own main, stubs u_log, compiles u_g2_telemetry.c
+# directly to stay self-contained — NOT linked against aux_util). A real ctest; guards the wait-free ring
+# + the manifest offsets (incl. the head_pose stream) that the offline harness depends on.
+add_executable(tests_g2_telemetry tests_g2_telemetry.c
+	${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/auxiliary/util/u_g2_telemetry.c)
+target_include_directories(
+	tests_g2_telemetry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/include
+							   ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/auxiliary)
+target_link_libraries(tests_g2_telemetry PRIVATE Threads::Threads)
+target_compile_definitions(tests_g2_telemetry PRIVATE _GNU_SOURCE) # pthread_setname_np in os_threading.h
+add_test(NAME tests_g2_telemetry COMMAND tests_g2_telemetry ${CMAKE_CURRENT_BINARY_DIR}/g2_telem_test_out)
+set_target_properties(tests_g2_telemetry PROPERTIES FOLDER monado_tests)
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(
