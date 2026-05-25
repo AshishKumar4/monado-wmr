@@ -54,18 +54,23 @@ kalman_fusion_process_imu_data(struct KalmanFusionInterfaceWrapper *wrapper,
                                const struct xrt_vec3 *accel_variance_optional,
                                const struct xrt_vec3 *gyro_variance_optional);
 
+//! @p hmd_world_pose is the LIVE HMD pose in the same world frame as the controller (NULL if
+//! unavailable). It lets the fusion gate optical adoption on the controller-to-HMD distance (arm reach),
+//! which is room-roam-invariant, and capture the body-lock offset for out-of-view reporting.
 void
 kalman_fusion_process_pose(struct KalmanFusionInterfaceWrapper *wrapper,
                            const struct xrt_pose_sample *sample,
                            const struct xrt_vec3 *position_variance_optional,
                            const struct xrt_vec3 *orientation_variance_optional,
-                           float residual_limit);
+                           float residual_limit,
+                           const struct xrt_pose *hmd_world_pose);
 
 //! Tightly-coupled per-LED optical update (the ESKF feed). @p feed=false runs a read-only diagnostic
 //! (computes the per-LED reprojection RMS vs the current pose) instead of folding — used to verify
 //! the frame/undistort transforms live before trusting the feed. feed=true returns the number of LEDs
 //! folded this frame (>=0; -1 if the filter is not yet tracking); feed=false returns the diagnostic
 //! reprojection RMS in NORMALIZED image units (or -1 if no pose).
+//! @p hmd_world_pose: see kalman_fusion_process_pose (NULL if unavailable).
 float
 kalman_fusion_process_led_observations(struct KalmanFusionInterfaceWrapper *wrapper,
                                        timepoint_ns timestamp_ns,
@@ -74,12 +79,30 @@ kalman_fusion_process_led_observations(struct KalmanFusionInterfaceWrapper *wrap
                                        const struct kalman_led_camera_view *view,
                                        const struct xrt_vec2 *pixel_variance_optional,
                                        float max_innov_px,
-                                       bool feed);
+                                       bool feed,
+                                       const struct xrt_pose *hmd_world_pose);
 
+//! @p hmd_world_pose is the LIVE HMD pose (same world frame as the controller; NULL if unavailable).
+//! When the controller's position is no longer optically observable, the fusion body-locks: it reports
+//! the controller at its last controller-to-HMD offset riding with this live HMD pose (so an out-of-view
+//! controller stays at arm's reach of the head instead of dead-reckoning to metres). NULL falls back to
+//! the world-frame hold at the last optically-observed position.
 void
 kalman_fusion_get_prediction(struct KalmanFusionInterfaceWrapper *wrapper,
                              const timepoint_ns timestamp_ns,
-                             struct xrt_space_relation *out_relation);
+                             struct xrt_space_relation *out_relation,
+                             const struct xrt_pose *hmd_world_pose);
+
+//! Predict one LED's image point @p out_zhat and 2x2 innovation covariance @p out_S (row-major:
+//! S00,S01,S10,S11) = H P H^T + R, the per-LED gate ellipse for the covariance-driven associator. Uses
+//! the SAME H/projection as the tightly-coupled fold (one source of truth). Returns false (writes
+//! nothing) until the filter is tracking, or on a null wrapper/view.
+bool
+kalman_fusion_predict_led_gate(struct KalmanFusionInterfaceWrapper *wrapper,
+                               const struct kalman_led_observation *obs,
+                               const struct kalman_led_camera_view *view,
+                               float out_zhat[2],
+                               float out_S[4]);
 
 //! Current 1-sigma uncertainty of the predicted pose (scalar position std in m, orientation std in
 //! rad) from the filter covariance — lets a consumer size a prior-consistency gate by the filter's
@@ -102,6 +125,21 @@ kalman_fusion_get_imu_calibration(struct KalmanFusionInterfaceWrapper *wrapper,
                                   double gyro_bias[3],
                                   double accel_bias[3],
                                   double *accel_scale);
+
+//! Optically-derived IMU intrinsics (offline-computed, persisted per serial alongside the bias cache).
+//! @p gyro_correction (row-major 3x3) corrects the gyro: rate = M_g·(gyro - bg) — scale + gyro->device
+//! misalignment in one matrix (the M imu_calib_from_optical.py fits). @p accel_correction (row-major 3x3)
+//! is the accel ellipsoid T_a: specific force = T_a·(accel - ba). Either may be identity (uncorrected).
+//! set_* applies a prior before tracking; get_* reads the applied intrinsics and returns false when
+//! neither is a real correction (nothing to persist).
+void
+kalman_fusion_set_imu_intrinsics(struct KalmanFusionInterfaceWrapper *wrapper,
+                                 const double gyro_correction[9],
+                                 const double accel_correction[9]);
+bool
+kalman_fusion_get_imu_intrinsics(struct KalmanFusionInterfaceWrapper *wrapper,
+                                 double gyro_correction[9],
+                                 double accel_correction[9]);
 
 #ifdef __cplusplus
 }

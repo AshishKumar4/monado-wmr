@@ -109,12 +109,12 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 		         mono_time_ns, wcb->last_imu_timestamp_ns, back_ns);
 		/* Telemetry: IMU went backwards in time -> anomaly (fusion is being reset).
 		 * value is the backwards delta in MILLISECONDS: an ns delta does not fit
-		 * f32's ~24-bit mantissa for large clock jumps (MINOR-2); ms keeps it
-		 * meaningful. The schema documents value's unit for this event type. */
+		 * f32's ~24-bit mantissa for large clock jumps; ms keeps it meaningful.
+		 * The schema documents value's unit for this event type. */
 		g2_telem_event(wmr_controller_telem_id(wcb), (uint64_t)mono_time_ns, 4 /* imu_anomaly */,
 		               (float)((double)back_ns / 1.0e6));
 		// Drop this sample and reset clock tracking so the next sample re-establishes the epoch.
-		// The UKF keeps its state (it tolerates the gap; a non-monotonic sample is never fed to it).
+		// The filter keeps its state (it tolerates the gap; a non-monotonic sample is never fed to it).
 		wcb->last_imu_timestamp_ns = 0;
 		wcb->last_imu_device_timestamp_ns = 0;
 		m_clock_windowed_skew_tracker_reset(wcb->hw2mono_clock);
@@ -136,7 +136,7 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 
 	/* Telemetry: controller IMU sample. hw_ts_ns uses mono_time_ns, the monotonic-
 	 * converted sample time, so it shares the common clock with the HMD IMU and every
-	 * other stream (MAJOR-3 -- no raw device ticks in hw_ts_ns). */
+	 * other stream (no raw device ticks in hw_ts_ns). */
 	g2_telem_imu(wmr_controller_telem_id(wcb), (uint64_t)mono_time_ns, imu_sample->acc.x, imu_sample->acc.y,
 	             imu_sample->acc.z, imu_sample->gyro.x, imu_sample->gyro.y, imu_sample->gyro.z);
 
@@ -480,9 +480,18 @@ write_calibration_cache(struct wmr_controller_base *wcb, char *cache_filename, u
 
 /* Cross-session IMU calibration cache (per controller serial). The converged gyro/accel bias + accel
  * scale are quasi-constant per unit, so persisting them and seeding the next session makes the first
- * second accurate (before any stance) and survives a large physical bias. Plain text, one line:
- *   version  bg_x bg_y bg_z  ba_x ba_y ba_z  scale  count
+ * second accurate (before any stance) and survives a large physical bias. The optically-derived
+ * INTRINSICS (gyro scale + gyro->device misalignment as one 3x3 M_g, and the accel ellipsoid T_a, both
+ * computed offline by imu_calib_from_optical.py) live here too — quasi-constant per unit, applied from
+ * the first sample. Plain text, one line; v2 appends the two 3x3 matrices to the v1 layout (a v1 file
+ * still loads — the matrices default to identity = uncorrected):
+ *   version  bg_x bg_y bg_z  ba_x ba_y ba_z  scale  count  M_g[9 row-major]  T_a[9 row-major]
  */
+#define IMU_CAL_VERSION 2
+
+/* Identity 3x3, row-major: the "no correction" default for the intrinsics matrices. */
+static const double IMU_CAL_IDENTITY3[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+
 static void
 imu_cal_filename(const char *serial, char *out, size_t out_size)
 {
@@ -492,6 +501,40 @@ imu_cal_filename(const char *serial, char *out, size_t out_size)
 			*c = '_';
 		}
 	}
+}
+
+/* Parse a cached record (v1 or v2). Returns true on a well-formed, PLAUSIBLE bias/scale; fills @p mg /
+ * @p ta with the v2 intrinsics, or identity for a v1 record (no intrinsics). Bounds mirror the filter's
+ * plausibility caps: real MEMS gyro bias << 0.1 rad/s, accel bias << 0.5 m/s^2, scale within ~10%. */
+static bool
+imu_cal_parse(FILE *f, double bg[3], double ba[3], double *scale, int *count, double mg[9], double ta[9])
+{
+	int ver = 0;
+	memcpy(mg, IMU_CAL_IDENTITY3, sizeof(IMU_CAL_IDENTITY3));
+	memcpy(ta, IMU_CAL_IDENTITY3, sizeof(IMU_CAL_IDENTITY3));
+	int n = fscanf(f, "%d %lf %lf %lf %lf %lf %lf %lf %d", &ver, &bg[0], &bg[1], &bg[2], &ba[0], &ba[1],
+	               &ba[2], scale, count);
+	if (n != 9 || (ver != 1 && ver != 2) || *scale <= 0.9 || *scale >= 1.1) {
+		return false;
+	}
+	for (int i = 0; i < 3; i++) {
+		if (fabs(bg[i]) > 0.1 || fabs(ba[i]) > 0.5) {
+			return false;
+		}
+	}
+	if (ver == 2) {
+		for (int i = 0; i < 9; i++) {
+			if (fscanf(f, "%lf", &mg[i]) != 1) {
+				return false;
+			}
+		}
+		for (int i = 0; i < 9; i++) {
+			if (fscanf(f, "%lf", &ta[i]) != 1) {
+				return false;
+			}
+		}
+	}
+	return true;
 }
 
 static void
@@ -506,24 +549,16 @@ imu_cal_load(struct wmr_controller_base *wcb, const char *serial)
 	if (f == NULL) {
 		return;
 	}
-	int ver = 0, count = 0;
-	double bg[3], ba[3], scale = 1.0;
-	int n = fscanf(f, "%d %lf %lf %lf %lf %lf %lf %lf %d", &ver, &bg[0], &bg[1], &bg[2], &ba[0], &ba[1], &ba[2],
-	               &scale, &count);
+	int count = 0;
+	double bg[3], ba[3], scale = 1.0, mg[9], ta[9];
+	bool plausible = imu_cal_parse(f, bg, ba, &scale, &count, mg, ta);
 	fclose(f);
-	/* Reject an implausible cache (e.g. a bias mis-estimated by a poorly-tracked session): real MEMS
-	 * gyro bias << 0.1 rad/s, accel bias << 0.5 m/s^2, scale within ~10%. Bounds mirror the filter's. */
-	bool plausible = (n == 9 && ver == 1 && scale > 0.9 && scale < 1.1);
-	for (int i = 0; i < 3 && plausible; i++) {
-		if (fabs(bg[i]) > 0.1 || fabs(ba[i]) > 0.5) {
-			plausible = false;
-		}
-	}
 	if (plausible) {
 		kalman_fusion_set_imu_calibration(wcb->kalman_fusion, bg, ba, scale);
+		kalman_fusion_set_imu_intrinsics(wcb->kalman_fusion, mg, ta); // identity for a v1 cache (no-op)
 		WMR_INFO(wcb, "Loaded IMU calibration prior (serial %s, accel scale %.4f, %d sessions)", serial,
 		         scale, count);
-	} else if (n == 9) {
+	} else {
 		WMR_WARN(wcb, "Ignoring implausible IMU calibration cache (serial %s) - will recalibrate", serial);
 	}
 }
@@ -541,19 +576,24 @@ imu_cal_save(struct wmr_controller_base *wcb, const char *serial)
 	char fn[64];
 	imu_cal_filename(serial, fn, sizeof(fn));
 
-	/* EMA-blend the session estimate into the existing cache (robust to one bad session; tracks slow
-	 * hardware drift over the device's life). First time, take the session value outright. */
-	double obg[3] = {0, 0, 0}, oba[3] = {0, 0, 0}, oscale = 1.0;
-	int over = 0, ocount = 0;
+	/* Read the prior cache once: its bias/scale to EMA-blend, and its intrinsics as the carry-forward
+	 * default (so a session that did not re-fit them keeps the offline-computed matrices intact). */
+	double obg[3] = {0, 0, 0}, oba[3] = {0, 0, 0}, oscale = 1.0, mg[9], ta[9];
+	int ocount = 0;
 	FILE *rf = u_file_open_file_in_config_dir_subpath("wmr", fn, "r");
+	bool had_cache = false;
 	if (rf != NULL) {
-		int n = fscanf(rf, "%d %lf %lf %lf %lf %lf %lf %lf %d", &over, &obg[0], &obg[1], &obg[2], &oba[0],
-		               &oba[1], &oba[2], &oscale, &ocount);
+		had_cache = imu_cal_parse(rf, obg, oba, &oscale, &ocount, mg, ta);
 		fclose(rf);
-		if (n != 9 || over != 1) {
-			ocount = 0;
-		}
 	}
+	if (!had_cache) {
+		ocount = 0;
+		memcpy(mg, IMU_CAL_IDENTITY3, sizeof(IMU_CAL_IDENTITY3));
+		memcpy(ta, IMU_CAL_IDENTITY3, sizeof(IMU_CAL_IDENTITY3));
+	}
+
+	/* EMA-blend the session BIAS/scale estimate into the existing cache (robust to one bad session;
+	 * tracks slow hardware drift over the device's life). First time, take the session value outright. */
 	const double a = (ocount > 0) ? 0.25 : 1.0;
 	for (int i = 0; i < 3; i++) {
 		bg[i] = (1.0 - a) * obg[i] + a * bg[i];
@@ -561,10 +601,27 @@ imu_cal_save(struct wmr_controller_base *wcb, const char *serial)
 	}
 	scale = (1.0 - a) * oscale + a * scale;
 
+	/* INTRINSICS: prefer the live filter's currently-applied matrices (the offline-seeded ones, or a
+	 * fresh online accel-ellipsoid fit) over the cached carry-forward. Not EMA-blended — they are a
+	 * geometric correction, not a slowly-drifting bias; get_* returns false (matrices unchanged) when
+	 * the filter holds no real correction, so the cached values carry forward untouched. */
+	double cur_mg[9], cur_ta[9];
+	if (kalman_fusion_get_imu_intrinsics(wcb->kalman_fusion, cur_mg, cur_ta)) {
+		memcpy(mg, cur_mg, sizeof(mg));
+		memcpy(ta, cur_ta, sizeof(ta));
+	}
+
 	FILE *wf = u_file_open_file_in_config_dir_subpath("wmr", fn, "w");
 	if (wf != NULL) {
-		fprintf(wf, "1 %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d\n", bg[0], bg[1], bg[2], ba[0], ba[1], ba[2],
-		        scale, ocount + 1);
+		fprintf(wf, "%d %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d", IMU_CAL_VERSION, bg[0], bg[1], bg[2], ba[0],
+		        ba[1], ba[2], scale, ocount + 1);
+		for (int i = 0; i < 9; i++) {
+			fprintf(wf, " %.9g", mg[i]);
+		}
+		for (int i = 0; i < 9; i++) {
+			fprintf(wf, " %.9g", ta[i]);
+		}
+		fprintf(wf, "\n");
 		fclose(wf);
 		WMR_INFO(wcb, "Saved IMU calibration (serial %s, accel scale %.4f)", serial, scale);
 	}
@@ -645,6 +702,30 @@ read_controller_config(struct wmr_controller_base *wcb)
 	return true;
 }
 
+/* Live HMD pose in the controller's world frame (OpenXR), at @p at_timestamp_ns. Returns NULL if no HMD is
+ * attached or its pose is unavailable, so the fusion degrades to world-frame holds (never a bad reference).
+ * XRT_INPUT_GENERIC_TRACKER_POSE is the raw head pose the constellation tracker uses as its camera base —
+ * the SAME world frame the controller poses live in — so controller-minus-HMD is a valid head-relative offset. */
+static const struct xrt_pose *
+wmr_controller_query_hmd_pose(struct wmr_controller_base *wcb, int64_t at_timestamp_ns, struct xrt_pose *out_pose)
+{
+	if (wcb->hmd_xdev == NULL) {
+		return NULL;
+	}
+	struct xrt_space_relation hmd_rel = {0};
+	if (xrt_device_get_tracked_pose(wcb->hmd_xdev, XRT_INPUT_GENERIC_TRACKER_POSE, at_timestamp_ns, &hmd_rel) !=
+	    XRT_SUCCESS) {
+		return NULL;
+	}
+	const enum xrt_space_relation_flags need =
+	    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
+	if ((hmd_rel.relation_flags & need) != need) {
+		return NULL; // head pose not yet valid (SLAM not converged): no reference
+	}
+	*out_pose = hmd_rel.pose;
+	return out_pose;
+}
+
 static xrt_result_t
 wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
                                      enum xrt_input_name name,
@@ -664,8 +745,12 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 		m_relation_chain_push_pose(&xrc, &wcb->P_aim_grip);
 	}
 
-	// Position + orientation both come from the tightly-coupled per-LED fusion (the UKF).
-	kalman_fusion_get_prediction(wcb->kalman_fusion, at_timestamp_ns, &relation);
+	// Position + orientation both come from the tightly-coupled per-LED fusion (the ESKF). Hand it the live
+	// HMD pose so an out-of-view controller body-locks (rides with the head at arm's reach) instead of
+	// dead-reckoning to metres in world frame.
+	struct xrt_pose hmd_pose;
+	const struct xrt_pose *hmd_world_pose = wmr_controller_query_hmd_pose(wcb, at_timestamp_ns, &hmd_pose);
+	kalman_fusion_get_prediction(wcb->kalman_fusion, at_timestamp_ns, &relation, hmd_world_pose);
 
 	m_relation_chain_push_relation(&xrc, &relation);
 	m_relation_chain_resolve(&xrc, out_relation);
@@ -825,7 +910,9 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	wmr_controller_send_bytes(wcb, wmr_controller_imu_on_cmd, sizeof(wmr_controller_imu_on_cmd));
 
 	wcb->timesync_counter = 2;
-	wcb->timesync_led_intensity = 200;
+	/* Start at full drive so acquisition sees the brightest possible LEDs; the brightness control
+	 * loop trims it down only if a close controller reads above LED_BRIGHT_TARGET_HI (bloom regime). */
+	wcb->timesync_led_intensity = 399;
 	wcb->timesync_val2 = 500;
 	wcb->timesync_time_offset = 0;
 
@@ -1212,6 +1299,16 @@ wmr_controller_base_get_pose_uncertainty(struct xrt_device *xdev, double *positi
 	return kalman_fusion_get_pose_uncertainty(wcb->kalman_fusion, position_std, orientation_std);
 }
 
+/* Observed LED peak-brightness band (0-255 image counts) the LED-drive control loop rides toward.
+ * Was 30-70 -- far too dim: detected LEDs peaked at a median of ~54, right on top of the blob
+ * retention threshold (24), so dim/angled/far LEDs fell below it and only ~5 of ~13 visible LEDs were
+ * matched -> degenerate few-point PnP -> mirror flips + fly-off. Drive the LEDs as bright as the
+ * detector can actually use instead: most LEDs then clear the threshold and the sub-pixel centroids
+ * stay crisp. Saturated cores are fine (blobwatch centroids them edge-symmetrically); the only regime
+ * this band backs off from is gross bloom/merge of adjacent LEDs at very close range. */
+#define LED_BRIGHT_TARGET_LO 160
+#define LED_BRIGHT_TARGET_HI 200
+
 static void
 wmr_controller_base_push_brightness_update(struct xrt_device *xdev, uint8_t average_brightness)
 {
@@ -1220,23 +1317,23 @@ wmr_controller_base_push_brightness_update(struct xrt_device *xdev, uint8_t aver
 
 	wcb->last_brightness_report = average_brightness;
 
-	if (average_brightness > 70) {
+	if (average_brightness > LED_BRIGHT_TARGET_HI) {
 		wcb->timesync_led_intensity -= MIN(wcb->timesync_led_intensity, 3);
 	}
 
-	if (average_brightness < 30) {
+	if (average_brightness < LED_BRIGHT_TARGET_LO) {
 		wcb->timesync_led_intensity = MIN(wcb->timesync_led_intensity + 10, 399);
 	}
 
 	os_mutex_unlock(&wcb->data_lock);
 }
 
-// Per-LED measurement noise + gate, in camera PIXELS (the obs are undistorted pixels under the view's
-// real intrinsics, so these are focal-independent). LED_PIXEL_VAR is the blob-centroid variance (the
-// benchmark's validated value); MAX_INNOV_PX rejects a mislabelled LED whose reprojection is farther
+// Per-LED gate, in camera PIXELS (the obs are undistorted pixels under the view's real intrinsics, so it
+// is focal-independent). The blob-centroid measurement noise R is owned by the filter (= LED_PIXEL_STD²);
+// we pass NULL variance so there is a SINGLE source of truth (passing a separate value here is what made
+// the live fold use std-as-variance). MAX_INNOV_PX rejects a mislabelled LED whose reprojection is farther
 // than this from the filter's predicted pose.
-#define ESKF_LED_PIXEL_VAR 1.5f // px^2
-#define ESKF_MAX_INNOV_PX 8.0f  // px
+#define ESKF_MAX_INNOV_PX 8.0f // px
 
 // Tightly-coupled per-LED optical feed (the ESKF). Translates the constellation's neutral per-view
 // payload into the fusion's structs and folds each LED. The blobs are undistorted to pixels and the
@@ -1275,15 +1372,20 @@ wmr_controller_base_push_observed_leds(struct xrt_device *xdev,
 		obs[i].led_obj = leds[i].led_obj;
 	}
 
-	struct xrt_vec2 led_var = {ESKF_LED_PIXEL_VAR, ESKF_LED_PIXEL_VAR};
+	// Live HMD pose at this frame's capture time: the body-lock reference + arm-reach gate origin. Queried
+	// at frame_mono_ns (the LED capture time, the same instant the constellation places the cameras).
+	struct xrt_pose hmd_pose;
+	const struct xrt_pose *hmd_world_pose = wmr_controller_query_hmd_pose(wcb, frame_mono_ns, &hmd_pose);
 
 	os_mutex_lock(&wcb->data_lock);
 	// Tightly-coupled per-LED fold (primary optical path); the gate skips a mislabelled LED whose
 	// reprojection is far from the filter's predicted pose. Returns LEDs folded (-1 if awaiting bootstrap).
+	// NULL variance => the filter's own LED_PIXEL_STD² (single source of truth for R).
 	// td: align the optical capture time onto the IMU clock before fusion (default 0).
 	float folded = kalman_fusion_process_led_observations(wcb->kalman_fusion,
 	                                                      frame_mono_ns + wcb->ctrl_optical_td_ns, obs, n,
-	                                                      &view, &led_var, ESKF_MAX_INNOV_PX, /*feed=*/true);
+	                                                      &view, NULL, ESKF_MAX_INNOV_PX, /*feed=*/true,
+	                                                      hmd_world_pose);
 	os_mutex_unlock(&wcb->data_lock);
 
 	// Per-frame fold health for log diagnosis: event 7 = LEDs folded (0 = all gated), event 8 = LEDs
@@ -1295,10 +1397,47 @@ wmr_controller_base_push_observed_leds(struct xrt_device *xdev,
 	}
 }
 
+// Per-LED ANISOTROPIC covariance gate: predict one LED's image point + 2x2 innovation covariance S =
+// H·P·Hᵀ + R from the filter's LIVE covariance (same projection/Jacobian as the fold). Used by the
+// front-end covariance-driven associator to gate a candidate blob<->LED pairing by its Mahalanobis
+// distance. Returns false until the filter is tracking (no usable prior) — the front-end then does NOT
+// gate-fold (cold-start guard). The payload mirrors wmr_controller_base_push_observed_leds exactly.
+static bool
+wmr_controller_base_predict_led_gate(struct xrt_device *xdev,
+                                     const struct xrt_pose *P_xrworld_cam,
+                                     const struct t_constellation_cam_calib *cam_calib,
+                                     const struct xrt_vec3 *led_obj,
+                                     float out_zhat[2],
+                                     float out_S[4])
+{
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
+	if (wcb->kalman_fusion == NULL || P_xrworld_cam == NULL || cam_calib == NULL || led_obj == NULL) {
+		return false;
+	}
+	struct kalman_led_camera_view view = {
+	    .fx = cam_calib->fx,
+	    .fy = cam_calib->fy,
+	    .cx = cam_calib->cx,
+	    .cy = cam_calib->cy,
+	    .cam_world_orient = P_xrworld_cam->orientation,
+	    .cam_world_pos = P_xrworld_cam->position,
+	};
+	struct kalman_led_observation obs = {.led_obj = *led_obj}; // observed_px unused by the gate predictor
+	os_mutex_lock(&wcb->data_lock);
+	bool ret = kalman_fusion_predict_led_gate(wcb->kalman_fusion, &obs, &view, out_zhat, out_S);
+	os_mutex_unlock(&wcb->data_lock);
+	return ret;
+}
+
 static void
 wmr_controller_base_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame_mono_ns, const struct xrt_pose *pose)
 {
 	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
+
+	// Live HMD pose at this optical frame: the arm-reach adoption gate's origin + the body-lock reference.
+	struct xrt_pose hmd_pose;
+	const struct xrt_pose *hmd_world_pose = wmr_controller_query_hmd_pose(wcb, frame_mono_ns, &hmd_pose);
+
 	os_mutex_lock(&wcb->data_lock);
 
 	/* Snapshot the PREVIOUS optical anchor before we overwrite it, so the fusion
@@ -1310,14 +1449,14 @@ wmr_controller_base_push_observed_pose(struct xrt_device *xdev, timepoint_ns fra
 	wcb->last_tracked_pose_ts = frame_mono_ns;
 	wcb->last_tracked_pose = *pose;
 
-	/* Fusion telemetry: capture the REPORTED (UKF) predicted pose before this optical
+	/* Fusion telemetry: capture the REPORTED (ESKF) predicted pose before this optical
 	 * observation is folded in, so each residual measures the actual output error:
 	 *   - pos_residual = optical vs kalman-predicted position (real SLAM<->IMU drift).
 	 *   - rot_residual = optical vs kalman-predicted orientation. */
 	// td: align the optical capture time onto the IMU clock for fusion + the residual (default 0).
 	const timepoint_ns fusion_ts = frame_mono_ns + wcb->ctrl_optical_td_ns;
 	struct xrt_space_relation predicted_rel = {0};
-	kalman_fusion_get_prediction(wcb->kalman_fusion, fusion_ts, &predicted_rel);
+	kalman_fusion_get_prediction(wcb->kalman_fusion, fusion_ts, &predicted_rel, hmd_world_pose);
 	struct xrt_vec3 predicted_pos = predicted_rel.pose.position;
 	struct xrt_quat predicted_rot = predicted_rel.pose.orientation;
 
@@ -1328,11 +1467,11 @@ wmr_controller_base_push_observed_pose(struct xrt_device *xdev, timepoint_ns fra
 	// to fix a large error — only a PnP re-solve can). This is the live divergence-recovery path.
 	// NULL variances => tuned defaults.
 	struct xrt_pose_sample sample = {.pose = *pose, .timestamp_ns = fusion_ts};
-	kalman_fusion_process_pose(wcb->kalman_fusion, &sample, NULL, NULL, 15);
+	kalman_fusion_process_pose(wcb->kalman_fusion, &sample, NULL, NULL, 15, hmd_world_pose);
 
-	/* Telemetry: optical observation vs the UKF-predicted state (what get_tracked_pose reports).
-	 *   - pos_residual_m  = |optical position - UKF-predicted position|
-	 *   - rot_residual_deg = angle between optical orientation and UKF-predicted orientation */
+	/* Telemetry: optical observation vs the ESKF-predicted state (what get_tracked_pose reports).
+	 *   - pos_residual_m  = |optical position - ESKF-predicted position|
+	 *   - rot_residual_deg = angle between optical orientation and ESKF-predicted orientation */
 	if (g2_telem_enabled()) {
 		struct xrt_vec3 pos_diff = {pose->position.x - predicted_pos.x, pose->position.y - predicted_pos.y,
 		                            pose->position.z - predicted_pos.z};
@@ -1350,11 +1489,10 @@ wmr_controller_base_push_observed_pose(struct xrt_device *xdev, timepoint_ns fra
 		float predicted_pose[7] = {predicted_pos.x, predicted_pos.y, predicted_pos.z, predicted_rot.x,
 		                           predicted_rot.y, predicted_rot.z, predicted_rot.w};
 
-		/* Mirror the kalman_fusion outcome at this call site so the documented
-		 * fusion outcomes have a producer (MAJOR-5). The gate constants and the
-		 * residual_limit (15) match t_tracker_kalman_fusion.cpp, which owns the
-		 * actual decision; this is a faithful read-only reproduction (that file
-		 * is not modified). uint8_t outcome: 0=rejected, 1=accepted, 2=reset. */
+		/* Mirror the kalman_fusion outcome at this call site so the fusion outcomes
+		 * have a telemetry producer. The gate constants and the residual_limit (15)
+		 * match t_tracker_kalman_fusion.cpp, which owns the actual decision; this is a
+		 * read-only reproduction. uint8_t outcome: 0=rejected, 1=accepted, 2=reset. */
 		uint8_t outcome = 1 /* accepted */;
 
 		/* Optical-jump gate: a candidate that moved further from the last optical
@@ -1404,11 +1542,15 @@ static struct t_constellation_tracked_device_callbacks tracking_callbacks = {
     .push_observed_leds = wmr_controller_base_push_observed_leds,
     .push_brightness_update = wmr_controller_base_push_brightness_update,
     .get_pose_uncertainty = wmr_controller_base_get_pose_uncertainty,
+    .predict_led_gate = wmr_controller_base_predict_led_gate,
 };
 
 void
 wmr_controller_attach_to_hmd(struct wmr_controller_base *wcb, struct wmr_hmd *hmd)
 {
+	/* Keep the HMD's base device: its live tracked pose is the body-lock reference (out-of-view controllers
+	 * ride with the head) and the arm-reach adoption gate's origin. */
+	wcb->hmd_xdev = &hmd->base;
 	/* Register the controller with the HMD for LED constellation tracking and LED sync timing updates */
 	wcb->tracking_connection = wmr_hmd_add_tracked_controller(hmd, &wcb->base, &tracking_callbacks);
 }

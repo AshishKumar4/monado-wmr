@@ -122,6 +122,12 @@ struct wmr_controller_base
 	//! Controller tracker connection that is doing 6dof tracking of this controller
 	struct t_constellation_tracked_device_connection *tracking_connection;
 
+	//! The HMD this controller is tracked relative to (its base xrt_device). Set at attach. Its live
+	//! tracked pose is the reference for body-locking the controller out of camera view (so an out-of-view
+	//! controller rides with the head at arm's reach) and for the room-roam-invariant arm-reach adoption
+	//! gate. NULL until attached (e.g. standalone tests) — the fusion then degrades to world-frame holds.
+	struct xrt_device *hmd_xdev;
+
 	//! Mutex protects shared data used from OpenXR callbacks
 	struct os_mutex data_lock;
 

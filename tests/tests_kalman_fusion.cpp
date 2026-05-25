@@ -36,6 +36,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/calib3d.hpp>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -134,7 +135,33 @@ feed_pose(KalmanFusionInterface *kf,
 	s.timestamp_ns = ts;
 	s.pose.position = pos;
 	s.pose.orientation = orient;
-	kf->process_pose(&s, nullptr, nullptr, residual_limit);
+	kf->process_pose(&s, nullptr, nullptr, residual_limit, nullptr);
+}
+
+//! Build an xrt_pose from a world position (identity orientation).
+xrt_pose
+pose_at(const xrt_vec3 &pos, const xrt_quat &orient = {0.0f, 0.0f, 0.0f, 1.0f})
+{
+	xrt_pose p{};
+	p.position = pos;
+	p.orientation = orient;
+	return p;
+}
+
+//! Feed an optical pose with a live HMD world pose (body-lock reference), so the filter captures the
+//! controller-to-HMD offset that out-of-view body-lock then rides.
+void
+feed_pose_hmd(KalmanFusionInterface *kf,
+              int64_t ts,
+              const xrt_vec3 &pos,
+              const xrt_quat &orient,
+              const xrt_pose &hmd)
+{
+	xrt_pose_sample s{};
+	s.timestamp_ns = ts;
+	s.pose.position = pos;
+	s.pose.orientation = orient;
+	kf->process_pose(&s, nullptr, nullptr, 15.0f, &hmd);
 }
 
 //! Feed a pose + a matching IMU sample for a device at orientation @p q,
@@ -166,7 +193,7 @@ TEST_CASE("kalman: prediction before any data is a safe identity")
 	REQUIRE(kf != nullptr);
 
 	xrt_space_relation rel{};
-	kf->get_prediction(1000000, &rel);
+	kf->get_prediction(1000000, &rel, nullptr);
 
 	CHECK(rel.pose.position.x == Approx(0.0).margin(1e-6));
 	CHECK(rel.pose.position.y == Approx(0.0).margin(1e-6));
@@ -206,7 +233,7 @@ TEST_CASE("kalman: stationary device stays put")
 	}
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 
 	CHECK(rel.pose.position.x == Approx(start_pos.x).margin(0.05));
 	CHECK(rel.pose.position.y == Approx(start_pos.y).margin(0.05));
@@ -237,7 +264,7 @@ TEST_CASE("kalman: stationary tilted device does not drift on gravity")
 	}
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 
 	// 2 s tilted at rest: position must stay within a few cm of the origin.
 	CHECK(std::abs(rel.pose.position.x) < 0.08);
@@ -267,7 +294,7 @@ TEST_CASE("kalman: tracks a tilted orientation with a consistent accelerometer")
 	}
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 
 	CHECK(quat_abs_dot(rel.pose.orientation, tilt) > 0.99f); // converged to tilt
 	CHECK(std::abs(rel.pose.orientation.w) < 0.999f);        // off identity
@@ -294,7 +321,7 @@ TEST_CASE("kalman: tracks a rotating optical orientation")
 	}
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 
 	xrt_quat expected = quat_axis_angle({0.0f, 1.0f, 0.0f}, (float)yaw);
 	CHECK(quat_abs_dot(rel.pose.orientation, expected) > 0.99f);
@@ -324,7 +351,7 @@ TEST_CASE("kalman: gyro integration advances orientation during optical dropout"
 	}
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 
 	double expected_yaw = yaw_rate * steps * DT_S; // 0.5 rad
 	xrt_quat expected = quat_axis_angle({0.0f, 1.0f, 0.0f}, (float)expected_yaw);
@@ -358,7 +385,7 @@ TEST_CASE("kalman: tracks constant-velocity motion and estimates velocity")
 	}
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 
 	CHECK(rel.pose.position.x == Approx(x).margin(0.05));
 	CHECK(rel.linear_velocity.x == Approx(vx).margin(0.25));
@@ -396,7 +423,7 @@ TEST_CASE("kalman: dead-reckons constant acceleration through optical dropout")
 	double expected_x = 0.5 * 2.0 * T * T;
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 
 	CHECK(rel.pose.position.x > expected_x * 0.5);
 	CHECK(rel.pose.position.x < expected_x * 1.5);
@@ -436,7 +463,7 @@ TEST_CASE("kalman: dead-reckons body-frame acceleration while tilted")
 	double expected_x = 0.5 * 3.0 * T * T;
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 
 	// Motion must be predominantly along world +X, not leaked into Y/Z.
 	CHECK(rel.pose.position.x > expected_x * 0.5);
@@ -468,7 +495,7 @@ TEST_CASE("kalman: rejects a wildly inconsistent optical pose")
 	t += DT_NS;
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 
 	CHECK(std::abs(rel.pose.position.x) < 10.0);
 	CHECK(std::abs(rel.pose.position.y) < 10.0);
@@ -505,7 +532,7 @@ TEST_CASE("kalman: recovers tracking after a bad pose forces a reset")
 	}
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 
 	CHECK(rel.pose.position.x == Approx(home.x).margin(0.1));
 	CHECK(rel.pose.position.y == Approx(home.y).margin(0.1));
@@ -536,7 +563,7 @@ TEST_CASE("kalman: smooths noisy optical poses")
 
 		if (i > 200) { // after convergence
 			xrt_space_relation rel{};
-			kf->get_prediction(t, &rel);
+			kf->get_prediction(t, &rel, nullptr);
 			max_abs_out = std::max({max_abs_out, (double)std::abs(rel.pose.position.x),
 			                        (double)std::abs(rel.pose.position.y),
 			                        (double)std::abs(rel.pose.position.z)});
@@ -571,7 +598,7 @@ TEST_CASE("kalman: a single glitch IMU sample does not reset or blow up the filt
 	}
 
 	xrt_space_relation before{};
-	kf->get_prediction(t, &before);
+	kf->get_prediction(t, &before, nullptr);
 	REQUIRE((before.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0);
 
 	// One catastrophic gyro glitch: ~115000 deg/s on every axis. The old
@@ -583,7 +610,7 @@ TEST_CASE("kalman: a single glitch IMU sample does not reset or blow up the filt
 
 	// Right after the glitch: still tracked, still at home, still finite.
 	xrt_space_relation after_glitch{};
-	kf->get_prediction(t, &after_glitch);
+	kf->get_prediction(t, &after_glitch, nullptr);
 	REQUIRE(std::isfinite(after_glitch.pose.position.x));
 	REQUIRE(std::isfinite(after_glitch.pose.orientation.w));
 	// The lone glitch must not have forced a reset (tracked bit retained).
@@ -601,7 +628,7 @@ TEST_CASE("kalman: a single glitch IMU sample does not reset or blow up the filt
 		t += DT_NS;
 	}
 	xrt_space_relation after{};
-	kf->get_prediction(t, &after);
+	kf->get_prediction(t, &after, nullptr);
 	CHECK(after.pose.position.x == Approx(home.x).margin(0.05));
 	CHECK(after.pose.position.y == Approx(home.y).margin(0.05));
 	CHECK(after.pose.position.z == Approx(home.z).margin(0.05));
@@ -637,7 +664,7 @@ TEST_CASE("kalman: rejects a divergent optical pose that jumps implausibly far")
 	t += DT_NS;
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 	// Filter must have ignored the divergent pose and stayed at home.
 	CHECK(rel.pose.position.x == Approx(home.x).margin(0.1));
 	CHECK(rel.pose.position.y == Approx(home.y).margin(0.1));
@@ -652,7 +679,7 @@ TEST_CASE("kalman: rejects a divergent optical pose that jumps implausibly far")
 		t += DT_NS;
 	}
 	xrt_space_relation after{};
-	kf->get_prediction(t, &after);
+	kf->get_prediction(t, &after, nullptr);
 	CHECK(after.pose.position.x == Approx(home.x).margin(0.05));
 	CHECK(after.pose.position.y == Approx(home.y).margin(0.05));
 	CHECK(after.pose.position.z == Approx(home.z).margin(0.05));
@@ -676,7 +703,7 @@ TEST_CASE("kalman: a sustained run of anomalous IMU samples still resets")
 	}
 
 	xrt_space_relation before{};
-	kf->get_prediction(t, &before);
+	kf->get_prediction(t, &before, nullptr);
 	REQUIRE((before.relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT) != 0);
 
 	// Many consecutive impossible gyro samples — a real fault.
@@ -689,7 +716,7 @@ TEST_CASE("kalman: a sustained run of anomalous IMU samples still resets")
 	// The sustained anomaly must have forced a reset: the filter no longer
 	// reports tracked, and output stays finite (never garbage).
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 	REQUIRE(std::isfinite(rel.pose.position.x));
 	REQUIRE(std::isfinite(rel.pose.orientation.w));
 	CHECK((rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0);
@@ -720,7 +747,7 @@ TEST_CASE("kalman: stays finite under extended mixed operation")
 
 		if (i % 50 == 0) {
 			xrt_space_relation rel{};
-			kf->get_prediction(t, &rel);
+			kf->get_prediction(t, &rel, nullptr);
 			REQUIRE(std::isfinite(rel.pose.position.x));
 			REQUIRE(std::isfinite(rel.pose.position.y));
 			REQUIRE(std::isfinite(rel.pose.position.z));
@@ -730,7 +757,7 @@ TEST_CASE("kalman: stays finite under extended mixed operation")
 	}
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 	// After a bounded sinusoid the position must remain bounded.
 	CHECK(std::abs(rel.pose.position.x) < 2.0);
 	CHECK(std::abs(rel.pose.position.y) < 2.0);
@@ -759,7 +786,7 @@ TEST_CASE("kalman: velocity estimate converges quickly")
 	}
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 	CHECK(rel.linear_velocity.x == Approx(vx).margin(0.2));
 	CHECK(rel.pose.position.x == Approx(x).margin(0.05));
 }
@@ -788,7 +815,7 @@ TEST_CASE("kalman: tracks an abrupt velocity reversal")
 	}
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 	CHECK(x_peak > 0.5);                                       // sanity
 	CHECK(rel.pose.position.x == Approx(x).margin(0.06));      // followed back
 	CHECK(rel.linear_velocity.x < -0.5f);                      // velocity reversed
@@ -821,7 +848,7 @@ TEST_CASE("kalman: re-converges after an optical dropout")
 	}
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 	CHECK(rel.pose.position.x == Approx(home.x).margin(0.05));
 	CHECK(rel.pose.position.y == Approx(home.y).margin(0.05));
 	CHECK(rel.pose.position.z == Approx(home.z).margin(0.05));
@@ -852,7 +879,7 @@ TEST_CASE("kalman: applies an optical pose that lags the filter clock")
 	}
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 	// The lagged poses were applied: position tracked to the shifted point.
 	CHECK(rel.pose.position.x == Approx(shifted.x).margin(0.08));
 }
@@ -873,13 +900,13 @@ TEST_CASE("kalman: clear_position_tracked_flag clears the tracked bit")
 	}
 
 	xrt_space_relation before{};
-	kf->get_prediction(t, &before);
+	kf->get_prediction(t, &before, nullptr);
 	REQUIRE((before.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0);
 
 	kf->clear_position_tracked_flag();
 
 	xrt_space_relation after{};
-	kf->get_prediction(t, &after);
+	kf->get_prediction(t, &after, nullptr);
 	CHECK((after.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0);
 }
 
@@ -904,7 +931,7 @@ TEST_CASE("kalman: an extended optical dropout stays finite and bounded")
 	}
 
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 	REQUIRE(std::isfinite(rel.pose.position.x));
 	REQUIRE(std::isfinite(rel.pose.position.y));
 	REQUIRE(std::isfinite(rel.pose.position.z));
@@ -940,13 +967,151 @@ TEST_CASE("kalman: re-acquisition after a long dropout never spikes")
 		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
 		t += DT_NS;
 		xrt_space_relation rel{};
-		kf->get_prediction(t, &rel);
+		kf->get_prediction(t, &rel, nullptr);
 		REQUIRE(std::isfinite(rel.pose.position.x));
 		const xrt_vec3 d = {rel.pose.position.x - home.x, rel.pose.position.y - home.y,
 		                    rel.pose.position.z - home.z};
 		max_dev = std::max(max_dev, std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z));
 	}
 	CHECK(max_dev < 1.0f); // a stationary controller cannot be flung a metre on re-lock
+}
+
+TEST_CASE("kalman: out-of-view controller body-locks to the moving HMD (no world fly-away, no world freeze)")
+{
+	// The #1 felt bug: a controller leaving camera view dead-reckons in WORLD frame to metres. The fix
+	// body-locks it — out of view it rides the LIVE HMD pose at its last controller-to-HMD offset. This
+	// test establishes a position-observable lock at a known head-relative offset, then runs a long
+	// no-optical stretch WHILE the (fake) HMD translates several metres AND rotates, feeding the live HMD
+	// pose to each prediction. The reported controller must (a) stay within arm's reach of the head (never
+	// fly to metres in world frame) and (b) RIDE with the head (its world position must follow the head,
+	// NOT stay frozen at the old world point as the head walks away).
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+
+	int64_t t = 1000000;
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	const xrt_pose hmd0 = pose_at(ZERO_VEC); // head at world origin while observed
+	const xrt_vec3 ctrl_pos = {0.3f, -0.2f, -0.5f}; // ~0.62 m from the head: a real arm's-reach pose
+	for (int i = 0; i < 200; i++) { // establish a position-observable lock + capture the body-lock offset
+		feed_pose_hmd(kf.get(), t, ctrl_pos, IDENTITY_QUAT, hmd0);
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+	// The captured offset (controller-minus-head while observed).
+	const xrt_vec3 offset = {ctrl_pos.x - hmd0.position.x, ctrl_pos.y - hmd0.position.y,
+	                         ctrl_pos.z - hmd0.position.z};
+	const double offset_norm = std::sqrt(offset.x * offset.x + offset.y * offset.y + offset.z * offset.z);
+
+	// 3 s no-optical, IMU rest only — the controller is out of camera view. The head meanwhile walks +X and
+	// yaws (a user turning while roaming). Each prediction sees the LIVE head pose.
+	float max_dist_to_hmd = 0.0f; // controller-to-head distance (post body-lock), must stay ~arm reach
+	float max_ride_err = 0.0f;    // |reported - (live_head + captured_offset)| (post body-lock), must be tiny
+	float max_world_pos = 0.0f;   // worst |reported world pos|, must never fly to metres in world frame
+	// Body-lock engages only once optical is STALE (past OPTICAL_FREEZE_NS, 0.5 s = 250 samples @ 2 ms); the
+	// first window is legitimate dead-reckoning (the controller may still be moving in-hand). Assert the
+	// strict ride properties past i=400 (comfortably stale), and the no-fly-away bound over the whole run.
+	for (int i = 0; i < 1500; i++) {
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+		const float head_x = 3.0f * (i / 1500.0f); // head walks 0 -> +3 m over the stretch
+		const xrt_quat head_q = quat_axis_angle({0.f, 1.f, 0.f}, 0.6f * (i / 1500.0f)); // + yaw
+		const xrt_pose hmd = pose_at({head_x, 0.f, 0.f}, head_q);
+
+		xrt_space_relation rel{};
+		kf->get_prediction(t, &rel, &hmd);
+		REQUIRE(std::isfinite(rel.pose.position.x));
+
+		const xrt_vec3 p = rel.pose.position;
+		max_world_pos =
+		    std::max(max_world_pos, std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z)); // fly-away probe
+
+		if (i < 400) {
+			continue; // pre-freeze: still dead-reckoning, body-lock not yet engaged
+		}
+		const float d_hmd = std::sqrt((p.x - hmd.position.x) * (p.x - hmd.position.x) +
+		                              (p.y - hmd.position.y) * (p.y - hmd.position.y) +
+		                              (p.z - hmd.position.z) * (p.z - hmd.position.z));
+		max_dist_to_hmd = std::max(max_dist_to_hmd, d_hmd);
+
+		const xrt_vec3 ride = {hmd.position.x + offset.x, hmd.position.y + offset.y, hmd.position.z + offset.z};
+		max_ride_err = std::max(max_ride_err, std::sqrt((p.x - ride.x) * (p.x - ride.x) +
+		                                                (p.y - ride.y) * (p.y - ride.y) +
+		                                                (p.z - ride.z) * (p.z - ride.z)));
+	}
+
+	// (a) stays at arm's reach of the head — NOT flung to metres in world frame.
+	CHECK(max_dist_to_hmd < (float)offset_norm + 0.05f);
+	// (b) rides rigidly with the head (the head-relative offset is preserved through the body-locked stretch).
+	CHECK(max_ride_err < 0.02f);
+	// (c) the reported world position followed the head's 3 m walk (would be ~0.6 m if frozen at the start, or
+	// metres if it flew away). At the end (head at +3 m, fully stale) the controller rides to ~head + offset.
+	xrt_space_relation last{};
+	const xrt_pose hmd_end = pose_at({3.0f, 0.f, 0.f}, quat_axis_angle({0.f, 1.f, 0.f}, 0.6f));
+	kf->get_prediction(t, &last, &hmd_end);
+	CHECK(last.pose.position.x == Approx(hmd_end.position.x + offset.x).margin(0.05)); // rode, did NOT freeze
+	CHECK(max_world_pos < 3.6f);                                                       // never flew past head+reach
+	CHECK((last.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0);       // a trusted estimate
+}
+
+TEST_CASE("kalman: an abandoned (set-down) controller drops to UNTRACKED after a sustained body-lock hold")
+{
+	// The body-lock hold rides BRIEF occlusion (a controller out of view at arm's reach during fast play
+	// MUST keep tracking — fix, don't reject). But a genuinely set-down controller, out of view for a long
+	// time, must be reported LOST rather than dragged at the head forever (the graceful-degrade endpoint).
+	// This drives the WMR reporting path (get_prediction with a live HMD pose, the only seam where it can be
+	// detected — unlike PSMV there is no per-frame "lost the object" callback). Proves: (1) a short burst of
+	// out-of-view at arm's reach stays TRACKED (rides the hold), (2) a sustained loss drops to UNTRACKED, and
+	// (3) re-acquiring optical restores TRACKED.
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+
+	int64_t t = 1000000;
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	const xrt_pose hmd = pose_at(ZERO_VEC);                    // head fixed at the origin throughout
+	const xrt_vec3 ctrl_pos = {0.3f, -0.2f, -0.5f};           // ~0.62 m: a real arm's-reach pose, in reach
+	for (int i = 0; i < 200; i++) { // establish a position-observable lock + capture the body-lock offset
+		feed_pose_hmd(kf.get(), t, ctrl_pos, IDENTITY_QUAT, hmd);
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+
+	auto predict_now = [&](int64_t now) {
+		xrt_space_relation rel{};
+		kf->get_prediction(now, &rel, &hmd);
+		return rel;
+	};
+	auto is_tracked = [](const xrt_space_relation &rel) {
+		return (rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
+	};
+
+	// (1) A short out-of-view burst (~3 s = the routine fast-play occlusion ceiling): IMU-rest only, no
+	// optical. The controller is at arm's reach in view of the head — the hold rides it, still TRACKED.
+	for (int i = 0; i < 1500; i++) { // 3.0 s, optical dropped
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+	const xrt_space_relation held = predict_now(t);
+	REQUIRE(std::isfinite(held.pose.position.x));
+	CHECK(is_tracked(held)); // brief burst -> ride the hold, stay tracked
+
+	// (2) Sustained loss: keep dropping optical well past the abandon horizon (2x the 3 s routine ceiling =
+	// 6 s). The controller is now genuinely set down — it must report UNTRACKED, not be dragged at the head.
+	for (int i = 0; i < 2500; i++) { // another 5 s (total ~8 s of no optical, > 6 s abandon horizon)
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+	const xrt_space_relation abandoned = predict_now(t);
+	REQUIRE(std::isfinite(abandoned.pose.position.x)); // still a finite, head-rideable report...
+	CHECK_FALSE(is_tracked(abandoned));                // ...but no longer a trusted (tracked) pose
+
+	// (3) Re-acquire: optical comes back (controller picked up). Tracking must recover.
+	for (int i = 0; i < 50; i++) {
+		feed_pose_hmd(kf.get(), t, ctrl_pos, IDENTITY_QUAT, hmd);
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+	const xrt_space_relation reacquired = predict_now(t);
+	CHECK(is_tracked(reacquired)); // re-acquire after a drop restores tracking
 }
 
 TEST_CASE("kalman: a lagged optical consistent with the trajectory leaves the pose intact (OOSM)")
@@ -980,7 +1145,7 @@ TEST_CASE("kalman: a lagged optical consistent with the trajectory leaves the po
 	feed_pose(kf.get(), t_capture, p_capture, IDENTITY_QUAT);
 
 	xrt_space_relation after{};
-	kf->get_prediction(t, &after);
+	kf->get_prediction(t, &after, nullptr);
 	CHECK(after.pose.position.x == Approx(true_x(t)).margin(0.03)); // not pulled back by ~v*lag (0.1 m)
 }
 
@@ -1011,7 +1176,7 @@ TEST_CASE("kalman: replay of recorded controller IMU + optical stays sane (real 
 			const ReplayPose &s = kReplayPose[p++];
 			feed_pose(kf.get(), base + s.t_ns, {s.px, s.py, s.pz}, {s.qx, s.qy, s.qz, s.qw}); // stamped at capture
 			xrt_space_relation rel{};
-			kf->get_prediction(base + s.t_ns + LAG, &rel); // predict at "now" (the feed instant)
+			kf->get_prediction(base + s.t_ns + LAG, &rel, nullptr); // predict at "now" (the feed instant)
 			REQUIRE(std::isfinite(rel.pose.position.x));
 			REQUIRE(std::isfinite(rel.pose.position.y));
 			REQUIRE(std::isfinite(rel.pose.position.z));
@@ -1162,7 +1327,7 @@ TEST_CASE("kalman: concurrent readers never observe a torn filter state")
 		readers.emplace_back([&] {
 			while (run.load(std::memory_order_relaxed)) {
 				xrt_space_relation rel{};
-				kf->get_prediction(clock_ns.load(std::memory_order_relaxed), &rel);
+				kf->get_prediction(clock_ns.load(std::memory_order_relaxed), &rel, nullptr);
 				reads.fetch_add(1, std::memory_order_relaxed);
 
 				const xrt_vec3 &p = rel.pose.position;
@@ -1395,7 +1560,7 @@ world_to_cam(const Cam &c, V3 pw)
 }
 //! INDEPENDENT pinhole projection used to GENERATE pixels. Deliberately a
 //! standalone implementation so it cannot accidentally match a bug in
-//! LEDReprojectionMeasurement::predictMeasurement.
+//! led_project_jacobian (the filter's per-LED reprojection model).
 static bool
 project_px(const Cam &c, V3 p_cam, double &u, double &v)
 {
@@ -1877,7 +2042,7 @@ TEST_CASE("kalman: A/B per-LED ESKF vs PnP-pose path (HONEST benchmark)")
 				total_leds_B += (long)obsB.size();
 				folded_this_frame += (long)obsB.size();
 				kfB->process_led_observations(ts, obsB, view[v], nullptr,
-				                              /*max_innov_px=*/8.0f, /*feed=*/true);
+				                              /*max_innov_px=*/8.0f, /*feed=*/true, nullptr);
 			}
 			(void)folded_this_frame;
 
@@ -1906,8 +2071,8 @@ TEST_CASE("kalman: A/B per-LED ESKF vs PnP-pose path (HONEST benchmark)")
 
 			// ---- Sample both filters at this timestamp, score vs GT ----
 			xrt_space_relation relA{}, relB{};
-			kfA->get_prediction(ts, &relA);
-			kfB->get_prediction(ts, &relB);
+			kfA->get_prediction(ts, &relA, nullptr);
+			kfB->get_prediction(ts, &relB, nullptr);
 
 			V3 gp = g.p;
 			Q gq = g.q;
@@ -2016,13 +2181,12 @@ TEST_CASE("kalman: A/B per-LED ESKF vs PnP-pose path (HONEST benchmark)")
 }
 
 // ===========================================================================
-// MAXIMAL ESKF REGRESSION SUITE
-// Targets the death-spiral failure class the old UKF+per-LED hit live (capture
-// 20260522-222525): a drifted state gated out every matched LED (fixed 8 px
-// gate) -> 0 folds -> IMU velocity runaway -> reset to origin -> repeat, with
-// the predicted controller flying to tens of metres. These drive the public
-// KalmanFusionInterface with per-LED frames synthesized from the same geometry
-// as the A/B benchmark, and assert the bug CANNOT happen.
+// ESKF REGRESSION SUITE
+// Guards the divergence failure class where a drifted state gates out every
+// matched LED -> 0 folds -> IMU velocity runaway -> reset to origin -> repeat,
+// with the predicted controller flying to tens of metres. These drive the public
+// KalmanFusionInterface with synthesized per-LED frames and assert the filter
+// recovers (covariance-aware gating + re-anchor) instead of diverging.
 // ===========================================================================
 namespace {
 
@@ -2057,7 +2221,7 @@ eskf_feed_leds(KalmanFusionInterface *kf, int64_t ts, const GTPose &gt, const Le
 			obs.push_back(o);
 		}
 		if (!obs.empty()) {
-			kf->process_led_observations(ts, obs, view[v], nullptr, 8.0f, true);
+			kf->process_led_observations(ts, obs, view[v], nullptr, 8.0f, true, nullptr);
 			fed += (int)obs.size();
 		}
 	}
@@ -2080,7 +2244,7 @@ static double
 eskf_pos_err(KalmanFusionInterface *kf, int64_t ts, double t)
 {
 	xrt_space_relation rel{};
-	kf->get_prediction(ts, &rel);
+	kf->get_prediction(ts, &rel, nullptr);
 	GTPose g = gt_pose(t);
 	V3 e{rel.pose.position.x - g.p.x, rel.pose.position.y - g.p.y, rel.pose.position.z - g.p.z};
 	return std::sqrt(dot(e, e));
@@ -2192,6 +2356,138 @@ TEST_CASE("kalman: ESKF stays bounded over a long intermittent-optical run (2225
 	CHECK((double)lost / frames < 0.05); // re-locks; not stuck diverged
 }
 
+TEST_CASE("kalman: divergence re-anchor does not adopt a flip-polluted m_pnp_pose (re-anchor hygiene)")
+{
+	// Pins the re-anchor-hygiene gate in process_pose (m_pnp_pose is set only when !pnp_flipped). The
+	// divergence re-anchor (process_led_observations: seen>=REANCHOR_NMIN but folded<REANCHOR_FRAC) snaps
+	// m_x onto m_pnp_pose. m_pnp_pose must therefore never carry a mirror flip. We drive the filter into a
+	// real orientation divergence (a fast gyro spin away from the locked pose with optical dropped) so the
+	// per-LED fold can't recover and the divergence re-anchor is the ONLY way back; while the filter was
+	// still locked at the true orientation we fed a ~180-deg-flipped PnP pose. With the gate that flip is
+	// rejected as the re-anchor source (m_pnp_pose stays the last good solve); without it m_pnp_pose becomes
+	// the flip and the re-anchor SNAPS the reported orientation onto the mirror. So this FAILS (snaps to the
+	// flip) if the gate is removed and m_pnp_pose is written unconditionally. (The filter-side flip_guard
+	// does not save this case: by re-anchor time the diverged gyro orientation is itself >FLIP_REJECT_RAD
+	// from the true pose, so flip_guard no longer cleanly rejects the stored flip.)
+	const LedModel led = make_led_model();
+	const Cam cam[2] = {make_cam(-0.06), make_cam(+0.06)};
+	const LEDCameraView view[2] = {make_view(cam[0]), make_view(cam[1])};
+	const double imu_dt = 1.0 / 200.0;
+	const int64_t imu_dt_ns = (int64_t)(imu_dt * 1e9);
+
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+	std::mt19937 rng(0xF11D);
+	int64_t ts = 1000000;
+	double t = 0.0;
+
+	// (1) Lock on at a fixed NON-identity YAW orientation at rest (gyro = 0 -> the gyro flip reference is
+	// this pose). Stereo per-LED folds + a consistent at-rest accel give a confident, tracked filter. Yaw is
+	// about world-up, so the later yaw spin keeps the body-frame gravity direction constant -> the
+	// gravity-tilt anchor does NOT fight the divergence (it cannot observe yaw), letting the gyro state
+	// diverge cleanly past FLIP_REJECT_RAD. (A tilt orientation would be dragged back by the gravity anchor.)
+	const Q q0 = q_axis(V3{0, 1, 0}, 0.52); // ~30 deg yaw, non-identity
+	const GTPose g_true{V3{0.10, 0.0, 1.45}, q0};
+	const xrt_vec3 a_rest = make_accel_body(to_xrt_quat(q0), ZERO_VEC);
+	double next_opt = 0.0;
+	for (; t < 1.5;) {
+		feed_imu(kf.get(), ts, a_rest, ZERO_VEC);
+		t += imu_dt;
+		ts += imu_dt_ns;
+		if (t >= next_opt) {
+			next_opt += 1.0 / 60.0;
+			// Both a PnP pose (pins orientation tightly) AND the per-LED list, exactly as the live
+			// constellation emits each frame -- so the per-LED divergence re-anchor path is the one exercised.
+			feed_pose(kf.get(), ts, to_xrt_vec3(g_true.p), to_xrt_quat(q0));
+			eskf_feed_leds(kf.get(), ts, g_true, led, cam, view, rng, 1.0, 0);
+		}
+	}
+	xrt_space_relation rel{};
+	kf->get_prediction(ts, &rel, nullptr);
+	REQUIRE(quat_abs_dot(rel.pose.orientation, to_xrt_quat(q0)) > 0.99f); // truly locked at q0
+
+	// The mirror twin: q0 rotated ~180 deg about world up. A few-LED PnP returns this on a flip; the
+	// flipped constellation (q_flip LEDs) is what the front-end then feeds when it has flipped.
+	const Q q_flip = q_norm(q_mul(q_axis(V3{0, 1, 0}, M_PI), q0));
+
+	// (2) GATE DECISION POINT. While still locked at q0 (gyro fresh, m_x.q == q0), feed the flipped PnP
+	// pose. integrate_pose_measurement's own flip-veto keeps the LIVE orientation at q0 (position-only),
+	// but process_pose would ALSO record this as m_pnp_pose -- the re-anchor source. The hygiene gate must
+	// refuse it: it disagrees with the fresh gyro (== q0 here) by ~180 deg. So with the gate, m_pnp_pose
+	// stays the last GOOD solve; without it m_pnp_pose becomes the flip. Same position -> not jump- or
+	// divergence-re-anchored here; only the m_pnp_pose record is at stake. (The pose feed also refreshes
+	// last_optical_ns, keeping the gyro a valid reference for flip_guard at the re-anchor below.)
+	feed_pose(kf.get(), ts, to_xrt_vec3(g_true.p), to_xrt_quat(q_flip));
+	feed_imu(kf.get(), ts, a_rest, ZERO_VEC);
+	ts += imu_dt_ns;
+	t += imu_dt;
+	kf->get_prediction(ts, &rel, nullptr);
+	REQUIRE(quat_abs_dot(rel.pose.orientation, to_xrt_quat(q0)) > 0.9f); // live orientation did NOT flip
+
+	// (3) DIVERGE the gyro orientation INSIDE the re-anchor freshness window: a hard flick about world up
+	// rotates the filter state PAST FLIP_REJECT_RAD from q0 and to WITHIN FLIP_REJECT_RAD of the mirror, in
+	// under REANCHOR_MAX_AGE_NS so m_pnp_pose (stored in step 2) is still fresh. The diverged gyro is now too
+	// close to the mirror for flip_guard to reject the stored flip -- so the m_pnp_pose RECORD is what
+	// decides the re-anchor, which is exactly what the m_pnp_pose hygiene gate must refuse.
+	const double spin_rate = 32.0; // rad/s (~1830 deg/s) -- a hard flick (cf. the flip-guard test's ~1490
+	                               // deg/s); finishes well inside the 100 ms re-anchor freshness window so
+	                               // m_pnp_pose (step 2) is still fresh, while clearing FLIP_REJECT_RAD.
+	const double spin_target = 1.80; // rad: lands ~110-118 deg from q0 (>75) and ~62-70 deg from the flip (<75)
+	double spun = 0.0;
+	while (spun < spin_target) {
+		feed_imu(kf.get(), ts, a_rest, xrt_vec3{0.0f, (float)spin_rate, 0.0f});
+		spun += spin_rate * imu_dt;
+		t += imu_dt;
+		ts += imu_dt_ns;
+	}
+	kf->get_prediction(ts, &rel, nullptr);
+	const double from_q0 = 2.0 * std::acos(std::min(1.0f, quat_abs_dot(rel.pose.orientation, to_xrt_quat(q0))));
+	const double from_flip =
+	    2.0 * std::acos(std::min(1.0f, quat_abs_dot(rel.pose.orientation, to_xrt_quat(q_flip))));
+	INFO("diverged gyro: " << from_q0 * 180.0 / M_PI << " deg from q0, " << from_flip * 180.0 / M_PI
+	                        << " deg from flip");
+	REQUIRE(from_q0 > 75.0 * M_PI / 180.0);   // past the flip-reject angle from the original lock
+	REQUIRE(from_flip < 75.0 * M_PI / 180.0); // and WITHIN the flip-reject angle of the mirror -> flip_guard fooled
+
+	// (4) DRIVE the divergence re-anchor. Feed a constellation whose observed pixels are grossly displaced
+	// (a confused front-end / wrong labels) so every LED fails the per-LED pixel gate: seen>=REANCHOR_NMIN
+	// but folded==0 -> the divergence re-anchor fires (the only route back) and snaps m_x onto
+	// flip_guard(m_pnp_pose). A failing fold does NOT advance last_optical_ns, so the gyro stays fresh as the
+	// flip_guard reference (and m_pnp_ns stays fresh from step 2). This is the one frame that decides it.
+	std::vector<LEDObservation> garbage[2];
+	for (int v = 0; v < 2; v++) {
+		for (size_t k = 0; k < led.pos.size(); k++) {
+			V3 pw = g_true.p + q_rot(q0, led.pos[k]);
+			V3 nw = q_rot(q0, led.normal[k]);
+			double u, vy;
+			if (dot(nw, pw - cam[v].C) >= 0 || !project_px(cam[v], world_to_cam(cam[v], pw), u, vy)) {
+				continue; // back-facing or out of FOV
+			}
+			LEDObservation g;
+			g.led_obj = to_xrt_vec3(led.pos[k]);
+			g.observed_px = xrt_vec2{(float)(u + 120.0), (float)(vy - 90.0)}; // >> 8 px gate: seen, never folded
+			garbage[v].push_back(g);
+		}
+	}
+	feed_imu(kf.get(), ts, a_rest, ZERO_VEC);
+	t += imu_dt;
+	ts += imu_dt_ns;
+	for (int v = 0; v < 2; v++) {
+		if (!garbage[v].empty()) {
+			kf->process_led_observations(ts, garbage[v], view[v], nullptr, 8.0f, true, nullptr);
+		}
+	}
+
+	// (5) ASSERT: with the gate, m_pnp_pose is the last GOOD (q0) solve so the re-anchor restores toward it
+	// and the reported orientation stays clearly OFF the mirror. Reverting the gate to the unconditional
+	// write makes m_pnp_pose the flip; flip_guard (fooled by the diverged gyro) lets it through and the
+	// re-anchor SNAPS fully onto the mirror -> dot_flip ~= 1 -> this CHECK fails (teeth verified).
+	kf->get_prediction(ts, &rel, nullptr);
+	const float dot_flip = quat_abs_dot(rel.pose.orientation, to_xrt_quat(q_flip));
+	INFO("after divergence re-anchor: dot_flip=" << dot_flip << " (->1.0 means it snapped to the mirror)");
+	CHECK(dot_flip < 0.9f); // did NOT snap onto the mirror twin via a flip-polluted re-anchor
+}
+
 TEST_CASE("kalman: ESKF online bias absorbs an IMU bias without a gravity-leak runaway")
 {
 	// A constant gyro+accel bias, uncorrected, tilts the gravity estimate and
@@ -2225,7 +2521,7 @@ TEST_CASE("kalman: ESKF online bias absorbs an IMU bias without a gravity-leak r
 			eskf_feed_leds(kf.get(), ts, g, led, cam, view, rng, 1.0, 0);
 		}
 		xrt_space_relation rel{};
-		kf->get_prediction(ts, &rel);
+		kf->get_prediction(ts, &rel, nullptr);
 		V3 e{rel.pose.position.x - g.p.x, rel.pose.position.y - g.p.y, rel.pose.position.z - g.p.z};
 		max_err = std::max(max_err, std::sqrt(dot(e, e))); // bounded the WHOLE run (no runaway)
 		V3 vv{rel.linear_velocity.x, rel.linear_velocity.y, rel.linear_velocity.z};
@@ -2241,9 +2537,9 @@ TEST_CASE("kalman: ESKF online bias absorbs an IMU bias without a gravity-leak r
 TEST_CASE("kalman: ESKF filter consistency (NEES within bounds)")
 {
 	// Monte-Carlo normalized estimation error squared. For a consistent 3-DOF
-	// position estimate E[NEES] ~ 3; a death-spiraling / over-confident filter
-	// (covariance too small -> gate traps) shows NEES in the hundreds. Catches
-	// the covariance pathology the old fixed-gate UKF had.
+	// position estimate E[NEES] ~ 3; an over-confident filter (covariance too
+	// small -> gate traps) shows NEES in the hundreds. Catches that covariance
+	// pathology.
 	const LedModel led = make_led_model();
 	const Cam cam[2] = {make_cam(-0.06), make_cam(+0.06)};
 	const LEDCameraView view[2] = {make_view(cam[0]), make_view(cam[1])};
@@ -2277,7 +2573,7 @@ TEST_CASE("kalman: ESKF filter consistency (NEES within bounds)")
 			continue;
 		}
 		xrt_space_relation rel{};
-		kf->get_prediction(ts, &rel);
+		kf->get_prediction(ts, &rel, nullptr);
 		GTPose g = gt_pose(t);
 		cv::Vec3d e(rel.pose.position.x - g.p.x, rel.pose.position.y - g.p.y,
 		            rel.pose.position.z - g.p.z);
@@ -2315,8 +2611,8 @@ tilt_angle_between(const xrt_quat &a, const xrt_quat &b)
 
 TEST_CASE("kalman: gyro rejects an optical orientation flip (output does not flip)")
 {
-	// The daylight failure: a few-LED PnP returns a ~180 deg mirror-flipped orientation. The fresh gyro
-	// (which never rotated) must veto it so the reported orientation does NOT flip.
+	// A few-LED PnP returns a ~180 deg mirror-flipped orientation. The fresh gyro (which never rotated)
+	// must reject it so the reported orientation does NOT flip.
 	auto kf = KalmanFusionInterface::create();
 	REQUIRE(kf != nullptr);
 	const int64_t dt = DT_NS;
@@ -2330,7 +2626,7 @@ TEST_CASE("kalman: gyro rejects an optical orientation flip (output does not fli
 		ts += dt;
 	}
 	xrt_space_relation rel{};
-	kf->get_prediction(ts, &rel);
+	kf->get_prediction(ts, &rel, nullptr);
 	REQUIRE(quat_abs_dot(rel.pose.orientation, q_true) > 0.99f);
 
 	// Inject a 180 deg mirror-flipped optical orientation for several frames (position unchanged).
@@ -2340,7 +2636,7 @@ TEST_CASE("kalman: gyro rejects an optical orientation flip (output does not fli
 		feed_imu(kf.get(), ts, a_rest, ZERO_VEC);
 		ts += dt;
 	}
-	kf->get_prediction(ts, &rel);
+	kf->get_prediction(ts, &rel, nullptr);
 	CHECK(quat_abs_dot(rel.pose.orientation, q_true) > 0.9f); // stayed with the gyro
 	CHECK(quat_abs_dot(rel.pose.orientation, q_flip) < 0.5f); // did NOT adopt the flip
 }
@@ -2368,7 +2664,7 @@ TEST_CASE("kalman: accel gravity anchor holds roll/pitch through a long optical-
 		ts += dt;
 	}
 	xrt_space_relation rel{};
-	kf->get_prediction(ts, &rel);
+	kf->get_prediction(ts, &rel, nullptr);
 	const double tilt_err_deg = tilt_angle_between(rel.pose.orientation, tilt) * 180.0 / M_PI;
 	INFO("roll/pitch error after 8 s optical-sparse with gyro bias = " << tilt_err_deg << " deg");
 	CHECK(tilt_err_deg < 3.0); // gravity anchor held roll/pitch (uncorrected would be ~9 deg)
@@ -2399,7 +2695,7 @@ TEST_CASE("kalman: flip-guard does NOT reject a real fast rotation")
 		ts += dt;
 	}
 	xrt_space_relation rel{};
-	kf->get_prediction(ts, &rel);
+	kf->get_prediction(ts, &rel, nullptr);
 	const xrt_quat q_final = quat_axis_angle({0.0f, 1.0f, 0.0f}, (float)yaw);
 	CHECK(quat_abs_dot(rel.pose.orientation, q_final) > 0.9f);      // tracked the real spin
 	CHECK(quat_abs_dot(rel.pose.orientation, IDENTITY_QUAT) < 0.5f); // did not get stuck (not over-rejected)
@@ -2422,7 +2718,7 @@ TEST_CASE("kalman: rejects a physically implausible optical pose without losing 
 		ts += dt;
 	}
 	xrt_space_relation rel{};
-	kf->get_prediction(ts, &rel);
+	kf->get_prediction(ts, &rel, nullptr);
 	REQUIRE(std::abs(rel.pose.position.x - home.x) < 0.05);
 
 	// Inject a degenerate ~316 m pose for several frames (loose residual_limit so the OLD divergence
@@ -2433,7 +2729,7 @@ TEST_CASE("kalman: rejects a physically implausible optical pose without losing 
 		feed_imu(kf.get(), ts, a_rest, ZERO_VEC);
 		ts += dt;
 	}
-	kf->get_prediction(ts, &rel);
+	kf->get_prediction(ts, &rel, nullptr);
 	const double dx = rel.pose.position.x - home.x, dy = rel.pose.position.y - home.y,
 	             dz = rel.pose.position.z - home.z;
 	CHECK(std::sqrt(dx * dx + dy * dy + dz * dz) < 0.5); // stayed home, did NOT fly to 316 m
@@ -2443,7 +2739,7 @@ TEST_CASE("kalman: rejects a physically implausible optical pose without losing 
 		feed_imu(kf.get(), ts, a_rest, ZERO_VEC);
 		ts += dt;
 	}
-	kf->get_prediction(ts, &rel);
+	kf->get_prediction(ts, &rel, nullptr);
 	CHECK(rel.pose.position.x == Approx(home.x).margin(0.1));
 	CHECK(rel.pose.position.z == Approx(home.z).margin(0.1));
 }
@@ -2453,7 +2749,7 @@ TEST_CASE("kalman: flip-guard rejects an optical flip through a multi-second dro
 	// Optical drops out for ~1 s (BT-limited controllers do this constantly), during which the gyro
 	// holds orientation. The few-LED PnP then returns a 180 deg mirror flip. The gyro is past the 0.5 s
 	// position-freeze but well within the (longer) flip-guard trust horizon, so the flip must still be
-	// rejected — the reported orientation does NOT flip. (Under the old 0.5 s window it would have.)
+	// rejected — the reported orientation does NOT flip.
 	auto kf = KalmanFusionInterface::create();
 	REQUIRE(kf != nullptr);
 	const int64_t dt = DT_NS;
@@ -2476,7 +2772,7 @@ TEST_CASE("kalman: flip-guard rejects an optical flip through a multi-second dro
 		ts += dt;
 	}
 	xrt_space_relation rel{};
-	kf->get_prediction(ts, &rel);
+	kf->get_prediction(ts, &rel, nullptr);
 	CHECK(quat_abs_dot(rel.pose.orientation, IDENTITY_QUAT) > 0.9f); // held the gyro orientation
 	CHECK(quat_abs_dot(rel.pose.orientation, q_flip) < 0.5f);        // did NOT adopt the flip
 }
@@ -2501,7 +2797,7 @@ TEST_CASE("kalman: G2_IMU_ONLY runs pure inertial after the bootstrap window")
 		ts += dt;
 	}
 	xrt_space_relation rel{};
-	kf->get_prediction(ts, &rel);
+	kf->get_prediction(ts, &rel, nullptr);
 	REQUIRE(std::abs(rel.pose.position.x - home.x) < 0.05);
 
 	const xrt_vec3 elsewhere{1.0f, 0.0f, 0.5f}; // plausible (< 4 m) but must be IGNORED in IMU-only mode
@@ -2510,7 +2806,7 @@ TEST_CASE("kalman: G2_IMU_ONLY runs pure inertial after the bootstrap window")
 		feed_imu(kf.get(), ts, a_rest, ZERO_VEC); // at rest -> pure inertial holds position
 		ts += dt;
 	}
-	kf->get_prediction(ts, &rel);
+	kf->get_prediction(ts, &rel, nullptr);
 	CHECK(std::abs(rel.pose.position.x - home.x) < 0.2);       // stayed where inertial put it
 	CHECK(std::abs(rel.pose.position.x - elsewhere.x) > 0.5);  // did NOT jump to the ignored optical
 }
@@ -2546,13 +2842,13 @@ TEST_CASE("kalman: ZUPT zeros residual velocity at rest so pure-inertial positio
 		feed_imu(kf.get(), ts, a_rest, ZERO_VEC);
 		ts += dt;
 	}
-	kf->get_prediction(ts, &rel);
+	kf->get_prediction(ts, &rel, nullptr);
 	const xrt_vec3 p_mid = rel.pose.position; // ZUPT now engaged; velocity should be ~0
 	for (int i = 0; i < 400; i++) {           // ~0.8 s hold
 		feed_imu(kf.get(), ts, a_rest, ZERO_VEC);
 		ts += dt;
 	}
-	kf->get_prediction(ts, &rel);
+	kf->get_prediction(ts, &rel, nullptr);
 	const double drift = std::sqrt(std::pow(rel.pose.position.x - p_mid.x, 2) +
 	                               std::pow(rel.pose.position.y - p_mid.y, 2) +
 	                               std::pow(rel.pose.position.z - p_mid.z, 2));
@@ -2601,7 +2897,7 @@ TEST_CASE("kalman: ZARU learns a yaw gyro bias at rest so orientation does not d
 		ts += dt;
 	}
 	xrt_space_relation rel{};
-	kf->get_prediction(ts, &rel);
+	kf->get_prediction(ts, &rel, nullptr);
 	// Without ZARU the yaw would drift ~0.05*10 = 0.5 rad (~29 deg) -> dot ~0.97; ZARU holds it near identity.
 	CHECK(quat_abs_dot(rel.pose.orientation, IDENTITY_QUAT) > 0.99f);
 }
@@ -2656,13 +2952,13 @@ TEST_CASE("kalman: velocity divergence watchdog bounds an unphysical dead-reckon
 		ts += dt;
 	}
 	xrt_space_relation r0{};
-	kf->get_prediction(ts, &r0);
+	kf->get_prediction(ts, &r0, nullptr);
 	for (int i = 0; i < 20; i++) { // ~40 ms more
 		feed_imu(kf.get(), ts, a_big, ZERO_VEC);
 		ts += dt;
 	}
 	xrt_space_relation r1{};
-	kf->get_prediction(ts, &r1);
+	kf->get_prediction(ts, &r1, nullptr);
 	const double dxp = r1.pose.position.x - r0.pose.position.x, dyp = r1.pose.position.y - r0.pose.position.y,
 	             dzp = r1.pose.position.z - r0.pose.position.z;
 	const double speed = std::sqrt(dxp * dxp + dyp * dyp + dzp * dzp) / (20.0 * DT_S);
@@ -2833,7 +3129,7 @@ TEST_CASE("kalman: accel ellipsoid rejects coplanar rest orientations (degenerac
 	double T[9];
 	CHECK(kf->debug_get_accel_calibration(T) == false); // coplanar -> never fitted
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 	CHECK(std::isfinite(rel.pose.position.x)); // and the filter survived the degenerate input
 	CHECK(std::isfinite(rel.pose.orientation.w));
 }
@@ -2883,7 +3179,7 @@ TEST_CASE("kalman: accel ellipsoid tolerates a large per-axis scale error withou
 		}
 	}
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 	CHECK(std::isfinite(rel.pose.position.x));
 	CHECK(std::isfinite(rel.pose.orientation.w));
 	double T[9];
@@ -2929,10 +3225,295 @@ TEST_CASE("kalman: a fitted accel ellipsoid compensates the real device and does
 		t += DT_NS;
 	}
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 	CHECK(rel.pose.position.x == Approx(home.x).margin(0.05));
 	CHECK(rel.pose.position.y == Approx(home.y).margin(0.05));
 	CHECK(rel.pose.position.z == Approx(home.z).margin(0.05));
+}
+
+// ---------------------------------------------------------------------------
+// Optically-derived IMU INTRINSICS (gyro scale+misalignment M_g, accel ellipsoid T_a) seeded via
+// set_imu_intrinsics — the offline-computed, persisted-per-serial calibration. These prove the live
+// filter APPLIES the same model imu_calib_from_optical.py fits (w = M_g*(w_m-bg), f = T_a*(a_m-ba)),
+// with TEETH: each correction's effect is large enough that removing/wronging it fails the assertion.
+// ---------------------------------------------------------------------------
+
+namespace {
+//! Row-major 3x3 of a small rotation about @p axis by @p deg (the kind a sensor->device misalignment
+//! is). Built from the test's own quaternion helpers (NOT the filter) so it is an independent truth.
+void
+rot3_rowmajor(const xrt_vec3 &axis, float deg, double out[9])
+{
+	const xrt_quat q = quat_axis_angle(axis, (float)(deg * M_PI / 180.0));
+	const xrt_vec3 ex = rotate(q, {1, 0, 0}), ey = rotate(q, {0, 1, 0}), ez = rotate(q, {0, 0, 1});
+	// Columns are the rotated basis vectors -> row-major matrix.
+	out[0] = ex.x; out[1] = ey.x; out[2] = ez.x;
+	out[3] = ex.y; out[4] = ey.y; out[5] = ez.y;
+	out[6] = ex.z; out[7] = ey.z; out[8] = ez.z;
+}
+//! Multiply row-major 3x3 @p M by vector @p v.
+xrt_vec3
+mat3_mul(const double M[9], const xrt_vec3 &v)
+{
+	return xrt_vec3{(float)(M[0] * v.x + M[1] * v.y + M[2] * v.z),
+	                (float)(M[3] * v.x + M[4] * v.y + M[5] * v.z),
+	                (float)(M[6] * v.x + M[7] * v.y + M[8] * v.z)};
+}
+} // namespace
+
+TEST_CASE("kalman: seeded gyro intrinsics correct a misaligned/scaled gyro so orientation integrates true")
+{
+	// Physics: the device truly rotates about world-up. The gyro's sensitive axes are misaligned from the
+	// device frame by R_ms, so it MEASURES w_meas = R_ms^T * w_true. The persisted intrinsic is M_g = R_ms
+	// (corrected = M_g * w_meas = w_true). The teeth must be GRAVITY-BLIND: the accel gravity-tilt anchor
+	// fixes roll/pitch every sample, so a misalignment that only tilts the axis would be silently masked.
+	// YAW is the one orientation DOF gravity cannot observe — so the test drives a pure-yaw rotation and the
+	// intrinsic carries a yaw-RATE error (a 10% yaw scale plus a small misalignment): without correction the
+	// integrated YAW is wrong by ~10% (~5.7 deg over a 1-rad turn), which gravity can never recover; with it
+	// the yaw is exact. M_g maps gyro->device, so the device MEASURES w_meas = M_g^-1 * w_true. M_g and its
+	// inverse are built from a hand-written matrix (NOT the filter's model) — an independent ground truth.
+	double Mg[9];
+	{
+		double mis[9];
+		rot3_rowmajor({1.0f, 0.0f, 0.0f}, 4.0f, mis); // 4 deg gyro->device misalignment about body-X
+		const double scale_y = 1.10;                  // 10% yaw-axis scale (gravity-blind under-rotation)
+		double S[9] = {1, 0, 0, 0, scale_y, 0, 0, 0, 1};
+		// M_g = mis * S (row-major multiply).
+		for (int r = 0; r < 3; r++)
+			for (int c = 0; c < 3; c++)
+				Mg[r * 3 + c] = mis[r * 3 + 0] * S[0 * 3 + c] + mis[r * 3 + 1] * S[1 * 3 + c] +
+				                mis[r * 3 + 2] * S[2 * 3 + c];
+	}
+	// Invert the general 3x3 M_g (not a pure rotation now) via the test's own cofactor inverse.
+	double Mg_inv[9];
+	{
+		const double *m = Mg;
+		const double det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
+		                   m[2] * (m[3] * m[7] - m[4] * m[6]);
+		REQUIRE(std::abs(det) > 1e-9);
+		const double inv_det = 1.0 / det;
+		Mg_inv[0] = (m[4] * m[8] - m[5] * m[7]) * inv_det;
+		Mg_inv[1] = (m[2] * m[7] - m[1] * m[8]) * inv_det;
+		Mg_inv[2] = (m[1] * m[5] - m[2] * m[4]) * inv_det;
+		Mg_inv[3] = (m[5] * m[6] - m[3] * m[8]) * inv_det;
+		Mg_inv[4] = (m[0] * m[8] - m[2] * m[6]) * inv_det;
+		Mg_inv[5] = (m[2] * m[3] - m[0] * m[5]) * inv_det;
+		Mg_inv[6] = (m[3] * m[7] - m[4] * m[6]) * inv_det;
+		Mg_inv[7] = (m[1] * m[6] - m[0] * m[7]) * inv_det;
+		Mg_inv[8] = (m[0] * m[4] - m[1] * m[3]) * inv_det;
+	}
+	const double ident[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+
+	auto run = [&](bool apply) {
+		auto kf = KalmanFusionInterface::create();
+		kf->set_imu_intrinsics(apply ? Mg : ident, ident);
+		int64_t t = 1000000;
+		const xrt_vec3 home{0.0f, 0.0f, 0.5f};
+		feed_pose(kf.get(), t, home, IDENTITY_QUAT); // bootstrap at identity
+		feed_imu(kf.get(), t, make_accel_body(IDENTITY_QUAT, ZERO_VEC), ZERO_VEC);
+		t += DT_NS;
+		// IMU-only: rotate about world-up at 1.0 rad/s for 1 s (well above the rest gate, so no ZUPT/ZARU).
+		// The accel correction is identity, so the accel is fed clean (only the gyro path is under test).
+		const xrt_vec3 w_true{0.0f, 1.0f, 0.0f};
+		for (int i = 1; i <= 500; i++) {
+			const xrt_quat q = quat_axis_angle({0, 1, 0}, (float)(1.0 * DT_S * i)); // true body->world
+			const xrt_vec3 a_body = make_accel_body(q, ZERO_VEC);                   // gravity only, true body frame
+			// Gyro MEASURES w_meas = M_g^-1 * w_true; accel kept clean (its seed is identity here).
+			feed_imu(kf.get(), t, a_body, mat3_mul(Mg_inv, w_true));
+			t += DT_NS;
+		}
+		xrt_space_relation rel{};
+		kf->get_prediction(t, &rel, nullptr);
+		return rel.pose.orientation;
+	};
+
+	// Extract the world-up (yaw) angle of an orientation — the gravity-blind DOF this test pins.
+	auto yaw_of = [](const xrt_quat &q) {
+		const xrt_vec3 fwd = rotate(q, {0.0f, 0.0f, -1.0f}); // body -Z into world
+		return std::atan2((double)-fwd.x, (double)-fwd.z);   // +rotation about world-up (right-handed)
+	};
+	const double yaw_true = 1.0; // 1 s at 1 rad/s about world-up
+
+	const double yaw_with = yaw_of(run(true));
+	const double yaw_without = yaw_of(run(false));
+	INFO("yaw_true=" << yaw_true << " with=" << yaw_with << " without=" << yaw_without);
+	// WITH the intrinsic: integrated yaw matches truth tightly (< ~0.5 deg).
+	CHECK(std::abs(yaw_with - yaw_true) < 0.01);
+	// WITHOUT it: the 10% yaw-scale error leaves ~0.1 rad of yaw error gravity cannot recover.
+	CHECK(std::abs(yaw_without - yaw_true) > 0.05);
+	// The correction is strictly the better estimate (it helps, by a wide gravity-blind margin).
+	CHECK(std::abs(yaw_with - yaw_true) < std::abs(yaw_without - yaw_true) - 0.04);
+}
+
+TEST_CASE("kalman: a seeded accel ellipsoid is applied from the first sample (offline-calibration path)")
+{
+	// The offline tool persists T_a; set_imu_intrinsics seeds it so it applies WITHOUT waiting for the
+	// online rest-orientation spread. A per-axis-scaled accelerometer (measured = S * true) seeded with
+	// T_a = S^-1 reports |corrected| = g and tracks the optical home; an identity seed (no correction)
+	// lets the scale error leak a velocity kick on rotation. Teeth: compare against a no-seed run.
+	const double sx = 1.05, sy = 0.96, sz = 1.02;
+	double Ta[9] = {1.0 / sx, 0, 0, 0, 1.0 / sy, 0, 0, 0, 1.0 / sz};
+	const double ident[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+
+	// Round-trip read of the seeded T_a (load/apply contract): get must return exactly what was set.
+	auto kf = KalmanFusionInterface::create();
+	kf->set_imu_intrinsics(ident, Ta);
+	double T_read[9], Mg_read[9];
+	REQUIRE(kf->get_imu_intrinsics(Mg_read, T_read) == true); // a real correction -> persistable
+	for (int i = 0; i < 9; i++) {
+		CHECK(T_read[i] == Approx(Ta[i]).margin(1e-9));
+	}
+	// debug_get_accel_calibration exposes the same applied matrix (the seed superseded the scalar scale).
+	double T_dbg[9];
+	REQUIRE(kf->debug_get_accel_calibration(T_dbg) == true);
+	for (int i = 0; i < 9; i++) {
+		CHECK(T_dbg[i] == Approx(Ta[i]).margin(1e-9));
+	}
+
+	// Behavioral: feed the SAME physical scaled accel on a tilted, rotating trajectory through an optical
+	// dropout. The seeded T_a cancels the scale; identity leaves it.
+	auto run = [&](const double seed_ta[9]) {
+		auto f = KalmanFusionInterface::create();
+		f->set_imu_intrinsics(ident, seed_ta);
+		int64_t t = 1000000;
+		const xrt_vec3 home{0.2f, -0.1f, 0.6f};
+		const xrt_quat tilt = quat_axis_angle({1, 0, 0}, 0.5f); // 0.5 rad pitch (gravity spans axes)
+		for (int i = 0; i < 200; i++) { // solid optical lock at the tilt, with the scaled accel
+			feed_pose(f.get(), t, home, tilt);
+			const xrt_vec3 clean = make_accel_body(tilt, ZERO_VEC);
+			const xrt_vec3 scaled{(float)(clean.x * sx), (float)(clean.y * sy), (float)(clean.z * sz)};
+			feed_imu(f.get(), t, scaled, ZERO_VEC);
+			t += DT_NS;
+		}
+		// Optical dropout: pure inertial for ~0.3 s. A residual specific-force error integrates into drift.
+		for (int i = 0; i < 150; i++) {
+			const xrt_vec3 clean = make_accel_body(tilt, ZERO_VEC);
+			const xrt_vec3 scaled{(float)(clean.x * sx), (float)(clean.y * sy), (float)(clean.z * sz)};
+			feed_imu(f.get(), t, scaled, ZERO_VEC);
+			t += DT_NS;
+		}
+		xrt_space_relation rel{};
+		f->get_prediction(t, &rel, nullptr);
+		return rel.pose.position;
+	};
+	const xrt_vec3 p_cal = run(Ta);
+	const xrt_vec3 p_unc = run(ident);
+	const xrt_vec3 home{0.2f, -0.1f, 0.6f};
+	auto dist = [&](const xrt_vec3 &p) {
+		return std::sqrt((p.x - home.x) * (p.x - home.x) + (p.y - home.y) * (p.y - home.y) +
+		                 (p.z - home.z) * (p.z - home.z));
+	};
+	CHECK(dist(p_cal) < dist(p_unc)); // the seeded ellipsoid reduces dead-reckon drift vs no correction
+	CHECK(std::isfinite(p_cal.x));
+}
+
+TEST_CASE("kalman: identity-seeded intrinsics are a no-op (bit-for-bit no regression)")
+{
+	// Seeding identity matrices must change NOTHING: it is the clean fallback when no offline calibration
+	// exists. Run an identical tracking scenario on a seeded-identity filter and an unseeded one; their
+	// reported poses must be exactly equal at every step (not merely close). Guards against the
+	// application point silently altering behaviour when the calibration is absent.
+	const double ident[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+	auto seeded = KalmanFusionInterface::create();
+	auto plain = KalmanFusionInterface::create();
+	seeded->set_imu_intrinsics(ident, ident);
+	// get_imu_intrinsics on an identity seed reports "nothing to persist".
+	double mg[9], ta[9];
+	CHECK(seeded->get_imu_intrinsics(mg, ta) == false);
+	CHECK(plain->get_imu_intrinsics(mg, ta) == false);
+
+	int64_t t = 1000000;
+	std::mt19937 rng(99);
+	std::uniform_real_distribution<float> jit(-0.05f, 0.05f);
+	const xrt_vec3 a_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	for (int i = 0; i < 400; i++) {
+		const xrt_vec3 pos{0.1f + jit(rng), -0.2f + jit(rng), 0.5f + jit(rng)};
+		const xrt_quat q = quat_axis_angle({0, 1, 0}, (float)(0.3 * std::sin(i * 0.02)));
+		feed_pose(seeded.get(), t, pos, q);
+		feed_pose(plain.get(), t, pos, q);
+		const xrt_vec3 gyro{jit(rng), 0.2f, jit(rng)};
+		const xrt_vec3 acc = make_accel_body(q, {jit(rng), jit(rng), jit(rng)});
+		feed_imu(seeded.get(), t, acc, gyro);
+		feed_imu(plain.get(), t, acc, gyro);
+		t += DT_NS;
+		xrt_space_relation rs{}, rp{};
+		seeded->get_prediction(t, &rs, nullptr);
+		plain->get_prediction(t, &rp, nullptr);
+		REQUIRE(rs.pose.position.x == rp.pose.position.x);
+		REQUIRE(rs.pose.position.y == rp.pose.position.y);
+		REQUIRE(rs.pose.position.z == rp.pose.position.z);
+		REQUIRE(rs.pose.orientation.w == rp.pose.orientation.w);
+		REQUIRE(rs.pose.orientation.x == rp.pose.orientation.x);
+		REQUIRE(rs.pose.orientation.y == rp.pose.orientation.y);
+		REQUIRE(rs.pose.orientation.z == rp.pose.orientation.z);
+	}
+}
+
+TEST_CASE("kalman: get_imu_intrinsics round-trips a seeded gyro+accel correction and rejects identity")
+{
+	// The driver persistence contract: what set_imu_intrinsics applies, get_imu_intrinsics reads back
+	// (so the cache round-trips), and get returns false only when neither channel is a real correction.
+	const double ident[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+	double Mg[9];
+	rot3_rowmajor({0, 0, 1}, 3.0f, Mg); // 3 deg gyro->device misalignment (the measured G2 case)
+	const double Ta[9] = {0.98, 0.01, 0.0, 0.01, 1.03, 0.0, 0.0, 0.0, 0.99};
+
+	SECTION("both channels real -> round-trips exactly, persistable") {
+		auto kf = KalmanFusionInterface::create();
+		kf->set_imu_intrinsics(Mg, Ta);
+		double rmg[9], rta[9];
+		REQUIRE(kf->get_imu_intrinsics(rmg, rta) == true);
+		for (int i = 0; i < 9; i++) {
+			CHECK(rmg[i] == Approx(Mg[i]).margin(1e-12));
+			CHECK(rta[i] == Approx(Ta[i]).margin(1e-12));
+		}
+	}
+	SECTION("only gyro real -> persistable, accel reads identity") {
+		auto kf = KalmanFusionInterface::create();
+		kf->set_imu_intrinsics(Mg, ident);
+		double rmg[9], rta[9];
+		REQUIRE(kf->get_imu_intrinsics(rmg, rta) == true);
+		for (int i = 0; i < 9; i++) {
+			CHECK(rmg[i] == Approx(Mg[i]).margin(1e-12));
+			CHECK(rta[i] == Approx(ident[i]).margin(1e-12));
+		}
+	}
+	SECTION("both identity -> nothing to persist") {
+		auto kf = KalmanFusionInterface::create();
+		kf->set_imu_intrinsics(ident, ident);
+		double rmg[9], rta[9];
+		CHECK(kf->get_imu_intrinsics(rmg, rta) == false);
+	}
+	SECTION("non-finite seed is ignored (stays uncorrected)") {
+		auto kf = KalmanFusionInterface::create();
+		double bad[9] = {1, 0, 0, 0, 1, 0, 0, 0, std::nan("")};
+		kf->set_imu_intrinsics(bad, ident);
+		double rmg[9], rta[9];
+		CHECK(kf->get_imu_intrinsics(rmg, rta) == false); // rejected -> nothing applied
+	}
+	SECTION("implausible (out-of-band) seed falls back to identity") {
+		// A corrupt external calibration whose scaling is wildly out of the plausible band (here a 3x
+		// blow-up on one axis) must NOT be applied — the trust-boundary guard falls back to identity so a
+		// garbage file cannot poison the integration. The OTHER (sane) channel is still applied.
+		auto kf = KalmanFusionInterface::create();
+		const double huge[9] = {3.0, 0, 0, 0, 1, 0, 0, 0, 1};
+		kf->set_imu_intrinsics(huge, Ta);
+		double rmg[9], rta[9];
+		REQUIRE(kf->get_imu_intrinsics(rmg, rta) == true); // accel (sane) still applied
+		for (int i = 0; i < 9; i++) {
+			CHECK(rmg[i] == Approx(ident[i]).margin(1e-12)); // gyro fell back to identity
+			CHECK(rta[i] == Approx(Ta[i]).margin(1e-12));
+		}
+	}
+	SECTION("degenerate (singular / sign-flipped) seed falls back to identity") {
+		// A zero/sign-flipped axis is not a physical correction (it would null or invert that axis). The
+		// guard rejects it; with the other channel also identity there is nothing left to persist.
+		auto kf = KalmanFusionInterface::create();
+		const double singular[9] = {1, 0, 0, 0, 0, 0, 0, 0, 1}; // middle axis collapsed to zero
+		kf->set_imu_intrinsics(singular, ident);
+		double rmg[9], rta[9];
+		CHECK(kf->get_imu_intrinsics(rmg, rta) == false); // both fell back to identity
+	}
 }
 
 #ifdef G2_TEST_DATA_DIR
@@ -2973,7 +3554,7 @@ TEST_CASE("kalman: real recorded session corpus replays stay finite and bounded"
 			feed_imu(kf.get(), s.t_ns, {s.ax, s.ay, s.az}, {s.gx, s.gy, s.gz});
 
 			xrt_space_relation rel{};
-			kf->get_prediction(s.t_ns, &rel);
+			kf->get_prediction(s.t_ns, &rel, nullptr);
 			REQUIRE(std::isfinite(rel.pose.position.x));
 			REQUIRE(std::isfinite(rel.pose.position.y));
 			REQUIRE(std::isfinite(rel.pose.position.z));
@@ -3014,7 +3595,7 @@ TEST_CASE("kalman: an implausible first optical pose does not bootstrap the filt
 		t += DT_NS;
 	}
 	xrt_space_relation rel{};
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 	CHECK_FALSE(rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT); // garbage never adopted
 	const xrt_vec3 &gp = rel.pose.position;
 	CHECK(std::sqrt(gp.x * gp.x + gp.y * gp.y + gp.z * gp.z) < 1.0f); // reported origin, not 33 m
@@ -3025,9 +3606,1125 @@ TEST_CASE("kalman: an implausible first optical pose does not bootstrap the filt
 		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
 		t += DT_NS;
 	}
-	kf->get_prediction(t, &rel);
+	kf->get_prediction(t, &rel, nullptr);
 	CHECK((rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0);
 	CHECK(rel.pose.position.x == Approx(home.x).margin(0.1));
 	CHECK(rel.pose.position.y == Approx(home.y).margin(0.1));
 	CHECK(rel.pose.position.z == Approx(home.z).margin(0.1));
+}
+
+// ===========================================================================
+// SOTA additions: predict_led_gate (per-LED gate ellipse), iterated EKF
+// (Gauss-Newton) per-LED update, and NIS consistency + weak-DOF P-floor.
+// Decoupled + adversarial. (agent-A)
+// ===========================================================================
+namespace {
+
+//! Convert an xrt_quat (x,y,z,w) into the test's Q (w,x,y,z).
+static Q
+from_xrt_quat(const xrt_quat &q)
+{
+	return q_norm(Q{q.w, q.x, q.y, q.z});
+}
+
+//! Replicate the FILTER's per-LED reprojection independently (so the test cannot agree with a bug in
+//! the filter): p_cam = R_cw*(p + R(q_b2w)*led_obj) + t_cw; zhat = pinhole(p_cam). q_cw/t_cw come from
+//! the LEDCameraView exactly as the filter reads them. Returns false behind the camera.
+static bool
+reproject_filter(const LEDCameraView &view, V3 p, Q q_b2w, V3 led_obj, double &u, double &v)
+{
+	const Q q_cw = from_xrt_quat(view.cam_world_orient);
+	const V3 t_cw{view.cam_world_pos.x, view.cam_world_pos.y, view.cam_world_pos.z};
+	const V3 p_world = p + q_rot(q_b2w, led_obj);
+	const V3 p_cam = q_rot(q_cw, p_world) + t_cw;
+	const double zc = (p_cam.z > 1e-6) ? p_cam.z : 1e-6;
+	u = view.fx * (p_cam.x / zc) + view.cx;
+	v = view.fy * (p_cam.y / zc) + view.cy;
+	return p_cam.z > 1e-6;
+}
+
+//! Central-difference the 2x6 reprojection Jacobian H = d zhat / d[dp(3), dtheta_world(3)] at (p,q),
+//! using the GLOBAL orientation error convention q' = exp(dtheta_world) (x) q (left multiply) — the
+//! exact convention the filter linearizes about. Output H[row*6 + col].
+static void
+numeric_H(const LEDCameraView &view, V3 p, Q q_b2w, V3 led_obj, double H[12])
+{
+	const double hp = 1e-5;   // position step (m)
+	const double ht = 1e-5;   // angle step (rad)
+	for (int c = 0; c < 6; c++) {
+		V3 pp = p, pm = p;
+		Q qp = q_b2w, qm = q_b2w;
+		if (c < 3) {
+			V3 e{c == 0 ? hp : 0.0, c == 1 ? hp : 0.0, c == 2 ? hp : 0.0};
+			pp = p + e;
+			pm = p - (1.0 * e);
+		} else {
+			V3 axis{c == 3 ? 1.0 : 0.0, c == 4 ? 1.0 : 0.0, c == 5 ? 1.0 : 0.0};
+			qp = q_norm(q_mul(q_axis(axis, ht), q_b2w));   // left-multiply: global error
+			qm = q_norm(q_mul(q_axis(axis, -ht), q_b2w));
+		}
+		double up, vp, um, vm;
+		reproject_filter(view, pp, qp, led_obj, up, vp);
+		reproject_filter(view, pm, qm, led_obj, um, vm);
+		const double step = (c < 3) ? hp : ht;
+		H[0 * 6 + c] = (up - um) / (2.0 * step);
+		H[1 * 6 + c] = (vp - vm) / (2.0 * step);
+	}
+}
+
+} // namespace
+
+TEST_CASE("kalman: predict_led_gate returns zhat + S consistent with the filter model")
+{
+	using xrt::auxiliary::tracking::LEDObservation;
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+	const LedModel led = make_led_model();
+	const Cam cam[2] = {make_cam(-0.06), make_cam(+0.06)};
+	const LEDCameraView view[2] = {make_view(cam[0]), make_view(cam[1])};
+	std::mt19937 rng(0xA11CE);
+
+	// Before tracking, the gate is unavailable.
+	{
+		LEDObservation o;
+		o.led_obj = to_xrt_vec3(led.pos[0]);
+		o.observed_px = xrt_vec2{0, 0};
+		float zhat[2], S[4];
+		CHECK_FALSE(kf->predict_led_gate(o, view[0], zhat, S));
+	}
+
+	const double imu_dt = 1.0 / 200.0;
+	const int64_t imu_dt_ns = (int64_t)(imu_dt * 1e9);
+	int64_t ts = 1000000;
+	double t = 0.0;
+	eskf_bootstrap(kf.get(), ts, t);
+	double next_opt = 0.0;
+	for (; t < 1.0;) {
+		GTPose g = gt_pose(t);
+		feed_imu(kf.get(), ts, gen_accel_body(g.q, gt_accel_world(t)), to_xrt_vec3(gt_gyro_body(t)));
+		t += imu_dt;
+		ts += imu_dt_ns;
+		if (t >= next_opt) {
+			next_opt += 1.0 / 60.0;
+			eskf_feed_leds(kf.get(), ts, gt_pose(t), led, cam, view, rng, 1.5, 0);
+		}
+	}
+
+	// The filter's reported pose right after a fresh fold IS the internal pose (optical not stale).
+	xrt_space_relation rel{};
+	kf->get_prediction(ts, &rel, nullptr);
+	const V3 fp{rel.pose.position.x, rel.pose.position.y, rel.pose.position.z};
+	const Q fq = from_xrt_quat(rel.pose.orientation);
+
+	double P6[36];
+	REQUIRE(kf->debug_get_pose_covariance(P6));
+	const double R_px = 1.5 * 1.5; // matches LED_PIXEL_STD^2 used inside predict_led_gate
+
+	// Pick a front-facing, in-FOV LED for view 0.
+	int led_idx = -1;
+	for (size_t k = 0; k < led.pos.size(); k++) {
+		V3 pw = fp + q_rot(fq, led.pos[k]);
+		V3 nw = q_rot(fq, led.normal[k]);
+		double u, v;
+		if (dot(nw, pw - cam[0].C) < 0 && project_px(cam[0], world_to_cam(cam[0], pw), u, v)) {
+			led_idx = (int)k;
+			break;
+		}
+	}
+	REQUIRE(led_idx >= 0);
+
+	LEDObservation o;
+	o.led_obj = to_xrt_vec3(led.pos[led_idx]);
+	o.observed_px = xrt_vec2{0, 0};
+	float zhat[2], S[4];
+	REQUIRE(kf->predict_led_gate(o, view[0], zhat, S));
+
+	// (c) zhat matches the plain independent projection. Margin 0.5 px: the filter computes zhat in
+	// double from its internal pose; the reference here reprojects from the float pose round-tripped
+	// through get_prediction, so a sub-pixel offset is expected (a wrong/flipped LED would be tens of px).
+	double u_ref, v_ref;
+	REQUIRE(reproject_filter(view[0], fp, fq, led.pos[led_idx], u_ref, v_ref));
+	CHECK((double)zhat[0] == Approx(u_ref).margin(0.5));
+	CHECK((double)zhat[1] == Approx(v_ref).margin(0.5));
+
+	// (a) S == H_num * P6 * H_num^T + R, with H_num a finite-difference Jacobian (independent of the
+	// filter's analytic H). This verifies the filter's S uses the reprojection Jacobian it should.
+	double H[12];
+	numeric_H(view[0], fp, fq, led.pos[led_idx], H);
+	double S_exp[4] = {0, 0, 0, 0};
+	for (int a = 0; a < 2; a++) {
+		for (int b = 0; b < 2; b++) {
+			double s = 0.0;
+			for (int i = 0; i < 6; i++) {
+				double hp = 0.0;
+				for (int j = 0; j < 6; j++) {
+					hp += H[a * 6 + j] * P6[j * 6 + i];
+				}
+				s += hp * H[b * 6 + i];
+			}
+			S_exp[a * 2 + b] = s + (a == b ? R_px : 0.0);
+		}
+	}
+	// Tolerance scales with the (large) pixel-domain entries; relative margin handles it.
+	const double rel_margin = 0.02;
+	for (int i = 0; i < 4; i++) {
+		INFO("S[" << i << "] filter=" << S[i] << " expected=" << S_exp[i]);
+		CHECK((double)S[i] == Approx(S_exp[i]).epsilon(rel_margin).margin(0.5));
+	}
+	// S must be symmetric PD.
+	CHECK(S[1] == Approx(S[2]).margin(1e-3));
+	CHECK(S[0] > R_px * 0.99); // diagonal at least the measurement floor
+	CHECK(S[3] > R_px * 0.99);
+
+	// (b) S grows monotonically when P is inflated. Drop optical for a long stretch (P inflates as the
+	// filter dead-reckons), then the SAME LED's S must be strictly larger in every diagonal entry.
+	float zhat0[2], S0[4];
+	REQUIRE(kf->predict_led_gate(o, view[0], zhat0, S0));
+	for (int i = 0; i < 200; i++) { // ~1 s of IMU-only -> P grows
+		GTPose g = gt_pose(t);
+		feed_imu(kf.get(), ts, gen_accel_body(g.q, gt_accel_world(t)), to_xrt_vec3(gt_gyro_body(t)));
+		t += imu_dt;
+		ts += imu_dt_ns;
+	}
+	float zhat1[2], S1[4];
+	REQUIRE(kf->predict_led_gate(o, view[0], zhat1, S1));
+	INFO("S diag before=" << S0[0] << "," << S0[3] << " after inflation=" << S1[0] << "," << S1[3]);
+	CHECK(S1[0] > S0[0]);
+	CHECK(S1[3] > S0[3]);
+}
+
+// ===========================================================================
+// Covariance-gated PARTIAL FOLD association contract. The front-end
+// (device_try_partial_fold) gates each candidate blob<->LED pairing by the ESKF's
+// per-LED innovation covariance S = predict_led_gate(led_obj,view): fold iff the
+// Mahalanobis distance d² = rᵀS⁻¹r <= χ²₂(0.99)=9.21. This decoupled test asserts
+// that contract DIRECTLY on the filter API the front-end calls, with an independent
+// Mahalanobis computation (cannot agree with a front-end bug):
+//   - a <4-LED frame with a good prior: the blob at the true projection is in-gate
+//     (would fold) AND folding it keeps the filter consistent (covariance stays
+//     honestly bounded, grows under a 1-LED fold relative to a full fold);
+//   - a flipped/garbage correspondence: out-of-gate (folds NOTHING) — the covariance
+//     gate is the mislabel guard;
+//   - cold start (untracked): the gate is unavailable so the front-end no-ops.
+// ===========================================================================
+
+static std::vector<xrt::auxiliary::tracking::LEDObservation> visible_obs(const GTPose &gt, const LedModel &led,
+                                                                         const Cam &cam); // defined below
+
+//! Mahalanobis d² of a blob @p b (px) against a gate (zhat,S), computed INDEPENDENTLY of the filter.
+static double
+mahalanobis2(const float zhat[2], const float S[4], double bx, double by)
+{
+	const double det = (double)S[0] * S[3] - (double)S[1] * S[2];
+	REQUIRE(det > 0.0);
+	const double i00 = S[3] / det, i01 = -S[1] / det, i10 = -S[2] / det, i11 = S[0] / det;
+	const double rx = bx - zhat[0], ry = by - zhat[1];
+	return rx * (i00 * rx + i01 * ry) + ry * (i10 * rx + i11 * ry);
+}
+
+TEST_CASE("kalman: covariance-gated partial-fold association (in-gate folds, flip/garbage folds nothing)")
+{
+	using xrt::auxiliary::tracking::LEDObservation;
+	const double CHI2 = 9.21; // χ²₂(0.99) — the front-end PARTIAL_FOLD_CHI2_2DOF, == the fold's GATE
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+	const LedModel led = make_led_model();
+	const Cam cam[2] = {make_cam(-0.06), make_cam(+0.06)};
+	const LEDCameraView view[2] = {make_view(cam[0]), make_view(cam[1])};
+	std::mt19937 rng(0xC0FFEE);
+
+	// COLD-START GUARD: before any tracking the gate is unavailable -> the front-end folds nothing.
+	{
+		LEDObservation o;
+		o.led_obj = to_xrt_vec3(led.pos[0]);
+		o.observed_px = xrt_vec2{0, 0};
+		float zhat[2], S[4];
+		CHECK_FALSE(kf->predict_led_gate(o, view[0], zhat, S));
+	}
+
+	// Bootstrap + track to confidence (exactly the existing predict_led_gate test's warmup).
+	const double imu_dt = 1.0 / 200.0;
+	const int64_t imu_dt_ns = (int64_t)(imu_dt * 1e9);
+	int64_t ts = 1000000;
+	double t = 0.0;
+	eskf_bootstrap(kf.get(), ts, t);
+	double next_opt = 0.0;
+	for (; t < 1.0;) {
+		GTPose g = gt_pose(t);
+		feed_imu(kf.get(), ts, gen_accel_body(g.q, gt_accel_world(t)), to_xrt_vec3(gt_gyro_body(t)));
+		t += imu_dt;
+		ts += imu_dt_ns;
+		if (t >= next_opt) {
+			next_opt += 1.0 / 60.0;
+			eskf_feed_leds(kf.get(), ts, gt_pose(t), led, cam, view, rng, 1.5, 0);
+		}
+	}
+
+	xrt_space_relation rel{};
+	kf->get_prediction(ts, &rel, nullptr);
+	const V3 fp{rel.pose.position.x, rel.pose.position.y, rel.pose.position.z};
+	const Q fq = from_xrt_quat(rel.pose.orientation);
+
+	// Pick a front-facing, in-FOV LED for view 0.
+	int led_idx = -1;
+	for (size_t k = 0; k < led.pos.size(); k++) {
+		V3 pw = fp + q_rot(fq, led.pos[k]);
+		V3 nw = q_rot(fq, led.normal[k]);
+		double u, v;
+		if (dot(nw, pw - cam[0].C) < 0 && project_px(cam[0], world_to_cam(cam[0], pw), u, v)) {
+			led_idx = (int)k;
+			break;
+		}
+	}
+	REQUIRE(led_idx >= 0);
+
+	LEDObservation o;
+	o.led_obj = to_xrt_vec3(led.pos[led_idx]);
+	o.observed_px = xrt_vec2{0, 0};
+	float zhat[2], S[4];
+	REQUIRE(kf->predict_led_gate(o, view[0], zhat, S));
+
+	// (1) GOOD correspondence: the blob at the LED's TRUE reprojection is well INSIDE the gate.
+	double u_true, v_true;
+	REQUIRE(reproject_filter(view[0], fp, fq, led.pos[led_idx], u_true, v_true));
+	const double d2_good = mahalanobis2(zhat, S, u_true, v_true);
+	INFO("d2_good=" << d2_good << " (gate=" << CHI2 << ")");
+	CHECK(d2_good < CHI2);    // would be folded
+	CHECK(d2_good < 1.0);     // and comfortably so for a confident filter (sub-1-sigma)
+
+	// (2a) GARBAGE blob far from zhat -> OUTSIDE the gate -> folds nothing.
+	const double d2_garbage = mahalanobis2(zhat, S, u_true + 60.0, v_true + 60.0);
+	INFO("d2_garbage=" << d2_garbage);
+	CHECK(d2_garbage > CHI2);
+
+	// NOTE on the mislabel guard's REACH: the per-LED gate rejects a grossly-displaced blob (the (2a)
+	// garbage case, d²=725). It does NOT separate two LEDs only a few px apart, nor a pure-YAW mirror that
+	// reprojects near-identically — those need the JOINT compatibility (JCBB) + yaw/gravity prior of
+	// increment 2. This test therefore asserts only what the per-LED covariance gate actually guarantees:
+	// in-gate true blob folds, gross mislabel is rejected, and the gate is ANISOTROPIC (below).
+
+	// (2b) ANISOTROPY (the design's actual claim) — TEETH. The fully-converged S above is nearly isotropic
+	// (P collapsed -> S≈R=2.25·I), so it cannot exercise the claim. Build a state that IS anisotropic: a
+	// fresh filter bootstrapped then given just a FEW folds, so P (hence HPHᵀ) is still well above R and
+	// retains the anisotropic shape of the geometry. Then probe AT zhat (residual r0=0 exactly, so the
+	// result is purely S's shape, not a base residual) and displace by the SAME pixel magnitude along the
+	// TIGHT vs the LOOSE principal axis. For a residual r along an eigenvector d²=|r|²/λ, so a fixed
+	// |r|=disp gives d²_tight=disp²/λ_small, d²_loose=disp²/λ_big, hence d²_tight/d²_loose == λ_big/λ_small
+	// EXACTLY — the anisotropy of S, which is >1 iff S is genuinely anisotropic and ==1 iff isotropic. So
+	// this FAILS if HPHᵀ were zeroed (S=R, ratio 1.0): the H P Hᵀ term is load-bearing.
+	{
+		auto kfa = KalmanFusionInterface::create();
+		REQUIRE(kfa != nullptr);
+		int64_t tsa = 1000000;
+		double ta = 0.0;
+		eskf_bootstrap(kfa.get(), tsa, ta);
+		std::mt19937 rnga(0xA15E);
+		double next = 0.0;
+		for (; ta < 0.5;) { // converge first so P reflects observed geometry, not the isotropic P0
+			GTPose g = gt_pose(ta);
+			feed_imu(kfa.get(), tsa, gen_accel_body(g.q, gt_accel_world(ta)), to_xrt_vec3(gt_gyro_body(ta)));
+			ta += imu_dt; tsa += imu_dt_ns;
+			if (ta >= next) { next += 1.0 / 60.0; eskf_feed_leds(kfa.get(), tsa, gt_pose(ta), led, cam, view, rnga, 1.5, 0); }
+		}
+		// Then an optical DROPOUT: IMU-only propagation inflates P ANISOTROPICALLY (the gyro grows the
+		// orientation block; gravity keeps the tilt sub-block tighter than yaw), so HPHᵀ rises well above
+		// R and S takes on the geometry's anisotropy. This is exactly the post-dropout regime the gate is
+		// designed for (wide where uncertain, tight where the gravity anchor holds).
+		for (int i = 0; i < 60; i++) {
+			GTPose g = gt_pose(ta);
+			feed_imu(kfa.get(), tsa, gen_accel_body(g.q, gt_accel_world(ta)), to_xrt_vec3(gt_gyro_body(ta)));
+			ta += imu_dt; tsa += imu_dt_ns;
+		}
+		float zA[2], SA[4];
+		REQUIRE(kfa->predict_led_gate(o, view[0], zA, SA));
+		const double a = SA[0], b = SA[1], d = SA[3];
+		const double tr = a + d, det = a * d - b * b;
+		const double disc = std::sqrt(std::max(0.0, tr * tr / 4.0 - det));
+		const double l_big = tr / 2.0 + disc, l_small = tr / 2.0 - disc; // eigenvalues (px^2)
+		REQUIRE(l_small > 0.0);
+		const double aniso_ratio = l_big / l_small;
+		INFO("l_big=" << l_big << " l_small=" << l_small << " anisotropy=" << aniso_ratio);
+		REQUIRE(aniso_ratio > 1.10); // S must genuinely BE anisotropic for this state (else the test has no teeth)
+		// Eigenvector for the LARGE eigenvalue (loose axis); the tight one is orthogonal.
+		double ex, ey;
+		if (std::abs(b) > 1e-12) {
+			ex = l_big - d; ey = b;
+		} else {
+			ex = (a >= d) ? 1.0 : 0.0; ey = (a >= d) ? 0.0 : 1.0;
+		}
+		const double en = std::hypot(ex, ey); ex /= en; ey /= en;
+		const double sx = -ey, sy = ex; // tight (orthogonal) axis
+		const double disp = 2.2 * std::sqrt(l_small); // a fixed pixel magnitude
+		// Probe relative to zhat itself => r0 == the displacement, no base-residual contamination.
+		const double d2_tight = mahalanobis2(zA, SA, (double)zA[0] + disp * sx, (double)zA[1] + disp * sy);
+		const double d2_loose = mahalanobis2(zA, SA, (double)zA[0] + disp * ex, (double)zA[1] + disp * ey);
+		INFO("d2_tight=" << d2_tight << " d2_loose=" << d2_loose << " ratio=" << d2_tight / d2_loose);
+		// Same |r| is "farther" on the tight axis, by EXACTLY the anisotropy ratio (the load-bearing claim).
+		CHECK(d2_tight == Approx(2.2 * 2.2).epsilon(1e-6));               // disp²/λ_small == 2.2² on the tight axis
+		CHECK(d2_loose == Approx(2.2 * 2.2 / aniso_ratio).epsilon(1e-6)); // and disp²/λ_big on the loose axis
+		CHECK(d2_tight / d2_loose == Approx(aniso_ratio).epsilon(1e-6));  // ratio == λ_big/λ_small (== 1 if isotropic)
+	}
+
+	// (3) COVARIANCE HONESTY: a partial fold of a SINGLE in-gate LED must keep the orientation covariance
+	// strictly LARGER than a full multi-LED fold from the same state — the filter does not manufacture
+	// confidence from one LED (it "grows covariance honestly", per the design). Compare two clones.
+	double Pfull6[36], Ppart6[36];
+	{
+		auto kf_full = KalmanFusionInterface::create();
+		auto kf_part = KalmanFusionInterface::create();
+		int64_t ts2 = 1000000;
+		double t2 = 0.0;
+		eskf_bootstrap(kf_full.get(), ts2, t2);
+		int64_t ts3 = 1000000;
+		double t3 = 0.0;
+		eskf_bootstrap(kf_part.get(), ts3, t3);
+		double no = 0.0;
+		for (; t2 < 1.0;) {
+			GTPose g = gt_pose(t2);
+			xrt_vec3 a = gen_accel_body(g.q, gt_accel_world(t2));
+			xrt_vec3 gy = to_xrt_vec3(gt_gyro_body(t2));
+			feed_imu(kf_full.get(), ts2, a, gy);
+			feed_imu(kf_part.get(), ts3, a, gy);
+			t2 += imu_dt; t3 += imu_dt; ts2 += imu_dt_ns; ts3 += imu_dt_ns;
+			if (t2 >= no) {
+				no += 1.0 / 60.0;
+				// full: all visible LEDs; partial: exactly ONE LED in one view.
+				eskf_feed_leds(kf_full.get(), ts2, gt_pose(t2), led, cam, view, rng, 1.5, 0);
+				std::vector<LEDObservation> one = visible_obs(gt_pose(t3), led, cam[0]);
+				if (!one.empty()) {
+					one.resize(1);
+					kf_part->process_led_observations(ts3, one, view[0], nullptr, 8.0f, true, nullptr);
+				}
+			}
+		}
+		REQUIRE(kf_full->debug_get_pose_covariance(Pfull6));
+		REQUIRE(kf_part->debug_get_pose_covariance(Ppart6));
+	}
+	// Orientation covariance trace (indices 3..5 of the 6x6 [pos,ori] block).
+	const double ori_full = Pfull6[3 * 6 + 3] + Pfull6[4 * 6 + 4] + Pfull6[5 * 6 + 5];
+	const double ori_part = Ppart6[3 * 6 + 3] + Ppart6[4 * 6 + 4] + Ppart6[5 * 6 + 5];
+	INFO("ori cov trace full=" << ori_full << " partial(1-LED)=" << ori_part);
+	CHECK(ori_part > ori_full); // 1-LED partial fold => honestly larger uncertainty than the full fold
+	CHECK(std::isfinite(ori_part));
+	CHECK(ori_part > 0.0);
+}
+
+//! Gather the visible LEDs for a view at GT pose @p gt as noise-free observations (no gate, no noise).
+static std::vector<xrt::auxiliary::tracking::LEDObservation>
+visible_obs(const GTPose &gt, const LedModel &led, const Cam &cam)
+{
+	std::vector<xrt::auxiliary::tracking::LEDObservation> obs;
+	for (size_t k = 0; k < led.pos.size(); k++) {
+		V3 pw = gt.p + q_rot(gt.q, led.pos[k]);
+		V3 nw = q_rot(gt.q, led.normal[k]);
+		double u, v;
+		if (dot(nw, pw - cam.C) < 0 && project_px(cam, world_to_cam(cam, pw), u, v)) {
+			xrt::auxiliary::tracking::LEDObservation o;
+			o.observed_px = xrt_vec2{(float)u, (float)v};
+			o.led_obj = to_xrt_vec3(led.pos[k]);
+			obs.push_back(o);
+		}
+	}
+	return obs;
+}
+
+TEST_CASE("kalman: iterated per-LED update converges closer than a single step from a far prior")
+{
+	// A/B: a single Gauss-Newton step vs the iterated (IEKF) update on the SAME far-but-unimodal,
+	// WEAK-prior fold. The prior is a large ORIENTATION error (the nonlinear DOF: orientation enters the
+	// reprojection via R[led_obj]_x, so one linearization at a far angle under-corrects). We drift the
+	// orientation ~25 deg with NO optical for >0.5 s, so the fold's re-acquisition inflation makes the
+	// prior covariance large and KNOWN (LOST_POS_VAR=(1.5 m)^2, LOST_ORI_VAR=(1 rad)^2): the measurement
+	// then dominates, which is exactly the regime where the linearization point matters. Then:
+	//  - SINGLE step: computed in-test from the prior pose + that known inflated 6x6 P, one EKF step
+	//    dx = P H^T (H P H^T + R)^-1 r applied to the prior -> its orientation error. This equals the
+	//    filter's FIRST GN iteration (same P0, same H at the prior).
+	//  - ITERATED: feed the SAME frame to the filter (which relinearizes) -> its post-fold error.
+	// The iterated result must converge strictly closer in orientation than the single step.
+	using xrt::auxiliary::tracking::LEDObservation;
+	const LedModel led = make_led_model();
+	const Cam cam[2] = {make_cam(-0.06), make_cam(+0.06)};
+	const LEDCameraView view[2] = {make_view(cam[0]), make_view(cam[1])};
+	const double imu_dt = 1.0 / 200.0;
+	const int64_t imu_dt_ns = (int64_t)(imu_dt * 1e9);
+
+	// The prior error is pure YAW (about world up): the gravity-tilt anchor constrains roll+pitch but NOT
+	// yaw, so a yaw drift is a clean unimodal far prior the anchor will not fight. Stereo makes depth (and
+	// thus the full pose) observable, so orientation-to-truth is a meaningful convergence metric. A >0.5 s
+	// dropout inflates P to the known LOST values (weak prior) so the measurement dominates — the regime
+	// where a single linearization under-corrects and the IEKF helps.
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+	int64_t ts = 1000000;
+	double t = 0.0;
+
+	const GTPose g_true{V3{0.0, 0.0, 1.45}, Q{1, 0, 0, 0}};
+	const xrt_vec3 a_rest = make_accel_body(to_xrt_quat(g_true.q), ZERO_VEC);
+	for (int i = 0; i < 80; i++) { // lock on at the truth
+		feed_pose(kf.get(), ts, to_xrt_vec3(g_true.p), to_xrt_quat(g_true.q));
+		feed_imu(kf.get(), ts, a_rest, ZERO_VEC);
+		ts += imu_dt_ns;
+	}
+	// Drift ~40 deg of YAW (about world up = body Y at identity) with NO optical for >0.5 s.
+	const double drift_rad = 40.0 * M_PI / 180.0;
+	const double drift_dur = 0.7; // > OPTICAL_FREEZE (0.5 s) -> fold inflates P to the LOST values
+	const double rate = drift_rad / drift_dur;
+	for (double td = 0.0; td < drift_dur; td += imu_dt) {
+		feed_imu(kf.get(), ts, a_rest, xrt_vec3{0.0f, (float)rate, 0.0f});
+		ts += imu_dt_ns;
+		t += imu_dt;
+	}
+	xrt_space_relation rel{};
+	kf->get_prediction(ts, &rel, nullptr);
+	const Q fq = from_xrt_quat(rel.pose.orientation);
+	const V3 fp{rel.pose.position.x, rel.pose.position.y, rel.pose.position.z};
+	const double prior_ang = q_angle_between(fq, g_true.q);
+	INFO("far prior orientation error = " << prior_ang * 180.0 / M_PI << " deg");
+	CHECK(prior_ang > 10.0 * M_PI / 180.0); // genuinely far
+
+	// SINGLE-STEP reference (= the filter's first GN iteration): the KNOWN inflated prior P (LOST diagonal,
+	// cross-terms ~0 after a rest drift), one JOINT EKF step over BOTH views: dx = P H^T (H P H^T + R)^-1 r
+	// at the prior, applied once. Anything beyond this is iteration.
+	double P6[36] = {0};
+	const double LOST_POS_VAR = 1.5 * 1.5, LOST_ORI_VAR = 1.0 * 1.0;
+	for (int d = 0; d < 3; d++) {
+		P6[d * 6 + d] = LOST_POS_VAR;
+	}
+	for (int d = 3; d < 6; d++) {
+		P6[d * 6 + d] = LOST_ORI_VAR;
+	}
+	const double R_px = 1.5 * 1.5;
+	std::vector<std::array<double, 12>> Hs; // 2x6 numeric Jacobians (both views)
+	std::vector<std::array<double, 2>> rs;  // residuals at the prior (both views)
+	std::vector<std::pair<int, V3>> led_view; // (view index, led_obj) for the post-step reprojection
+	for (int v = 0; v < 2; v++) {
+		for (const LEDObservation &o : visible_obs(g_true, led, cam[v])) {
+			V3 lo{o.led_obj.x, o.led_obj.y, o.led_obj.z};
+			double u_hat, v_hat;
+			if (!reproject_filter(view[v], fp, fq, lo, u_hat, v_hat)) {
+				continue;
+			}
+			std::array<double, 12> H;
+			numeric_H(view[v], fp, fq, lo, H.data());
+			Hs.push_back(H);
+			rs.push_back({(double)o.observed_px.x - u_hat, (double)o.observed_px.y - v_hat});
+			led_view.push_back({v, lo});
+		}
+	}
+	const int m = (int)Hs.size();
+	REQUIRE(m >= 6);
+	cv::Mat Hm((int)(2 * m), 6, CV_64F), rm((int)(2 * m), 1, CV_64F);
+	for (int i = 0; i < m; i++) {
+		for (int c = 0; c < 6; c++) {
+			Hm.at<double>(2 * i + 0, c) = Hs[i][0 * 6 + c];
+			Hm.at<double>(2 * i + 1, c) = Hs[i][1 * 6 + c];
+		}
+		rm.at<double>(2 * i + 0, 0) = rs[i][0];
+		rm.at<double>(2 * i + 1, 0) = rs[i][1];
+	}
+	cv::Mat P6m(6, 6, CV_64F, P6);
+	cv::Mat PHt = P6m * Hm.t();                 // 6 x 2m
+	cv::Mat S = Hm * PHt + cv::Mat::eye(2 * m, 2 * m, CV_64F) * R_px;
+	cv::Mat dx = PHt * S.inv() * rm;            // 6 x 1 single EKF step
+	V3 sp{fp.x + dx.at<double>(0), fp.y + dx.at<double>(1), fp.z + dx.at<double>(2)};
+	V3 dth{dx.at<double>(3), dx.at<double>(4), dx.at<double>(5)};
+	double dth_n = std::sqrt(dot(dth, dth));
+	Q sq_ = (dth_n > 1e-12) ? q_norm(q_mul(q_axis(dth, dth_n), fq)) : fq;
+	const double single_ang = q_angle_between(sq_, g_true.q);
+	(void)sp;
+	(void)led_view;
+	INFO("single-step orientation error = " << single_ang * 180.0 / M_PI << " deg");
+
+	// ITERATED: feed the SAME stereo frame to the filter (it relinearizes internally, per view).
+	for (int v = 0; v < 2; v++) {
+		auto obs = visible_obs(g_true, led, cam[v]);
+		kf->process_led_observations(ts, obs, view[v], nullptr, 1000.0f, true, nullptr);
+	}
+	kf->get_prediction(ts, &rel, nullptr);
+	const Q iq = from_xrt_quat(rel.pose.orientation);
+	const double iter_ang = q_angle_between(iq, g_true.q);
+	INFO("prior=" << prior_ang * 180.0 / M_PI << " deg, single-step=" << single_ang * 180.0 / M_PI
+	              << " deg, iterated=" << iter_ang * 180.0 / M_PI << " deg");
+
+	// Strict improvement: the iterated update converges closer to the true orientation than a single step.
+	CHECK(iter_ang < single_ang);
+	CHECK(iter_ang < prior_ang);
+}
+
+TEST_CASE("kalman: iterated update stays in basin (does NOT cross an optical flip)")
+{
+	// The IEKF must descend within the prior's basin only. A 180 deg yaw-flipped optical at a far prior
+	// must NOT be adopted (that would be crossing to the mirror twin). Like the gyro flip-rejection test
+	// but specifically guards the iterated update: feed a flipped per-LED set and confirm orientation
+	// stays with the (correct) prior — no fusion-side flip adoption.
+	const LedModel led = make_led_model();
+	const Cam cam[2] = {make_cam(-0.06), make_cam(+0.06)};
+	const LEDCameraView view[2] = {make_view(cam[0]), make_view(cam[1])};
+	const double imu_dt = 1.0 / 200.0;
+	const int64_t imu_dt_ns = (int64_t)(imu_dt * 1e9);
+
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+	std::mt19937 rng(0x2468);
+	int64_t ts = 1000000;
+	double t = 0.0;
+	// Hold a fixed identity-ish pose at rest so the gyro stays a valid flip reference.
+	const GTPose g_true{V3{0.1, 0.0, 1.45}, Q{1, 0, 0, 0}};
+	const xrt_vec3 a_rest = make_accel_body(to_xrt_quat(g_true.q), ZERO_VEC);
+	for (int i = 0; i < 20; i++) {
+		feed_pose(kf.get(), ts, to_xrt_vec3(g_true.p), to_xrt_quat(g_true.q));
+		ts += imu_dt_ns;
+	}
+	double next_opt = 0.0;
+	for (; t < 1.0;) {
+		feed_imu(kf.get(), ts, a_rest, ZERO_VEC);
+		t += imu_dt;
+		ts += imu_dt_ns;
+		if (t >= next_opt) {
+			next_opt += 1.0 / 60.0;
+			eskf_feed_leds(kf.get(), ts, g_true, led, cam, view, rng, 1.0, 0);
+		}
+	}
+	xrt_space_relation rel{};
+	kf->get_prediction(ts, &rel, nullptr);
+	REQUIRE(quat_abs_dot(rel.pose.orientation, to_xrt_quat(g_true.q)) > 0.99f);
+
+	// Now feed the 180-deg yaw-flipped constellation (a mirror twin) for several frames.
+	const Q q_flip = q_mul(q_axis(V3{0, 1, 0}, M_PI), g_true.q);
+	const GTPose g_flip{g_true.p, q_norm(q_flip)};
+	for (int f = 0; f < 20; f++) {
+		feed_imu(kf.get(), ts, a_rest, ZERO_VEC);
+		t += imu_dt;
+		ts += imu_dt_ns;
+		eskf_feed_leds(kf.get(), ts, g_flip, led, cam, view, rng, 1.0, 0);
+	}
+	kf->get_prediction(ts, &rel, nullptr);
+	const float dot_true = quat_abs_dot(rel.pose.orientation, to_xrt_quat(g_true.q));
+	const float dot_flip = quat_abs_dot(rel.pose.orientation, to_xrt_quat(g_flip.q));
+	INFO("after flipped LEDs: dot_true=" << dot_true << " dot_flip=" << dot_flip);
+	CHECK(dot_true > 0.7f);  // stayed in the correct basin
+	CHECK(dot_flip < 0.7f);  // did NOT adopt the mirror twin
+}
+
+TEST_CASE("kalman: NIS consistency on synthetic data sits within the chi-square band")
+{
+	// Average per-DOF NIS must sit near 1 (the chi-square 95% band for 2-DOF folds is ~[0.025, 3.69]
+	// per DOF; we assert the MEAN over many folds is comfortably inside, i.e. neither over- nor
+	// under-confident). A death-spiral / over-tight covariance would push it far above; a wildly
+	// inflated one far below.
+	using xrt::auxiliary::tracking::LEDObservation;
+	const LedModel led = make_led_model();
+	const Cam cam[2] = {make_cam(-0.06), make_cam(+0.06)};
+	const LEDCameraView view[2] = {make_view(cam[0]), make_view(cam[1])};
+	const double imu_dt = 1.0 / 200.0;
+	const int64_t imu_dt_ns = (int64_t)(imu_dt * 1e9);
+	const double PX = 1.5; // matches LED_PIXEL_STD so R is correctly specified -> NIS is meaningful
+
+	double nis_sum = 0.0;
+	int runs = 0;
+	for (int run = 0; run < 12; run++) {
+		auto kf = KalmanFusionInterface::create();
+		std::mt19937 rng(0x7000 + run);
+		int64_t ts = 1000000;
+		double t = 0.0;
+		eskf_bootstrap(kf.get(), ts, t);
+		double next_opt = 0.0;
+		while (t < 3.0) {
+			GTPose g = gt_pose(t);
+			feed_imu(kf.get(), ts, gen_accel_body(g.q, gt_accel_world(t)),
+			         to_xrt_vec3(gt_gyro_body(t)));
+			t += imu_dt;
+			ts += imu_dt_ns;
+			if (t >= next_opt) {
+				next_opt += 1.0 / 60.0;
+				eskf_feed_leds(kf.get(), ts, gt_pose(t), led, cam, view, rng, PX, 0);
+			}
+		}
+		double mean_per_dof = -1.0, last = -1.0;
+		int n = kf->debug_get_nis_stats(&mean_per_dof, &last);
+		REQUIRE(n > 0);
+		REQUIRE(std::isfinite(mean_per_dof));
+		REQUIRE(std::isfinite(last));
+		nis_sum += mean_per_dof;
+		runs++;
+	}
+	REQUIRE(runs > 0);
+	const double avg = nis_sum / runs;
+	INFO("avg per-DOF NIS over " << runs << " runs = " << avg << " (ideal ~1)");
+	// Chi-square 95% per-DOF band is roughly [0.2, 2.5] for the mean of many folds; assert well inside.
+	CHECK(avg > 0.2);
+	CHECK(avg < 2.5);
+}
+
+TEST_CASE("kalman: weak-DOF covariance floor keeps depth uncertainty from collapsing")
+{
+	// The per-LED reprojection barely constrains depth-along-the-camera-ray; a standard EKF reports that
+	// direction as ever-shrinking. The floor must keep the position covariance's SMALLEST eigenvalue at
+	// or above the physical floor (1 cm)^2 even after a long, well-observed run — so the gate never
+	// over-tightens into the death-spiral.
+	const LedModel led = make_led_model();
+	const Cam cam[2] = {make_cam(-0.06), make_cam(+0.06)};
+	const LEDCameraView view[2] = {make_view(cam[0]), make_view(cam[1])};
+	const double imu_dt = 1.0 / 200.0;
+	const int64_t imu_dt_ns = (int64_t)(imu_dt * 1e9);
+
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+	std::mt19937 rng(0x0FF1CE);
+	int64_t ts = 1000000;
+	double t = 0.0;
+	eskf_bootstrap(kf.get(), ts, t);
+	double next_opt = 0.0;
+	while (t < 4.0) {
+		GTPose g = gt_pose(t);
+		feed_imu(kf.get(), ts, gen_accel_body(g.q, gt_accel_world(t)), to_xrt_vec3(gt_gyro_body(t)));
+		t += imu_dt;
+		ts += imu_dt_ns;
+		if (t >= next_opt) {
+			next_opt += 1.0 / 60.0;
+			eskf_feed_leds(kf.get(), ts, gt_pose(t), led, cam, view, rng, 1.5, 0);
+		}
+	}
+	double cov[9];
+	REQUIRE(kf->debug_get_position_covariance(cov));
+	// Smallest eigenvalue of the 3x3 symmetric position covariance via cv.
+	cv::Matx33d P(cov[0], cov[1], cov[2], cov[3], cov[4], cov[5], cov[6], cov[7], cov[8]);
+	cv::Vec3d evals;
+	cv::eigen(P, evals); // descending
+	const double min_ev = evals[2];
+	const double floor = 0.01 * 0.01; // PFLOOR_POS = (1 cm)^2
+	INFO("min position covariance eigenvalue = " << min_ev << " (floor " << floor << ")");
+	CHECK(min_ev >= floor * 0.95); // not collapsed below the weak-DOF floor
+	CHECK(min_ev < 0.25);          // and not absurdly inflated (still a real estimate)
+
+	// The floor must also keep the FULL joint 6x6 pose covariance PSD: floor_weak_dof lifts only the
+	// marginal position/orientation 3x3 blocks, so it must add a block-PSD delta (never touch the cross-
+	// terms in a way that breaks definiteness). Guards the D2 audit concern that a marginal-block floor
+	// could leave the joint P indefinite (it does not — the lift is positive-semidefinite).
+	double P6[36];
+	REQUIRE(kf->debug_get_pose_covariance(P6));
+	cv::Mat P6m(6, 6, CV_64F);
+	for (int r = 0; r < 6; r++)
+		for (int c = 0; c < 6; c++)
+			P6m.at<double>(r, c) = P6[r * 6 + c];
+	cv::Mat ev6;
+	cv::eigen(P6m, ev6); // symmetric -> real eigenvalues, descending
+	const double min6 = ev6.at<double>(5);
+	INFO("min pose(6x6) covariance eigenvalue = " << min6);
+	CHECK(min6 >= -1e-9); // full joint pose covariance stays PSD after the weak-DOF floor
+}
+
+// F1 regression: the per-LED reprojection orientation Jacobian H_theta MUST use the GLOBAL (world/left)
+// angular-error convention dpi*(-R_cw*[R*led_obj]_x), matching the filter's inject/propagation/gravity/pose
+// channels. The body/local form dpi*(-R_cw*R*[led_obj]_x) coincides only at R≈I (so it self-masks on
+// trajectories that converge to identity) and is invisible to S=HPH^T+R when P_theta is isotropic (the
+// orthogonal R cancels). It is NOT invisible to an end-to-end fold either, because the iterated EKF
+// converges through a wrong-magnitude-but-descent gain — so neither the suite's trajectories nor a
+// behavioural fold catch it. We therefore pin H_theta DIRECTLY: at a clearly non-identity tracked
+// orientation, the filter's analytic H must match a GLOBAL finite-difference and must NOT match the LOCAL
+// one. (The two finite-differences are required to genuinely differ here, so the test has teeth.)
+TEST_CASE("kalman: per-LED H_theta uses the global orientation-error convention (F1 regression)")
+{
+	using xrt::auxiliary::tracking::LEDObservation;
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+	const LedModel led = make_led_model();
+	const Cam cam[2] = {make_cam(-0.06), make_cam(+0.06)};
+	const LEDCameraView view[2] = {make_view(cam[0]), make_view(cam[1])};
+	std::mt19937 rng(0xF1F1);
+
+	// Drive to a well-tracked, clearly NON-identity orientation (identity hides the bug).
+	const double imu_dt = 1.0 / 200.0;
+	const int64_t imu_dt_ns = (int64_t)(imu_dt * 1e9);
+	int64_t ts = 1000000;
+	double t = 0.0;
+	eskf_bootstrap(kf.get(), ts, t);
+	double next_opt = 0.0;
+	const double t_stop = 2.6; // gt_pose yaw+pitch+roll are all sizeable here
+	for (; t < t_stop;) {
+		GTPose g = gt_pose(t);
+		feed_imu(kf.get(), ts, gen_accel_body(g.q, gt_accel_world(t)), to_xrt_vec3(gt_gyro_body(t)));
+		t += imu_dt;
+		ts += imu_dt_ns;
+		if (t >= next_opt) {
+			next_opt += 1.0 / 60.0;
+			eskf_feed_leds(kf.get(), ts, gt_pose(t), led, cam, view, rng, 1.0, 0);
+		}
+	}
+	xrt_space_relation rel{};
+	kf->get_prediction(ts, &rel, nullptr);
+	const V3 fp{rel.pose.position.x, rel.pose.position.y, rel.pose.position.z};
+	const Q fq = from_xrt_quat(rel.pose.orientation);
+	REQUIRE(2.0 * std::acos(std::min(1.0, std::fabs(fq.w))) > 0.3); // > ~17 deg from identity
+
+	// A front-facing, in-FOV LED for view 0 (so H_theta is well-excited).
+	int li = -1;
+	for (size_t k = 0; k < led.pos.size(); k++) {
+		V3 pw = fp + q_rot(fq, led.pos[k]);
+		V3 nw = q_rot(fq, led.normal[k]);
+		double u, v;
+		if (dot(nw, pw - cam[0].C) < 0 && project_px(cam[0], world_to_cam(cam[0], pw), u, v)) {
+			li = (int)k;
+			break;
+		}
+	}
+	REQUIRE(li >= 0);
+
+	LEDObservation o;
+	o.led_obj = to_xrt_vec3(led.pos[li]);
+	o.observed_px = xrt_vec2{0, 0};
+	double zhat[2], Hf[12]; // the filter's analytic 2x6 [pos(3), world-ori(3)]
+	REQUIRE(kf->debug_predict_led_jacobian(o, view[0], zhat, Hf));
+
+	double Hg[12];
+	numeric_H(view[0], fp, fq, led.pos[li], Hg); // GLOBAL finite-difference (left-multiply)
+	double Hl[12];                               // LOCAL finite-difference (right-multiply: q (x) exp(dtheta_body))
+	for (int r = 0; r < 2; r++) {
+		for (int c = 0; c < 3; c++) {
+			Hl[r * 6 + c] = Hg[r * 6 + c]; // position columns are convention-independent
+		}
+	}
+	const double ht = 1e-5;
+	for (int c = 0; c < 3; c++) {
+		V3 axis{c == 0 ? 1.0 : 0.0, c == 1 ? 1.0 : 0.0, c == 2 ? 1.0 : 0.0};
+		Q qp = q_norm(q_mul(fq, q_axis(axis, ht)));
+		Q qm = q_norm(q_mul(fq, q_axis(axis, -ht)));
+		double up, vp, um, vm;
+		reproject_filter(view[0], fp, qp, led.pos[li], up, vp);
+		reproject_filter(view[0], fp, qm, led.pos[li], um, vm);
+		Hl[0 * 6 + 3 + c] = (up - um) / (2.0 * ht);
+		Hl[1 * 6 + 3 + c] = (vp - vm) / (2.0 * ht);
+	}
+	auto ori_diff = [](const double A[12], const double B[12]) {
+		double s = 0;
+		for (int r = 0; r < 2; r++)
+			for (int c = 3; c < 6; c++) {
+				double d = A[r * 6 + c] - B[r * 6 + c];
+				s += d * d;
+			}
+		return std::sqrt(s);
+	};
+	const double gl = ori_diff(Hg, Hl); // global-vs-local (px/rad): must be large -> the test has teeth
+	INFO("ori |Hg-Hl|=" << gl << "  |Hf-Hg|=" << ori_diff(Hf, Hg) << "  |Hf-Hl|=" << ori_diff(Hf, Hl));
+	REQUIRE(gl > 5.0);                    // the two conventions genuinely differ at this pose
+	CHECK(ori_diff(Hf, Hg) < 0.05 * gl);  // filter matches the GLOBAL finite-difference
+	CHECK(ori_diff(Hf, Hl) > 0.5 * gl);   // filter does NOT match the LOCAL (buggy) convention
+}
+
+// ---------------------------------------------------------------------------
+// B3a: out-of-sequence (late/reordered) IMU samples are folded, not dropped
+// ---------------------------------------------------------------------------
+
+namespace {
+
+//! Body-frame accel reading for sample index @p i of a non-trivial trajectory: a strongly TIME-VARYING
+//! world acceleration along +X (a square wave + DC). Sharp per-sample variation is essential — constant
+//! (or smoothly ramping) accel dead-reckoning is near-exact under resampling, so dropping a sample would
+//! barely move the state and the "teeth" check would be vacuous. A square wave makes each sample's exact
+//! contribution distinct, so omitting one is clearly visible while folding it in order is exact.
+xrt_vec3
+b3a_accel_at(int i)
+{
+	const float ax = ((i % 2 == 0) ? 12.0f : -12.0f) + 2.0f; // ±12 square wave on a +2 DC drift
+	return make_accel_body(IDENTITY_QUAT, {ax, 0.0f, 0.0f});
+}
+
+//! Establish a solid stationary lock at the origin so the filter is tracked with an anchor in place.
+void
+b3a_lock(KalmanFusionInterface *kf, int64_t &t)
+{
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	for (int i = 0; i < 80; i++) {
+		feed_pose(kf, t, ZERO_VEC, IDENTITY_QUAT);
+		feed_imu(kf, t + DT_NS / 2, accel_rest, ZERO_VEC); // async so the rest sample actually integrates
+		t += DT_NS;
+	}
+}
+
+} // namespace
+
+TEST_CASE("kalman: a reordered late IMU sample folds exactly as if it had arrived in order (OOSM)")
+{
+	// The core B3a guarantee: a single IMU sample delivered OUT OF ORDER (a lagged BT packet) must be
+	// rewound into the buffer and folded, leaving the filter in the SAME state as if it had arrived in
+	// sequence — not silently dropped. Two filters are driven with the identical sample stream; one
+	// in-order, one with a mid-stream sample delayed past several later samples. Their final predictions
+	// must agree to tight tolerance. A third filter that simply OMITS the late sample must NOT agree —
+	// proving the OOSM path genuinely incorporates the sample's inertial information rather than no-op'ing.
+	auto in_order = KalmanFusionInterface::create();
+	auto reordered = KalmanFusionInterface::create();
+	auto dropped = KalmanFusionInterface::create();
+	REQUIRE(in_order != nullptr);
+
+	int64_t t = 1000000;
+	int64_t t2 = 1000000;
+	int64_t t3 = 1000000;
+	b3a_lock(in_order.get(), t);
+	b3a_lock(reordered.get(), t2);
+	b3a_lock(dropped.get(), t3);
+	REQUIRE(t == t2);
+
+	// A run of (time-varying) accelerating IMU samples (no optical, pure dead-reckon, so every sample shapes
+	// the result and each one's distinct accel matters).
+	const int N = 40;
+	std::vector<int64_t> ts(N);
+	for (int i = 0; i < N; i++) {
+		ts[i] = t + (int64_t)i * DT_NS;
+	}
+
+	// (A) In order.
+	for (int i = 0; i < N; i++) {
+		feed_imu(in_order.get(), ts[i], b3a_accel_at(i), ZERO_VEC);
+	}
+
+	// (B) Reordered: hold back sample index `late` and deliver it AFTER index late+lag (out of sequence).
+	const int late = 18, lag = 6;
+	for (int i = 0; i < N; i++) {
+		if (i == late) {
+			continue; // delay it
+		}
+		feed_imu(reordered.get(), ts[i], b3a_accel_at(i), ZERO_VEC);
+		if (i == late + lag) {
+			// the late packet finally arrives carrying ITS OWN (sample-`late`) accel, out of order
+			feed_imu(reordered.get(), ts[late], b3a_accel_at(late), ZERO_VEC);
+		}
+	}
+
+	// (C) Dropped: never deliver the late sample at all (the OLD silent-drop behaviour).
+	for (int i = 0; i < N; i++) {
+		if (i == late) {
+			continue;
+		}
+		feed_imu(dropped.get(), ts[i], b3a_accel_at(i), ZERO_VEC);
+	}
+
+	const int64_t when = ts[N - 1];
+	xrt_space_relation r_in{}, r_re{}, r_drop{};
+	in_order->get_prediction(when, &r_in, nullptr);
+	reordered->get_prediction(when, &r_re, nullptr);
+	dropped->get_prediction(when, &r_drop, nullptr);
+
+	REQUIRE(std::isfinite(r_re.pose.position.x));
+	// The reordered filter matches the in-order filter to tight tolerance (it folded the late sample in
+	// sequence via the rewind-replay).
+	CHECK(r_re.pose.position.x == Approx(r_in.pose.position.x).margin(1e-4));
+	CHECK(r_re.pose.position.y == Approx(r_in.pose.position.y).margin(1e-4));
+	CHECK(r_re.pose.position.z == Approx(r_in.pose.position.z).margin(1e-4));
+	CHECK(quat_abs_dot(r_re.pose.orientation, r_in.pose.orientation) > 0.99999f);
+
+	// The test has teeth: omitting that one sample DOES move the state, so matching it is meaningful.
+	CHECK(std::abs(r_drop.pose.position.x - r_in.pose.position.x) > 1e-3);
+}
+
+TEST_CASE("kalman: an out-of-horizon late IMU sample is folded best-effort without destabilising")
+{
+	// A late sample older than the rewind horizon (the OOSM anchor) cannot be replayed exactly, but its
+	// inertial information is real and a power-limited link cannot spare it — so it is folded best-effort
+	// (clamped to the horizon) rather than discarded. The contract under test is STABILITY: such a sample
+	// must never spike, NaN, or unbound the filter. A stationary controller stays put and tracked.
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+
+	int64_t t = 1000000;
+	const xrt_vec3 home = {0.3f, 0.8f, -0.2f};
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	for (int i = 0; i < 120; i++) {
+		feed_pose(kf.get(), t, home, IDENTITY_QUAT);
+		feed_imu(kf.get(), t + DT_NS / 2, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+	// Advance the clock a long way on pure IMU so the anchor/horizon is firmly behind `t`.
+	for (int i = 0; i < 400; i++) {
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+	xrt_space_relation before{};
+	kf->get_prediction(t, &before, nullptr);
+	REQUIRE(std::isfinite(before.pose.position.x));
+
+	// Inject a sample stamped 5 s in the PAST (far older than any anchor): a pathological reordering.
+	feed_imu(kf.get(), t - 5LL * 1000 * 1000 * 1000, accel_rest, ZERO_VEC);
+
+	xrt_space_relation after{};
+	kf->get_prediction(t, &after, nullptr);
+	REQUIRE(std::isfinite(after.pose.position.x));
+	REQUIRE(std::isfinite(after.pose.position.y));
+	REQUIRE(std::isfinite(after.pose.orientation.w));
+	// No spike: a stationary controller stays near home (the stale sample carried rest data; even mis-timed
+	// it cannot fling the pose).
+	CHECK(after.pose.position.x == Approx(home.x).margin(0.1));
+	CHECK(after.pose.position.y == Approx(home.y).margin(0.1));
+	CHECK(after.pose.position.z == Approx(home.z).margin(0.1));
+
+	// And the filter keeps working afterwards: good optical re-locks cleanly.
+	for (int i = 0; i < 60; i++) {
+		feed_pose(kf.get(), t, home, IDENTITY_QUAT);
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+	xrt_space_relation recov{};
+	kf->get_prediction(t, &recov, nullptr);
+	CHECK(recov.pose.position.x == Approx(home.x).margin(0.05));
+	CHECK((recov.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0);
+}
+
+// ---------------------------------------------------------------------------
+// Render-time acceleration damping (smooth without lagging real motion)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("kalman: render-time accel contribution is damped more at longer horizons (dt-dependent)")
+{
+	// The render-time extrapolation attenuates the 1/2 a dt^2 acceleration term by a factor that GROWS with
+	// the horizon dt (and with accel uncertainty), so an undamped noisy acceleration cannot amplify into
+	// visible jitter over a longer frame-ahead. This test isolates that property: with a fixed estimated
+	// acceleration, the EFFECTIVE acceleration recovered from the prediction (back out the velocity term,
+	// divide by 1/2 dt^2) must DECREASE as the horizon lengthens. Undamped, it would be flat.
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+
+	int64_t t = 1000000;
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	for (int i = 0; i < 120; i++) { // lock at rest at the origin (well-tracked, low covariance)
+		feed_pose(kf.get(), t, ZERO_VEC, IDENTITY_QUAT);
+		feed_imu(kf.get(), t + DT_NS / 2, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+	// Inject a single non-zero accel sample so m_accel_world is a known, fixed value at prediction time.
+	const double a_true = 3.0; // m/s^2 along +X (a transient the render-extrapolation would lean on)
+	feed_imu(kf.get(), t + DT_NS / 2, make_accel_body(IDENTITY_QUAT, {(float)a_true, 0.f, 0.f}), ZERO_VEC);
+	t += DT_NS;
+
+	auto pred_x = [&](int64_t dt_ns) {
+		xrt_space_relation rel{};
+		kf->get_prediction(t + dt_ns, &rel, nullptr);
+		return std::make_pair((double)rel.pose.position.x, (double)rel.linear_velocity.x);
+	};
+	// Effective accel at horizon dt: a_eff = (x(dt) - x(0) - v(0)*dt) / (1/2 dt^2). With damping a_eff shrinks
+	// as dt grows; undamped it equals the estimated accel at every dt.
+	auto a_eff = [&](int64_t dt_ns) {
+		const double dt = time_ns_to_s(dt_ns);
+		const auto p0 = pred_x(0);
+		const auto pd = pred_x(dt_ns);
+		return (pd.first - p0.first - p0.second * dt) / (0.5 * dt * dt);
+	};
+	const double a_short = a_eff(10LL * 1000 * 1000); // 10 ms
+	const double a_long = a_eff(80LL * 1000 * 1000);  // 80 ms
+	INFO("a_eff short(10ms)=" << a_short << "  a_eff long(80ms)=" << a_long << "  a_true=" << a_true);
+	// Damping is real and dt-dependent: the long-horizon effective accel is strictly, substantially smaller.
+	REQUIRE(a_short > 0.0);
+	CHECK(a_long < 0.85 * a_short); // longer horizon -> markedly less 1/2 a dt^2
+	// Not vacuously zero: a short-horizon prediction still leans on the acceleration (no over-damping near now).
+	CHECK(a_short > 0.4 * a_true);
+}
+
+TEST_CASE("kalman: render-time extrapolation stays smooth under noisy acceleration (no jitter amplification)")
+{
+	// A controller moving at a smooth constant velocity, its accelerometer corrupted with alternating-sign
+	// noise. The TRUE acceleration is ~0, so any reported acceleration is noise. Predicted at a render-ahead
+	// horizon every frame, the prediction must stay smooth (bounded jump beyond the true constant-velocity
+	// step) and not lag — the velocity carries it, the damped accel term cannot inject the full noise wobble.
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+
+	const double vx = 1.0; // m/s, smooth constant velocity along +X
+	const double noise_a = 1.0; // m/s^2 alternating accel noise (realistic controller scale; spectral floor ~0.05)
+	const int64_t render_ahead = 30LL * 1000 * 1000; // 30 ms render horizon (a realistic frame-ahead query)
+	int64_t t = 1000000;
+	double x = 0.0;
+	const int64_t t0 = t;
+	auto true_x = [&](int64_t when) { return vx * time_ns_to_s(when - t0); };
+
+	// Establish smooth constant-velocity tracking (clean accel) so velocity is well estimated. IMU is
+	// asynchronous to optical (distinct timestamp), as in reality, so each accel sample actually integrates.
+	for (int i = 0; i < 250; i++) {
+		feed_pose(kf.get(), t, {(float)x, 0.f, 0.f}, IDENTITY_QUAT);
+		feed_imu(kf.get(), t + DT_NS / 2, make_accel_body(IDENTITY_QUAT, ZERO_VEC), ZERO_VEC);
+		x += vx * DT_S;
+		t += DT_NS;
+	}
+
+	// Inject alternating accel noise and query the prediction at the render horizon every step.
+	double prev_pred_x = 0.0;
+	bool have_prev = false;
+	double max_excess_jump = 0.0; // prediction jump beyond the true per-step displacement
+	double max_lag = 0.0;         // |predicted - true| at the render horizon
+	const double true_step = vx * DT_S;
+	for (int i = 0; i < 300; i++) {
+		feed_pose(kf.get(), t, {(float)x, 0.f, 0.f}, IDENTITY_QUAT);
+		const float an = (i % 2 == 0) ? (float)noise_a : -(float)noise_a;
+		feed_imu(kf.get(), t + DT_NS / 2, make_accel_body(IDENTITY_QUAT, {an, 0.f, 0.f}), ZERO_VEC);
+		x += vx * DT_S;
+		t += DT_NS;
+
+		xrt_space_relation rel{};
+		kf->get_prediction(t + render_ahead, &rel, nullptr);
+		REQUIRE(std::isfinite(rel.pose.position.x));
+		if (i > 50) { // after the noise regime settles
+			if (have_prev) {
+				const double jump = std::abs((double)rel.pose.position.x - prev_pred_x);
+				max_excess_jump = std::max(max_excess_jump, jump - true_step);
+			}
+			max_lag = std::max(max_lag, std::abs((double)rel.pose.position.x - true_x(t + render_ahead)));
+			prev_pred_x = rel.pose.position.x;
+			have_prev = true;
+		}
+	}
+
+	// Smoothness: the excess jump beyond the smooth true step stays small (sub-millimetre), so the noisy
+	// accel does not wobble the render-extrapolated pose; velocity carries it, accel is damped down.
+	INFO("max excess jump (m) = " << max_excess_jump << ", max lag (m) = " << max_lag);
+	CHECK(max_excess_jump < 0.001); // < 1 mm of jitter injected by the noisy accel
+	// Lag: the prediction still follows the true motion within a small bound.
+	CHECK(max_lag < 0.03);
+}
+
+TEST_CASE("kalman: render-time extrapolation does not over-damp a genuine acceleration")
+{
+	// The damping must shrink NOISE, not real signal. A device under a strong, clean, sustained
+	// acceleration has a confident large acceleration estimate (||a||^2 >> its variance), so the render-time
+	// extrapolation must retain essentially the full 1/2 a dt^2 term — the predicted pose must lead the
+	// current position by close to the true ballistic displacement, not collapse to velocity-only.
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+
+	const double ax = 6.0; // m/s^2, strong clean acceleration along +X
+	const int64_t render_ahead = 40LL * 1000 * 1000; // 40 ms render horizon
+	int64_t t = 1000000;
+	double x = 0.0, v = 0.0;
+
+	// Anchor at rest, then drive a clean constant +X acceleration with matching optical so the filter has a
+	// confident acceleration + velocity estimate (low covariance).
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	for (int i = 0; i < 60; i++) {
+		feed_pose(kf.get(), t, ZERO_VEC, IDENTITY_QUAT);
+		feed_imu(kf.get(), t + DT_NS / 2, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+	const xrt_vec3 accel_moving = make_accel_body(IDENTITY_QUAT, {(float)ax, 0.f, 0.f});
+	for (int i = 0; i < 250; i++) { // 0.5 s of clean acceleration with consistent optical (async IMU)
+		feed_pose(kf.get(), t, {(float)x, 0.f, 0.f}, IDENTITY_QUAT);
+		feed_imu(kf.get(), t + DT_NS / 2, accel_moving, ZERO_VEC);
+		v += ax * DT_S;
+		x += v * DT_S;
+		t += DT_NS;
+	}
+
+	// Prediction at `t` (dt~0) gives the current estimate; at the render horizon it must lead it by the
+	// ballistic displacement v*dt + 1/2 a dt^2, NOT merely the velocity-only v*dt.
+	xrt_space_relation now{}, ahead{};
+	kf->get_prediction(t, &now, nullptr);
+	kf->get_prediction(t + render_ahead, &ahead, nullptr);
+	REQUIRE(std::isfinite(ahead.pose.position.x));
+
+	const double dt = time_ns_to_s(render_ahead);
+	const double v_est = now.linear_velocity.x;
+	const double lead = (double)ahead.pose.position.x - (double)now.pose.position.x;
+	const double vel_only = v_est * dt;          // displacement if the accel term were fully damped away
+	const double ballistic = v_est * dt + 0.5 * ax * dt * dt; // full constant-accel displacement
+	INFO("lead=" << lead << " vel_only=" << vel_only << " ballistic=" << ballistic << " v_est=" << v_est);
+	// The accel term contributes 1/2 a dt^2 = 0.5*6*0.04^2 = 4.8 mm on top of the velocity step. The
+	// prediction must retain most of it (not over-damped): well past the velocity-only displacement and
+	// close to the full ballistic one.
+	CHECK(lead > vel_only + 0.6 * (ballistic - vel_only)); // kept >= 60% of the genuine accel term
+	CHECK(lead == Approx(ballistic).margin(0.003));        // within 3 mm of the full ballistic extrapolation
 }

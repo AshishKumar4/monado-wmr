@@ -65,7 +65,10 @@ wmr_camera_set_ctrl_exposure_gain(struct wmr_camera *cam, uint8_t camera_id, uin
 #define DEFAULT_SLAM_EXPOSURE 6000
 #define DEFAULT_SLAM_GAIN 127
 #define DEFAULT_CTRL_EXPOSURE 0x0190
-#define DEFAULT_CTRL_GAIN 0x0001
+/* The sensor's documented minimum usable gain (valid range 16-255). Below this floor the constellation
+ * reads too dim (~54 peak, barely above the blob threshold) even at full LED drive. */
+#define WMR_MIN_GAIN 16
+#define DEFAULT_CTRL_GAIN WMR_MIN_GAIN
 
 #define WMR_FRAMETYPE_SLAM 0x0
 #define WMR_FRAMETYPE_CONTROLLER 0x2

@@ -5,9 +5,7 @@
  * @file
  * @brief  Tightly-coupled controller fusion: a purpose-built error-state Kalman
  *         filter (ESKF) over the controller 6-DOF pose, IMU and per-LED
- *         constellation reprojection. Replaces the prior flexkalman UKF + per-LED
- *         measurement, which death-spiralled live (fixed-pixel gate trapped a
- *         drifted state -> no folds -> IMU runaway -> reset to origin -> repeat).
+ *         constellation reprojection.
  *
  *         The LED 3D positions in the controller frame are KNOWN (firmware
  *         constellation model), so this is not SLAM: a direct ESKF with
@@ -77,6 +75,7 @@ namespace {
 	using Eigen::Vector2d;
 	using Eigen::Vector3d;
 	using Mat3 = Eigen::Matrix3d;
+	using Mat3RowMajor = Eigen::Matrix<double, 3, 3, Eigen::RowMajor>; //!< for mapping persisted row-major 3x3
 	using Mat15 = Eigen::Matrix<double, 15, 15>;
 	using Vec15 = Eigen::Matrix<double, 15, 1>;
 	using MatX = Eigen::MatrixXd;
@@ -108,6 +107,51 @@ namespace {
 		m << 0, -v.z(), v.y(), v.z(), 0, -v.x(), -v.y(), v.x(), 0;
 		return m;
 	}
+
+	//! Precomputed per-view geometry+intrinsics for the per-LED reprojection (built once per frame).
+	struct LedViewCache
+	{
+		Mat3 R_cw;       //!< world->camera rotation
+		Vector3d t_cw;   //!< world->camera translation
+		double fx, fy, cx, cy;
+	};
+
+	//! SINGLE SOURCE OF TRUTH for the per-LED reprojection model: given the pose (R = R(q), p), the view
+	//! and the LED's object point, return the predicted pixel zhat and the 2x15 measurement Jacobian H
+	//! (nonzero in the position + global-orientation blocks). Both fold_led_observations and
+	//! predict_led_gate (and the IEKF relinearization) call THIS, so the projection and the Jacobian can
+	//! never drift apart. Math: docs/ESKF-DESIGN.md 4a.
+	inline void
+	led_project_jacobian(const LedViewCache &vc,
+	                     const Mat3 &R,
+	                     const Vector3d &p,
+	                     const Vector3d &led_obj,
+	                     Vector2d &zhat,
+	                     Eigen::Matrix<double, 2, 15> &H)
+	{
+		const Vector3d p_world = p + R * led_obj;
+		const Vector3d p_cam = vc.R_cw * p_world + vc.t_cw;
+		const double zc = (p_cam.z() > 1e-6) ? p_cam.z() : 1e-6;
+		zhat[0] = vc.fx * (p_cam.x() / zc) + vc.cx;
+		zhat[1] = vc.fy * (p_cam.y() / zc) + vc.cy;
+		// GLOBAL (world-frame, left) angular error δθ: R_true = exp(δθ) R, matching inject/F/gravity/pose.
+		// p_world = p + R·led_obj ⇒ ∂p_world/∂δθ = skew(δθ)·(R·led_obj) = −skew(R·led_obj)·δθ, so
+		// H = dpi · [ R_cw | 0 | −R_cw [R·led_obj]_x | 0 | 0 ]. The body-frame form −R_cw·R·[led_obj]_x is
+		// the LOCAL convention — wrong here; the two coincide only at R≈I.
+		Eigen::Matrix<double, 2, 3> dpi;
+		dpi << vc.fx / zc, 0.0, -vc.fx * p_cam.x() / (zc * zc), 0.0, vc.fy / zc,
+		    -vc.fy * p_cam.y() / (zc * zc);
+		H.setZero();
+		H.block<2, 3>(0, EP) = dpi * vc.R_cw;
+		H.block<2, 3>(0, ET) = dpi * (-vc.R_cw * skew(R * led_obj));
+	}
+
+	//! Plausible-scaling band for an IMU-intrinsics correction (the online accel-ellipsoid fit T, and the
+	//! offline-persisted M_g / T_a loaded at the trust boundary). A physical correction is a SMALL scaling —
+	//! per-axis scale a few %, misalignment a few deg — so every singular value lies near 1. These generous
+	//! bounds (-20%/+25%) sit far outside any genuine correction yet reject a garbage/corrupt matrix.
+	constexpr double INTRINSICS_SV_MIN = 0.8;
+	constexpr double INTRINSICS_SV_MAX = 1.25;
 
 	//! Full accelerometer ellipsoid calibration: given bias-corrected at-rest samples @p v that span
 	//! orientations, find the symmetric correction T (per-axis scale + misalignment) such that the
@@ -153,11 +197,35 @@ namespace {
 		// T = g·√A (symmetric). |T·v| = g·√(vᵀ A v) = g at rest.
 		const Mat3 T = g * (es.eigenvectors() * ev.cwiseSqrt().asDiagonal() * es.eigenvectors().transpose());
 		const Vector3d evT = Eigen::SelfAdjointEigenSolver<Mat3>(T).eigenvalues();
-		if (evT(0) < 0.8 || evT(2) > 1.25) {
+		if (evT(0) < INTRINSICS_SV_MIN || evT(2) > INTRINSICS_SV_MAX) {
 			return false; // a real correction is a small scaling; reject a wild (bad-data) fit
 		}
 		T_out = T;
 		return true;
+	}
+
+	//! A correction matrix is APPLICABLE only if it is finite and its singular values lie in the plausible
+	//! scaling band (INTRINSICS_SV_MIN/MAX) — i.e. it is non-degenerate (positive singular values =>
+	//! invertible, no sign flip / null axis) and not wildly out of range. The narrow trust-boundary guard at
+	//! the external-calibration seam.
+	inline bool
+	is_plausible_intrinsics(const Mat3 &M)
+	{
+		if (!M.allFinite()) {
+			return false;
+		}
+		const Vector3d sv = M.jacobiSvd().singularValues();
+		return sv(2) >= INTRINSICS_SV_MIN && sv(0) <= INTRINSICS_SV_MAX;
+	}
+
+	//! A persisted IMU-intrinsics matrix is "real" (worth applying/persisting) only if it is finite and
+	//! deviates from identity by more than a small numeric floor: an absent/identity calibration must leave
+	//! the channel uncorrected so there is no regression. The floor (~0.1% / ~0.06deg) is far below any
+	//! genuine scale (~1%) or misalignment (~3deg) the offline tool reports, yet rejects round-trip noise.
+	inline bool
+	is_real_correction(const Mat3 &M)
+	{
+		return M.allFinite() && (M - Mat3::Identity()).cwiseAbs().maxCoeff() > 1e-3;
 	}
 
 	//! Rotation vector -> unit quaternion (exp map). Small-angle safe.
@@ -349,8 +417,11 @@ namespace {
 		double angular_velocity[3]; //!< world-frame, last sample
 		double acceleration[3];     //!< world-frame incl. gravity, last sample
 		double last_good_position[3];
+		double body_lock_offset[3]; //!< controller-minus-HMD (world) at the last position-observable fold
 		double position_var_max;    //!< largest eigenvalue of P[EP,EP] (m^2): worst-direction variance
 		double orientation_var_max; //!< largest eigenvalue of P[ET,ET] (rad^2): worst-direction variance
+		double acceleration_var_max; //!< largest eigenvalue of P[EBA,EBA] ((m/s^2)^2): worst-direction accel-bias
+		                             //!< variance, the dominant uncertainty of the world accel used to render-extrapolate
 		timepoint_ns filter_time_ns;
 		timepoint_ns last_optical_ns;
 		bool tracked;
@@ -358,11 +429,12 @@ namespace {
 		bool position_tracked;
 		bool orientation_valid;
 		bool orientation_tracked;
+		bool body_lock_valid; //!< body_lock_offset is meaningful (a fold supplied a live HMD pose)
 	};
 
 	//! A complete copy of the mutable filter state, to rewind for out-of-sequence
 	//! (lagged) optical measurements. The ESKF carries a full covariance, so the
-	//! checkpoint includes P (unlike the old block-diagonal UKF checkpoint).
+	//! checkpoint includes P.
 	struct FilterCheckpoint
 	{
 		NominalState nominal;
@@ -370,6 +442,7 @@ namespace {
 		Vector3d accel_world{0, 0, 0};
 		Vector3d angvel_world{0, 0, 0};
 		Vector3d last_good_position{0, 0, 0};
+		Vector3d body_lock_offset{0, 0, 0};
 		timepoint_ns filter_time_ns{0};
 		timepoint_ns last_imu_ns{0};
 		timepoint_ns last_optical_ns{0};
@@ -378,6 +451,7 @@ namespace {
 		TrackingInfo position_state;
 		int imu_anomaly_count{0};
 		bool tracked{false};
+		bool body_lock_valid{false};
 	};
 
 	//! One buffered IMU sample retained for out-of-sequence replay.
@@ -414,7 +488,8 @@ namespace {
 		process_pose(const struct xrt_pose_sample *sample,
 		             const struct xrt_vec3 *position_variance_optional,
 		             const struct xrt_vec3 *orientation_variance_optional,
-		             const float residual_limit) override;
+		             const float residual_limit,
+		             const struct xrt_pose *hmd_world_pose) override;
 
 		float
 		process_led_observations(const timepoint_ns timestamp_ns,
@@ -422,10 +497,28 @@ namespace {
 		                         const LEDCameraView &view,
 		                         const struct xrt_vec2 *pixel_variance,
 		                         const float max_innov_px,
-		                         const bool feed) override;
+		                         const bool feed,
+		                         const struct xrt_pose *hmd_world_pose) override;
 
 		void
-		get_prediction(const timepoint_ns when_ns, struct xrt_space_relation *out_relation) override;
+		get_prediction(const timepoint_ns when_ns,
+		               struct xrt_space_relation *out_relation,
+		               const struct xrt_pose *hmd_world_pose) override;
+
+		bool
+		predict_led_gate(const LEDObservation &obs,
+		                 const LEDCameraView &view,
+		                 float out_zhat[2],
+		                 float out_S[4]) override;
+
+		bool
+		debug_predict_led_jacobian(const LEDObservation &obs,
+		                           const LEDCameraView &view,
+		                           double out_zhat[2],
+		                           double out_H[12]) override;
+
+		int
+		debug_get_nis_stats(double *mean_per_dof, double *last_per_dof) override;
 
 		bool
 		get_pose_uncertainty(double *position_std, double *orientation_std) override
@@ -448,6 +541,9 @@ namespace {
 
 		bool
 		debug_get_position_covariance(double cov_row_major[9]) override;
+
+		bool
+		debug_get_pose_covariance(double cov6_row_major[36]) override;
 
 		double
 		debug_get_accel_scale() override
@@ -497,6 +593,49 @@ namespace {
 			return true;
 		}
 
+		//! Seed the optically-derived IMU intrinsics (offline-computed, persisted per serial). Applied
+		//! immediately so the very first samples are corrected. A matrix at/near identity is treated as
+		//! "no correction" (the channel stays uncorrected — no regression). Math: the gyro correction is
+		//! exactly the M imu_calib_from_optical.py fits (phi_optical = M·∫gyro dt); the accel correction is
+		//! the ellipsoid T_a seeding m_accel_T. Call before tracking starts.
+		void
+		set_imu_intrinsics(const double gyro_correction[9], const double accel_correction[9]) override
+		{
+			std::lock_guard<std::mutex> lock(m_filter_lock);
+			// Trust boundary: these matrices come from external per-controller calibration. Apply a channel
+			// only if it is a real correction AND sane (finite, non-degenerate, in the plausible scaling
+			// band); an identity/absent channel stays uncorrected (no regression), and a corrupt one falls
+			// back to identity with one warning rather than poisoning the integration.
+			auto apply_channel = [](const double src[9], const char *name, Mat3 &dst, bool &valid) {
+				const Mat3 M = Eigen::Map<const Mat3RowMajor>(src);
+				if (!is_real_correction(M)) {
+					return; // identity/absent: leave the channel uncorrected
+				}
+				if (!is_plausible_intrinsics(M)) {
+					U_LOG_W("ESKF: rejecting implausible %s IMU-intrinsics calibration - using identity", name);
+					return;
+				}
+				dst = M;
+				valid = true;
+			};
+			apply_channel(gyro_correction, "gyro", m_gyro_M, m_gyro_M_valid);
+			// A valid accel ellipsoid supersedes the scalar scale + suppresses the online ellipsoid fit.
+			apply_channel(accel_correction, "accel", m_accel_T, m_accel_T_valid);
+		}
+
+		//! Read back the currently-applied IMU intrinsics for the driver to persist. Returns false when
+		//! neither channel is a real correction (nothing worth caching).
+		bool
+		get_imu_intrinsics(double gyro_correction[9], double accel_correction[9]) override
+		{
+			std::lock_guard<std::mutex> lock(m_filter_lock);
+			Eigen::Map<Mat3RowMajor> mg(gyro_correction);
+			Eigen::Map<Mat3RowMajor> ta(accel_correction);
+			mg = m_gyro_M;
+			ta = m_accel_T;
+			return m_gyro_M_valid || m_accel_T_valid;
+		}
+
 		void
 		add_ui(void *root, const char *device_name) override;
 
@@ -514,7 +653,7 @@ namespace {
 		//! roll+pitch absolutely (2-DOF) INDEPENDENT of optical — it bleeds gyro tilt-drift and keeps
 		//! orientation correct through optical-sparse / flipping stretches (the daylight case). Yaw still
 		//! needs optical. GRAV_VAR is the unit-vector measurement variance (loose: the gyro leads
-		//! short-term, gravity slowly anchors). Replaces the old m_imu_3dof gravity correction.
+		//! short-term, gravity slowly anchors).
 		static constexpr double GRAV_BAND = 0.6;       //!< ||accel|-g| tolerance (m/s^2) to trust as gravity
 		static constexpr double GRAV_VAR = 0.02;       //!< gravity-direction unit-vector measurement var
 		//! Gravity anchor also requires near-stationarity: an accelerometer cannot tell "tilted at rest"
@@ -559,13 +698,38 @@ namespace {
 		static constexpr double LED_PIXEL_STD = 1.5;
 		//! Per-LED robustness as two confidence levels (the real knobs); the chi-square thresholds are
 		//! DERIVED from them via chi2inv_2dof. GATE = acceptance confidence (covariance-aware via S_i, so
-		//! it widens automatically as the filter grows uncertain — the self-recovery the old gate lacked);
+		//! it widens automatically as the filter grows uncertain, so a transiently-drifted state recovers);
 		//! HUBER = where the robust kernel starts down-weighting (R inflated by sqrt(d2/HUBER), a bend not
 		//! a hard cut). GATE must be looser than HUBER (gate >= huber confidence).
 		static constexpr double GATE_CONFIDENCE = 0.99;
 		static constexpr double HUBER_CONFIDENCE = 0.95;
 		static inline const double CHI2_GATE_2DOF = chi2inv_2dof(GATE_CONFIDENCE);  // 9.21
 		static inline const double HUBER_DELTA2 = chi2inv_2dof(HUBER_CONFIDENCE);   // 5.99
+		//! Iterated EKF (Gauss-Newton) per-LED update. A standard EKF linearizes H once at the PRIOR; for a
+		//! far/weak prior that point is poor and one step under-corrects. When the prior's reprojection
+		//! residual is large, relinearize H at the updated estimate and re-solve (IEKF) for better
+		//! convergence into the SAME basin (it cannot jump basins — that is what gives the gyro flip-veto its
+		//! soundness). Trigger off the residual normalized by the MEASUREMENT noise R (per DOF), not by S:
+		//! S grows with an inflated P and would mask a genuinely-far prior. Threshold = the Huber knee per
+		//! DOF (the same "this fold is stressed" level the robust kernel already uses — no new knob). Normal
+		//! small-residual folds take exactly one step (cheap); a stressed fold iterates until the GN step
+		//! converges or the cap is hit.
+		static inline const double IEKF_TRIGGER_RES_PER_DOF = HUBER_DELTA2 / 2.0; // per-DOF (R is 2-DOF/LED)
+		static constexpr int IEKF_MAX_ITERS = 3;          //!< extra Gauss-Newton steps beyond the first
+		static constexpr int IEKF_MAX_BACKTRACK = 4;      //!< max step-halvings in the line search per iter
+		static constexpr double IEKF_CONVERGED_DX = 1e-4; //!< stop once a step barely moves the state
+		//! Weak-DOF covariance floor (covariance honesty, docs/CONSTELLATION-DATA-ASSOCIATION §0). A per-LED
+		//! reprojection barely constrains depth-along-the-ray and roll-about-the-ray, yet a standard EKF
+		//! reports those directions as confidently shrinking -> over-tight chi-square gates -> it rejects the
+		//! truth. Floor the smallest eigenvalue of the position and orientation P blocks
+		//! after each optical fold so no direction can collapse below the genuine single-view uncertainty.
+		//! Position floor ~ a few px of depth error at arm's length; orientation floor a small angle. These
+		//! are LOWER bounds only (never tighten a larger P), so they never fight a well-observed direction.
+		static constexpr double PFLOOR_POS = sq(0.01);  //!< 1 cm: min position std on the weak (depth) DOF
+		static constexpr double PFLOOR_ORI = sq(deg2rad(0.5)); //!< 0.5 deg: min orientation std on the weak (roll-about-ray) DOF
+		//! NIS consistency ring: keep the last N folds' normalized innovation squared per DOF so a consumer/
+		//! test can confirm the filter is neither over- nor under-confident (mean per-DOF NIS ~ 1).
+		static constexpr int NIS_RING = 64;
 		//! Divergence: if at least REANCHOR_NMIN LEDs are matched but fewer than this FRACTION pass the
 		//! gate, the PREDICTION is wrong (not the LEDs) -> re-anchor + inflate P, never reset to origin.
 		static constexpr int REANCHOR_NMIN = 4;
@@ -623,12 +787,28 @@ namespace {
 		//! during them the few-LED PnP keeps proposing mirror flips. Trusting the gyro this long rejects
 		//! those flips through the gap; past it (a true re-acquisition) the optical orientation is adopted.
 		static constexpr int64_t FLIP_GUARD_TRUST_NS = ms_to_ns(3000);
-		//! Hard physical sanity bound on an adopted optical position. An LED-constellation-tracked
-		//! controller is within head-camera range of the HMD (~arm's reach); a pose hundreds of metres out
-		//! is a degenerate few-blob PnP, never a real position. Reject such poses outright (don't fold,
-		//! don't re-anchor) so a garbage solve can't snap the filter away. Generous (head-excursion +
-		//! reach) so it never clips real motion — it only catches the math artifacts.
-		static constexpr double MAX_PLAUSIBLE_POS_M = 4.0;
+		//! How long the out-of-view body-lock hold may keep reporting POSITION_TRACKED before the controller
+		//! is declared abandoned (set down) and dropped to UNTRACKED. The hold rides brief occlusion (fix,
+		//! don't reject); past this it would be a lie. Sized at 2x the routine-occlusion ceiling (optical
+		//! dropouts during fast play are routinely <= FLIP_GUARD_TRUST_NS = 3 s), so a fast Beat Saber /
+		//! room-roam controller out of view at arm's reach for short bursts always keeps tracking, and only a
+		//! genuinely set-down one (out of view this long) drops.
+		static constexpr int64_t BODY_LOCK_ABANDON_NS = 2 * FLIP_GUARD_TRUST_NS;
+		//! Hard physical sanity bound on the controller-to-HMD distance. An LED-constellation-tracked
+		//! controller is within the head cameras' range — physically a head-relative arm's reach — so a
+		//! candidate whose distance FROM THE LIVE HMD exceeds this is a degenerate few-blob PnP, never a
+		//! real position; reject it (don't fold, don't re-anchor) so a garbage solve can't snap the filter
+		//! away. Bounding the HEAD-RELATIVE distance (not the world-origin distance) is room-roam-invariant:
+		//! roaming carries head + controller together, so a legitimate room-scale pose far from the world
+		//! origin is never wrongly rejected. Generous (full extension + slack) so it only catches artifacts.
+		//! Reused as the body-lock trust bound (an out-of-view controller is only ridden with the head while
+		//! its last offset is within reach).
+		static constexpr double MAX_CONTROLLER_REACH_M = 1.5;
+		//! World-origin fallback bound used ONLY when no live HMD pose is available (standalone use; head
+		//! pose not yet valid). Without a head reference the head-relative distance cannot be measured, so the
+		//! gate degrades to the world-origin distance — kept generous (room excursion + reach) so it never
+		//! clips a legitimate room-scale pose, while still catching the hundreds-of-metres degenerate solves.
+		static constexpr double MAX_WORLD_POS_M = 4.0;
 		//! Plausibility bounds for PERSISTING the cross-session IMU calibration. A real MEMS gyro/accel
 		//! bias is far below these; a larger converged estimate means this session tracked poorly (e.g. a
 		//! controller with daylight optical flips) and mis-attributed the error to bias — never persist
@@ -668,6 +848,28 @@ namespace {
 		//! Time of the last successful per-LED fold; gates process_pose's measurement mode (see above).
 		timepoint_ns m_last_led_fold_ns{0};
 
+		//! BODY-LOCK out-of-view reporting. When position stops being optically observable the controller
+		//! is reported riding the LIVE HMD pose at its last controller-to-HMD offset (NOT a world dead-reckon,
+		//! NOT a world-frame freeze): report = hmd_world(live) + m_body_lock_offset. The offset is the
+		//! controller-minus-HMD vector captured at the last POSITION-OBSERVABLE fold; while observable it is
+		//! refreshed every fold, so out-of-view we ride the most recent good geometry. Valid only once such a
+		//! fold has supplied an HMD pose; falls back to the world-frame hold when invalid or no live HMD pose.
+		bool m_body_lock_valid{false};
+		Vector3d m_body_lock_offset{0, 0, 0};
+		//! Per-optical-op HMD world position, set under m_filter_lock by process_pose / process_led_observations
+		//! before the fold/integrate so the offset capture + the controller-to-HMD adoption gate read it
+		//! without threading it through every helper signature. Cleared (invalid) when no HMD pose is supplied.
+		bool m_hmd_pos_valid{false};
+		Vector3d m_hmd_pos{0, 0, 0};
+
+		//! NIS consistency telemetry: a small ring of the last folds' mean per-DOF NIS (d^2 / dof). For a
+		//! correctly-tuned filter this averages ~1; persistently >>1 means over-confident (P too small),
+		//! <<1 means under-confident. Exposed via debug_get_nis_stats for the consistency test + live checks.
+		double m_nis_ring[NIS_RING] = {0};
+		int m_nis_count{0};   //!< total folds recorded (saturates the running mean once > NIS_RING)
+		int m_nis_head{0};    //!< next ring slot
+		double m_last_nis_per_dof{0.0}; //!< most recent fold's mean per-DOF NIS
+
 		//! Latest PnP pose (bootstrap + divergence re-anchor reference). Not fed as a steady-state
 		//! measurement (that would double-count the LEDs the per-LED fold already uses).
 		xrt_pose m_pnp_pose{};
@@ -692,9 +894,20 @@ namespace {
 
 		//! Full accelerometer ellipsoid calibration (per-axis scale + misalignment), fit from at-rest
 		//! samples spanning orientations. When valid it replaces the scalar scale: f = m_accel_T·(a_m-ba).
+		//! Also the target the offline-persisted accel ellipsoid seeds (set_imu_intrinsics), so it applies
+		//! from the first sample instead of waiting for the rarely-occurring online rest-orientation spread.
 		Mat3 m_accel_T{Mat3::Identity()};
 		bool m_accel_T_valid{false};
 		std::vector<Vector3d> m_accel_cal_dirs; //!< distinct-orientation rest samples accumulated for the fit
+
+		//! Gyro INTRINSIC correction M_g: corrected body rate = M_g·(gyro_meas - bg). One 3x3 carrying gyro
+		//! scale (singular values) AND gyro->device misalignment (orthogonal part) — exactly the M the
+		//! offline tool (imu_calib_from_optical.py) fits from phi_optical = M·∫gyro dt (single source of
+		//! truth). Identity until set_imu_intrinsics seeds the persisted offline calibration (no online
+		//! estimator: the measured scale is ~1.0 and there is no well-conditioned online misalignment
+		//! signal — the robust path is offline-compute + persist + apply). Identity => gyro uncorrected.
+		Mat3 m_gyro_M{Mat3::Identity()};
+		bool m_gyro_M_valid{false};
 
 		//! Cross-session IMU calibration prior (loaded from disk by the driver, keyed per controller serial).
 		//! The converged gyro/accel bias + accel scale are quasi-constant per unit, so seeding the first
@@ -776,8 +989,66 @@ namespace {
 		                      const struct xrt_vec2 *pixel_variance,
 		                      float max_innov_px,
 		                      int *out_seen);
+		//! Build the per-frame view cache (extrinsic + intrinsics) once from a LEDCameraView.
+		static LedViewCache
+		make_view_cache(const LEDCameraView &view);
+		//! Record one fold's joint NIS into the consistency ring (d2 = r^T S^-1 r over @p dof DOF).
+		void
+		record_nis(double d2, int dof);
+		//! Lower-bound the smallest eigenvalue of the position + orientation P blocks (weak-DOF floor) so a
+		//! per-LED fold cannot collapse depth-along-ray / roll-about-ray to false confidence. Lift-only.
+		void
+		floor_weak_dof();
+		//! Largest eigenvalue of the position covariance (worst-direction variance, m^2). Lets a fold tell
+		//! whether it actually constrained position (a depth-blind 1-2 LED fold leaves it inflated).
+		double
+		position_var_max() const;
+		//! True iff the most recent fold drove position uncertainty below LOST_POS_VAR — i.e. it constrained
+		//! position, not just orientation/tilt. Gates the position-freshness clock + the body-lock capture.
+		bool
+		position_observable() const
+		{
+			return position_var_max() < LOST_POS_VAR;
+		}
+		//! Physical sanity gate on an adopted optical position. With a live HMD pose: the room-roam-invariant
+		//! arm-reach bound on the controller-to-HMD distance. Without one (degraded): the generous world-origin
+		//! bound (can't measure head-relative distance, so don't tighten — only catch the gross degenerates).
+		bool
+		position_plausible(const Vector3d &world_pos) const
+		{
+			return m_hmd_pos_valid ? (world_pos - m_hmd_pos).norm() < MAX_CONTROLLER_REACH_M
+			                       : world_pos.norm() < MAX_WORLD_POS_M;
+		}
+		//! Capture the body-lock offset (controller-minus-HMD, world) from the current state + the op's HMD
+		//! pose. Called on a position-observable fold; no-op (leaves the prior offset) without a live HMD pose.
+		void
+		capture_body_lock()
+		{
+			if (m_hmd_pos_valid) {
+				m_body_lock_offset = m_x.p - m_hmd_pos;
+				m_body_lock_valid = true;
+			}
+		}
+		//! Stash this optical op's live HMD world position for the arm-reach gate + body-lock capture. Caller
+		//! holds m_filter_lock. A null pose degrades the gate to the world-origin distance.
+		void
+		set_op_hmd_pose(const struct xrt_pose *hmd_world_pose)
+		{
+			m_hmd_pos_valid = hmd_world_pose != nullptr;
+			if (m_hmd_pos_valid) {
+				m_hmd_pos = map_vec3(hmd_world_pose->position).cast<double>();
+			}
+		}
 		bool
 		apply_optical_at(timepoint_ns t_pose, const std::function<void()> &apply);
+		//! Fold a late/reordered IMU sample (timestamp <= the filter clock — a lagged BT packet) by the SAME
+		//! rewind-replay the optical OOSM path uses: insert it into the timestamp-sorted IMU log, rewind to the
+		//! anchor, and replay the (now-reordered) log forward, so the sample folds exactly as if it had arrived
+		//! in order. A sample older than the rewind horizon (the anchor) is folded best-effort from the anchor
+		//! rather than discarded — its inertial information is real and a power-limited link cannot spare it.
+		//! Caller holds m_filter_lock.
+		void
+		integrate_late_imu_sample(const xrt_imu_sample &sample);
 		FilterCheckpoint
 		capture_checkpoint() const;
 		void
@@ -829,6 +1100,7 @@ namespace {
 		m_angvel_world.setZero();
 		tracked = false;
 		position_state = TrackingInfo{};
+		m_body_lock_valid = false; // a lost track invalidates the head-relative offset; re-captured on re-lock
 	}
 
 	void
@@ -967,6 +1239,7 @@ namespace {
 		c.accel_world = m_accel_world;
 		c.angvel_world = m_angvel_world;
 		c.last_good_position = last_good_position;
+		c.body_lock_offset = m_body_lock_offset;
 		c.filter_time_ns = filter_time_ns;
 		c.last_imu_ns = m_last_imu_ns;
 		c.last_optical_ns = last_optical_ns;
@@ -975,6 +1248,7 @@ namespace {
 		c.position_state = position_state;
 		c.imu_anomaly_count = m_imu_anomaly_count;
 		c.tracked = tracked;
+		c.body_lock_valid = m_body_lock_valid;
 		return c;
 	}
 
@@ -986,6 +1260,7 @@ namespace {
 		m_accel_world = c.accel_world;
 		m_angvel_world = c.angvel_world;
 		last_good_position = c.last_good_position;
+		m_body_lock_offset = c.body_lock_offset;
 		filter_time_ns = c.filter_time_ns;
 		m_last_imu_ns = c.last_imu_ns;
 		last_optical_ns = c.last_optical_ns;
@@ -994,6 +1269,7 @@ namespace {
 		position_state = c.position_state;
 		m_imu_anomaly_count = c.imu_anomaly_count;
 		tracked = c.tracked;
+		m_body_lock_valid = c.body_lock_valid;
 	}
 
 	void
@@ -1006,14 +1282,21 @@ namespace {
 		Eigen::Map<Vector3d>{s.angular_velocity} = m_angvel_world;
 		Eigen::Map<Vector3d>{s.acceleration} = m_accel_world;
 		Eigen::Map<Vector3d>{s.last_good_position} = last_good_position;
+		Eigen::Map<Vector3d>{s.body_lock_offset} = m_body_lock_offset;
+		s.body_lock_valid = m_body_lock_valid;
 		// Worst-direction (largest-eigenvalue) variance, so a consumer's isotropic n-sigma bound is
 		// conservative in EVERY frame (rotating P can move variance up to its max eigenvalue).
-		s.position_var_max =
-		    Eigen::SelfAdjointEigenSolver<Mat3>(m_P.block<3, 3>(EP, EP), Eigen::EigenvaluesOnly)
-		        .eigenvalues()
-		        .maxCoeff();
+		s.position_var_max = position_var_max();
 		s.orientation_var_max =
 		    Eigen::SelfAdjointEigenSolver<Mat3>(m_P.block<3, 3>(ET, ET), Eigen::EigenvaluesOnly)
+		        .eigenvalues()
+		        .maxCoeff();
+		// Worst-direction accel-bias variance: the world acceleration a_world = R·T_a·(a_m−ba)+G depends on
+		// the accel bias with ∂a_world/∂ba = −R·T_a (orthonormal·scaling ≈ unit), so P[EBA] is the dominant
+		// uncertainty of the acceleration the render-time extrapolation leans on. Published so get_prediction
+		// can damp the accel contribution by its confidence.
+		s.acceleration_var_max =
+		    Eigen::SelfAdjointEigenSolver<Mat3>(m_P.block<3, 3>(EBA, EBA), Eigen::EigenvaluesOnly)
 		        .eigenvalues()
 		        .maxCoeff();
 		s.filter_time_ns = filter_time_ns;
@@ -1137,7 +1420,11 @@ namespace {
 		}
 
 		const Mat3 R = m_x.q.toRotationMatrix();
-		const Vector3d w = w_m - m_x.bg;       // body angular rate, bias-corrected
+		// Body angular rate: subtract bias in the RAW gyro frame (ZARU observes bg there, and the offline
+		// tool fits bias as the gyro-integral intercept), THEN apply the intrinsic correction M_g (gyro
+		// scale + gyro->device misalignment). M_g = I until the offline calibration is seeded -> the gyro is
+		// then uncorrected. This is the SINGLE point where the raw gyro becomes the device-frame rate.
+		const Vector3d w = m_gyro_M * (w_m - m_x.bg);
 		const double am_mag = a_m.norm();      // RAW accel magnitude (bias-independent for scale)
 
 		// Online accel-scale (k = g/|a_m| at stance): bootstrap once on the first low-rotation sample, so
@@ -1197,7 +1484,7 @@ namespace {
 		F.block<3, 3>(EP, EV) = Mat3::Identity();
 		F.block<3, 3>(EV, ET) = -skew(R * f);
 		F.block<3, 3>(EV, EBA) = -R * T_a; // a_world = R*T_a*(a_m-ba)+G -> d/d(ba) = -R*T_a
-		F.block<3, 3>(ET, EBG) = -R;
+		F.block<3, 3>(ET, EBG) = -R * m_gyro_M; // w = M_g*(w_m-bg) -> d(R*w)/d(bg) = -R*M_g (M_g=I default)
 		const Mat15 Phi = Mat15::Identity() + F * dt;
 
 		Mat15 Q = Mat15::Zero();
@@ -1254,7 +1541,7 @@ namespace {
 		// Velocity divergence watchdog: a hand-held controller never exceeds OPTICAL_MAX_SPEED_M_S. A
 		// larger estimated speed means unaided dead-reckoning has diverged (no optical to bound it); clamp
 		// it and re-open the velocity covariance so the reported pose can't fly off and optical re-anchors
-		// hard on return. Physical sanity bound (cf. MAX_PLAUSIBLE_POS_M), not a tuning knob.
+		// hard on return. Physical sanity bound (cf. MAX_CONTROLLER_REACH_M), not a tuning knob.
 		const double speed = m_x.v.norm();
 		if (speed > OPTICAL_MAX_SPEED_M_S) {
 			m_x.v *= OPTICAL_MAX_SPEED_M_S / speed;
@@ -1307,6 +1594,67 @@ namespace {
 	// Per-LED reprojection update (the primary optical measurement)
 	// ---------------------------------------------------------------------------
 
+	LedViewCache
+	EskfFusion::make_view_cache(const LEDCameraView &view)
+	{
+		LedViewCache vc;
+		vc.R_cw = map_quat(view.cam_world_orient).cast<double>().normalized().toRotationMatrix();
+		vc.t_cw = map_vec3(view.cam_world_pos).cast<double>();
+		vc.fx = view.fx;
+		vc.fy = view.fy;
+		vc.cx = view.cx;
+		vc.cy = view.cy;
+		return vc;
+	}
+
+	void
+	EskfFusion::record_nis(double d2, int dof)
+	{
+		if (dof <= 0 || !std::isfinite(d2)) {
+			return;
+		}
+		const double per_dof = d2 / dof;
+		m_last_nis_per_dof = per_dof;
+		m_nis_ring[m_nis_head] = per_dof;
+		m_nis_head = (m_nis_head + 1) % NIS_RING;
+		m_nis_count++;
+	}
+
+	void
+	EskfFusion::floor_weak_dof()
+	{
+		// The per-LED reprojection weakly constrains depth-along-the-ray (position) and roll-about-the-ray
+		// (orientation); a standard EKF under-reports P there, tightening the chi-square gate until it
+		// rejects the truth. Lift the smallest eigenvalue of each block to a physical floor — LOWER bound
+		// only, so a well-observed direction (large eigenvalue) is never tightened. (Symmetric eigensolve;
+		// off the hot path is fine — this runs once per accepted fold.)
+		auto floor_block = [](Mat3 &B, double floor) {
+			Eigen::SelfAdjointEigenSolver<Mat3> es(B);
+			Vector3d ev = es.eigenvalues();
+			if (ev.minCoeff() >= floor) {
+				return; // already above the floor in every direction
+			}
+			ev = ev.cwiseMax(floor);
+			B = es.eigenvectors() * ev.asDiagonal() * es.eigenvectors().transpose();
+		};
+		Mat3 Ppos = m_P.block<3, 3>(EP, EP);
+		Mat3 Pori = m_P.block<3, 3>(ET, ET);
+		floor_block(Ppos, PFLOOR_POS);
+		floor_block(Pori, PFLOOR_ORI);
+		m_P.block<3, 3>(EP, EP) = Ppos;
+		m_P.block<3, 3>(ET, ET) = Pori;
+		m_P = 0.5 * (m_P + m_P.transpose()).eval();
+	}
+
+	double
+	EskfFusion::position_var_max() const
+	{
+		// Worst-direction position variance (largest eigenvalue of the EP block). Caller holds m_filter_lock.
+		return Eigen::SelfAdjointEigenSolver<Mat3>(m_P.block<3, 3>(EP, EP), Eigen::EigenvaluesOnly)
+		    .eigenvalues()
+		    .maxCoeff();
+	}
+
 	int
 	EskfFusion::fold_led_observations(const std::vector<LEDObservation> &obs,
 	                                  const LEDCameraView &view,
@@ -1318,9 +1666,7 @@ namespace {
 		if (pixel_variance != nullptr) {
 			px_var = Vector2d{pixel_variance->x, pixel_variance->y};
 		}
-		const Quaterniond q_cw = map_quat(view.cam_world_orient).cast<double>().normalized();
-		const Mat3 R_cw = q_cw.toRotationMatrix();
-		const Vector3d t_cw = map_vec3(view.cam_world_pos).cast<double>();
+		const LedViewCache vc = make_view_cache(view);
 		const Mat3 R = m_x.q.toRotationMatrix();
 		const double max_innov_sq = (max_innov_px > 0.f) ? double(max_innov_px) * double(max_innov_px) : -1.0;
 
@@ -1335,9 +1681,11 @@ namespace {
 			m_P.block<3, 3>(ET, ET) = Mat3::Identity() * LOST_ORI_VAR;
 		}
 
-		// Collect gated per-LED rows, then apply ONE joint Kalman update (correct cross-correlations).
-		std::vector<Eigen::Matrix<double, 2, 15>> Hs;
-		std::vector<Vector2d> rs;
+		// Gate each LED at the prior (chi-square + Huber), keeping the accepted LEDs' object points + the
+		// measured pixel + effective R for the (possibly iterated) joint solve below. Gating uses the
+		// shared led_project_jacobian — the SAME model the fold/IEKF/predict_led_gate all use.
+		std::vector<Vector3d> led_objs;
+		std::vector<Vector2d> zs;
 		std::vector<Vector2d> Rs;
 		int seen = 0;
 
@@ -1349,30 +1697,17 @@ namespace {
 			}
 			seen++;
 
-			const Vector3d p_world = m_x.p + R * led_obj;
-			const Vector3d p_cam = R_cw * p_world + t_cw;
-			const double zc = (p_cam.z() > 1e-6) ? p_cam.z() : 1e-6;
 			Vector2d zhat;
-			zhat[0] = view.fx * (p_cam.x() / zc) + view.cx;
-			zhat[1] = view.fy * (p_cam.y() / zc) + view.cy;
+			Eigen::Matrix<double, 2, 15> H;
+			led_project_jacobian(vc, R, m_x.p, led_obj, zhat, H);
 			const Vector2d innov = z - zhat;
 			if (!innov.allFinite()) {
 				continue;
 			}
-
 			// Hard mislabel reject (raw pixel innovation), independent of covariance.
 			if (max_innov_sq > 0.0 && innov.squaredNorm() > max_innov_sq) {
 				continue;
 			}
-
-			// Jacobian H = dpi/dp_cam * [ R_cw | 0 | -R_cw R [led_obj]_x | 0 | 0 ]   (global error)
-			Eigen::Matrix<double, 2, 3> dpi;
-			dpi << view.fx / zc, 0.0, -view.fx * p_cam.x() / (zc * zc), 0.0, view.fy / zc,
-			    -view.fy * p_cam.y() / (zc * zc);
-			Eigen::Matrix<double, 2, 15> H = Eigen::Matrix<double, 2, 15>::Zero();
-			H.block<2, 3>(0, EP) = dpi * R_cw;
-			H.block<2, 3>(0, ET) = dpi * (-R_cw * R * skew(led_obj));
-
 			// Covariance-aware (chi-square) gate: S = H P H^T + R. Widens as P grows -> self-recovering.
 			const Eigen::Matrix2d Rmeas = px_var.asDiagonal();
 			const Eigen::Matrix2d S = H * m_P * H.transpose() + Rmeas;
@@ -1389,33 +1724,165 @@ namespace {
 			if (d2 > HUBER_DELTA2) {
 				r_eff *= std::sqrt(d2 / HUBER_DELTA2);
 			}
-			Hs.push_back(H);
-			rs.push_back(innov);
+			led_objs.push_back(led_obj);
+			zs.push_back(z);
 			Rs.push_back(r_eff);
 		}
 
 		if (out_seen != nullptr) {
 			*out_seen = seen;
 		}
-		const int k = (int)Hs.size();
+		const int k = (int)led_objs.size();
 		if (k == 0) {
 			return 0;
 		}
 
-		// Stack into one joint update.
-		MatX H(2 * k, 15);
-		VecX r(2 * k);
+		// Iterated EKF (Gauss-Newton): keep the PRIOR (x0, P0) fixed and refine the estimate. Each step
+		// relinearizes H at the current iterate and re-solves a P0-weighted GN move FROM the prior:
+		//   e_{i+1} = K_i ( z - h(x_i) - H_i e_i ),   K_i = P0 H_i^T (H_i P0 H_i^T + R)^-1
+		// where e_i is the error-state from x0 to the current iterate x_i. Anchored to the prior, the
+		// iteration descends within the prior's basin (it cannot cross to a flipped twin — that is what
+		// keeps the gyro flip-veto sound). A first step with negligible innovation is the ordinary EKF.
+		const NominalState x0 = m_x;       // prior nominal (anchor)
+		const Mat15 P0 = m_P;              // prior covariance
 		MatX Rm = MatX::Zero(2 * k, 2 * k);
 		for (int i = 0; i < k; i++) {
-			H.block<2, 15>(2 * i, 0) = Hs[i];
-			r.segment<2>(2 * i) = rs[i];
 			Rm(2 * i, 2 * i) = Rs[i].x();
 			Rm(2 * i + 1, 2 * i + 1) = Rs[i].y();
 		}
-		if (!ekf_update(H, r, Rm)) {
+
+		// Measurement-data misfit r^T R^-1 r at a given nominal (used to ACCEPT only cost-decreasing GN
+		// steps — a backtracking safeguard so the iterated result is never worse than the single step).
+		auto data_cost = [&](const NominalState &x) {
+			const Mat3 Rr = x.q.toRotationMatrix();
+			double c = 0.0;
+			for (int i = 0; i < k; i++) {
+				Vector2d zhat;
+				Eigen::Matrix<double, 2, 15> Hi;
+				led_project_jacobian(vc, Rr, x.p, led_objs[i], zhat, Hi);
+				const Vector2d ri = zs[i] - zhat;
+				c += ri.x() * ri.x() / Rs[i].x() + ri.y() * ri.y() / Rs[i].y();
+			}
+			return c;
+		};
+
+		Vec15 e = Vec15::Zero();           // accumulated error state x_i (-) x0
+		MatX H(2 * k, 15);
+		VecX r(2 * k);
+		const VecX Rdiag = Rm.diagonal();  // measurement-noise diagonal (for the residual trigger)
+		MatX K;                            // gain at the accepted iterate (for the Joseph covariance update)
+		MatX H_acc(2 * k, 15);             // H at the accepted iterate
+		bool any_ok = false;
+		bool iterate = true;               // decided after the first linearization (residual-vs-R)
+		double prior_nis = 0.0;            // predicted (prior) innovation NIS r0^T S0^-1 r0 for consistency
+		bool prior_nis_ok = false;
+		double best_cost = data_cost(x0);
+		const int max_iters = 1 + IEKF_MAX_ITERS;
+		for (int iter = 0; iter < max_iters; iter++) {
+			const Mat3 Ri = m_x.q.toRotationMatrix();
+			for (int i = 0; i < k; i++) {
+				Vector2d zhat;
+				Eigen::Matrix<double, 2, 15> Hi;
+				led_project_jacobian(vc, Ri, m_x.p, led_objs[i], zhat, Hi);
+				H.block<2, 15>(2 * i, 0) = Hi;
+				r.segment<2>(2 * i) = zs[i] - zhat; // residual at the current iterate
+			}
+			if (iter == 0) {
+				// Decide whether this fold needs iteration: residual normalized by the MEASUREMENT noise
+				// (not S), so an inflated prior P cannot mask a genuinely-far prior. Below the knee -> the
+				// ordinary single EKF step suffices (the common case, kept cheap).
+				double res_per_dof = 0.0;
+				for (int j = 0; j < 2 * k; j++) {
+					res_per_dof += r(j) * r(j) / Rdiag(j);
+				}
+				res_per_dof /= (2 * k);
+				iterate = res_per_dof > IEKF_TRIGGER_RES_PER_DOF;
+			}
+			const MatX PHt = P0 * H.transpose();          // 15 x 2k (prior-weighted)
+			const MatX S = H * PHt + Rm;                   // 2k x 2k
+			const MatX Sinv = S.inverse();
+			if (!Sinv.allFinite()) {
+				break;
+			}
+			if (iter == 0) {
+				// Textbook NIS for consistency = the PRIOR (predicted) innovation, BEFORE any update.
+				prior_nis = r.dot(Sinv * r);
+				prior_nis_ok = true;
+			}
+			const MatX Ki = PHt * Sinv;                   // 15 x 2k
+			Vec15 e_new = Ki * (r - H * e);               // GN step from the prior
+			if (!e_new.allFinite()) {
+				break;
+			}
+			// Backtracking line search: halve the step until the data misfit does not increase (the GN
+			// step can overshoot a far nonlinear prior). Guarantees monotonic improvement over the prior,
+			// so the iterated estimate is never worse than the single (first-step) EKF.
+			NominalState cand = x0;
+			double cand_cost = best_cost;
+			bool accepted = false;
+			Vec15 e_try = e_new;
+			for (int bt = 0; bt < IEKF_MAX_BACKTRACK; bt++) {
+				NominalState xt = x0;
+				m_x = xt;
+				inject(e_try); // m_x = x0 (+) e_try
+				const double c = data_cost(m_x);
+				if (c <= best_cost) {
+					cand = m_x;
+					cand_cost = c;
+					e_new = e_try;
+					accepted = true;
+					break;
+				}
+				e_try = 0.5 * (e + e_try); // backtrack toward the previous accepted iterate
+			}
+			if (iter == 0 && !accepted) {
+				// Even the full first step did not reduce cost (degenerate); take it anyway as the ordinary
+				// EKF result so behaviour matches a plain single-step update.
+				m_x = x0;
+				inject(e_new);
+				cand = m_x;
+				cand_cost = data_cost(m_x);
+				accepted = true;
+			}
+			if (!accepted) {
+				m_x = x0;
+				inject(e); // restore EXACTLY the last accepted iterate before stopping
+				break;     // no further improvement; keep it (K, H_acc already hold its linearization)
+			}
+			const Vec15 step = e_new - e;
+			e = e_new;
+			m_x = cand;
+			K = Ki;
+			H_acc = H;
+			best_cost = cand_cost;
+			any_ok = true;
+			// Stop after the first step unless a stressed fold needs iterating; then iterate until the GN
+			// step converges (or the cap). Re-evaluating H next iter is what gives the far-prior accuracy.
+			if (!iterate || step.norm() < IEKF_CONVERGED_DX) {
+				break;
+			}
+		}
+		if (!any_ok) {
 			U_LOG_E("Non-finite per-LED update - re-anchoring");
+			m_x = x0;
+			m_P = P0;
 			const Vector3d pnp_pos = map_vec3(m_pnp_pose.position).cast<double>();
-			if (m_pnp_valid && pnp_pos.allFinite() && pnp_pos.norm() < MAX_PLAUSIBLE_POS_M) {
+			if (m_pnp_valid && pnp_pos.allFinite() && position_plausible(pnp_pos)) {
+				reanchor(pnp_pos, flip_guard(map_quat(m_pnp_pose.orientation).cast<double>()));
+			} else {
+				reset_filter();
+			}
+			return 0;
+		}
+		// Joseph-form covariance once, at the ACCEPTED iterate: P = (I-KH) P0 (I-KH)^T + K R K^T.
+		const Mat15 IKH = Mat15::Identity() - K * H_acc;
+		m_P = IKH * P0 * IKH.transpose() + K * Rm * K.transpose();
+		m_P = 0.5 * (m_P + m_P.transpose()).eval();
+		if (!m_P.allFinite() || !m_x.p.allFinite() || !std::isfinite(m_x.q.norm())) {
+			m_x = x0;
+			m_P = P0;
+			const Vector3d pnp_pos = map_vec3(m_pnp_pose.position).cast<double>();
+			if (m_pnp_valid && pnp_pos.allFinite() && position_plausible(pnp_pos)) {
 				reanchor(pnp_pos, flip_guard(map_quat(m_pnp_pose.orientation).cast<double>()));
 			} else {
 				reset_filter();
@@ -1423,13 +1890,118 @@ namespace {
 			return 0;
 		}
 
+		if (prior_nis_ok) {
+			record_nis(prior_nis, 2 * k); // predicted-innovation NIS (per-DOF ~ 1 when well tuned)
+		}
+		floor_weak_dof();            // covariance honesty: keep weak DOF from collapsing to false confidence
+
+		// Always: the fold ran, the orientation/tilt improved, and a per-LED fold happened. Orientation
+		// stays observable far longer than position (a single LED still tilts), so its tracked state and
+		// the per-LED-fold clock advance on every accepted fold.
 		tracked = true;
-		position_state.valid = position_state.tracked = true;
 		orientation_state.valid = orientation_state.tracked = true;
-		last_optical_ns = filter_time_ns;
-		last_good_position = m_x.p;
 		m_last_led_fold_ns = filter_time_ns;
+
+		// Only if the fold actually CONSTRAINED position (posterior worst-direction variance below
+		// LOST_POS_VAR): a depth-blind 1-2 LED fold of a controller leaving view barely pins depth-along-ray,
+		// so it must NOT reset the position-freshness clock or move the body-lock hold-point — else the freeze
+		// never fires and the reported pose dead-reckons to metres. A position-constraining fold refreshes the
+		// clock + the world hold + the body-lock offset (controller-minus-HMD) for out-of-view riding.
+		if (position_observable()) {
+			position_state.valid = position_state.tracked = true;
+			last_optical_ns = filter_time_ns;
+			last_good_position = m_x.p;
+			capture_body_lock();
+		}
 		return k;
+	}
+
+	bool
+	EskfFusion::predict_led_gate(const LEDObservation &o,
+	                             const LEDCameraView &view,
+	                             float out_zhat[2],
+	                             float out_S[4])
+	{
+		std::lock_guard<std::mutex> lock(m_filter_lock);
+		if (!tracked) {
+			return false;
+		}
+		const LedViewCache vc = make_view_cache(view);
+		const Mat3 R = m_x.q.toRotationMatrix();
+		const Vector3d led_obj = map_vec3(o.led_obj).cast<double>();
+		Vector2d zhat;
+		Eigen::Matrix<double, 2, 15> H;
+		led_project_jacobian(vc, R, m_x.p, led_obj, zhat, H); // SAME model as fold_led_observations
+		// S = H P H^T + R, with R = LED_PIXEL_STD^2 I (the fold's default measurement noise).
+		const Eigen::Matrix2d Rmeas = Vector2d{LED_PIXEL_STD * LED_PIXEL_STD, LED_PIXEL_STD * LED_PIXEL_STD}.asDiagonal();
+		const Eigen::Matrix2d S = H * m_P * H.transpose() + Rmeas;
+		if (!zhat.allFinite() || !S.allFinite()) {
+			return false;
+		}
+		if (out_zhat != nullptr) {
+			out_zhat[0] = (float)zhat[0];
+			out_zhat[1] = (float)zhat[1];
+		}
+		if (out_S != nullptr) {
+			out_S[0] = (float)S(0, 0);
+			out_S[1] = (float)S(0, 1);
+			out_S[2] = (float)S(1, 0);
+			out_S[3] = (float)S(1, 1);
+		}
+		return true;
+	}
+
+	bool
+	EskfFusion::debug_predict_led_jacobian(const LEDObservation &o,
+	                                       const LEDCameraView &view,
+	                                       double out_zhat[2],
+	                                       double out_H[12])
+	{
+		std::lock_guard<std::mutex> lock(m_filter_lock);
+		if (!tracked) {
+			return false;
+		}
+		const LedViewCache vc = make_view_cache(view);
+		const Mat3 R = m_x.q.toRotationMatrix();
+		const Vector3d led_obj = map_vec3(o.led_obj).cast<double>();
+		Vector2d zhat;
+		Eigen::Matrix<double, 2, 15> H;
+		led_project_jacobian(vc, R, m_x.p, led_obj, zhat, H);
+		if (!zhat.allFinite() || !H.allFinite()) {
+			return false;
+		}
+		if (out_zhat != nullptr) {
+			out_zhat[0] = zhat[0];
+			out_zhat[1] = zhat[1];
+		}
+		if (out_H != nullptr) {
+			// Row-major 2x6 [pos(3), world-orientation(3)] = the [EP,ET] columns of the 2x15 H.
+			for (int r = 0; r < 2; r++) {
+				for (int c = 0; c < 3; c++) {
+					out_H[r * 6 + c] = H(r, EP + c);
+					out_H[r * 6 + 3 + c] = H(r, ET + c);
+				}
+			}
+		}
+		return true;
+	}
+
+	int
+	EskfFusion::debug_get_nis_stats(double *mean_per_dof, double *last_per_dof)
+	{
+		std::lock_guard<std::mutex> lock(m_filter_lock);
+		const int n = std::min(m_nis_count, NIS_RING);
+		if (mean_per_dof != nullptr && n > 0) {
+			double sum = 0.0;
+			for (int i = 0; i < n; i++) {
+				sum += m_nis_ring[i];
+			}
+			*mean_per_dof = sum / n;
+		}
+		if (last_per_dof != nullptr) {
+			*last_per_dof = m_last_nis_per_dof;
+		}
+		return n;
 	}
 
 	bool
@@ -1443,9 +2015,9 @@ namespace {
 		if (!pos.allFinite() || !std::isfinite(orient.norm())) {
 			return true; // never feed a non-finite pose
 		}
-		if (pos.norm() >= MAX_PLAUSIBLE_POS_M) {
-			U_LOG_W("Optical pose physically implausible (%.0f m) - degenerate PnP, rejecting", pos.norm());
-			return true; // a constellation controller is never this far out; this is a degenerate solve
+		if (!position_plausible(pos)) {
+			U_LOG_W("Optical pose implausibly far from the head/origin - degenerate PnP, rejecting");
+			return true; // a constellation controller is never this far from the head; degenerate solve
 		}
 
 		// Jump plausibility gate: reject (don't apply) a candidate that moved further from the last
@@ -1473,6 +2045,7 @@ namespace {
 			position_state.valid = position_state.tracked = true;
 			orientation_state.valid = orientation_state.tracked = true;
 			last_optical_ns = filter_time_ns;
+			capture_body_lock();
 			return true;
 		}
 
@@ -1509,6 +2082,7 @@ namespace {
 			position_state.valid = position_state.tracked = true;
 			orientation_state.valid = orientation_state.tracked = true;
 			last_optical_ns = filter_time_ns;
+			capture_body_lock();
 			return false;
 		}
 		tracked = true;
@@ -1516,6 +2090,7 @@ namespace {
 		orientation_state.valid = orientation_state.tracked = true;
 		last_optical_ns = filter_time_ns;
 		last_good_position = m_x.p;
+		capture_body_lock();
 		return true;
 	}
 
@@ -1558,6 +2133,35 @@ namespace {
 		return true;
 	}
 
+	void
+	EskfFusion::integrate_late_imu_sample(const xrt_imu_sample &sample)
+	{
+		// No anchor to rewind to (untracked / not yet checkpointed): integrate in place. The dt<=0 guard in
+		// integrate_imu_sample handles a true duplicate; there is no earlier state to reorder against anyway.
+		if (!m_anchor_valid || filter_time_ns == 0) {
+			integrate_imu_sample(sample);
+			return;
+		}
+		// Insert at the sample's true time, clamped up to just past the rewind horizon so a packet older than
+		// the anchor still folds (best-effort) over the earliest replayable interval rather than being dropped.
+		// Within the horizon (the common BT-reorder case) this is the sample's exact time -> an in-order fold.
+		xrt_imu_sample s = sample;
+		if (s.timestamp_ns <= m_anchor.filter_time_ns) {
+			s.timestamp_ns = m_anchor.filter_time_ns + 1;
+		}
+		// Splice into the timestamp-sorted log (the replay loops assume sorted order).
+		auto at = std::find_if(m_imu_log.begin(), m_imu_log.end(),
+		                       [&](const ImuLogEntry &e) { return e.sample.timestamp_ns > s.timestamp_ns; });
+		m_imu_log.insert(at, ImuLogEntry{s});
+
+		// Rewind to the anchor and replay the (now-reordered) log forward: the late sample folds exactly as if
+		// it had arrived in order, and the filter clock returns to the latest sample as before.
+		restore_checkpoint(m_anchor);
+		for (const ImuLogEntry &e : m_imu_log) {
+			integrate_imu_sample(e.sample);
+		}
+	}
+
 	// ---------------------------------------------------------------------------
 	// Public interface
 	// ---------------------------------------------------------------------------
@@ -1572,8 +2176,17 @@ namespace {
 		{
 			std::lock_guard<std::mutex> lock(m_filter_lock);
 			if (tracked) {
-				integrate_imu_sample(*sample);
-				m_imu_log.push_back(ImuLogEntry{*sample});
+				if (sample->timestamp_ns < filter_time_ns) {
+					// Strictly-late (reordered) BT packet — carries a real inertial interval BEFORE the
+					// current clock. Reorder it into the log and rewind-replay so it folds in sequence
+					// instead of being silently dropped. A sample AT the clock (==) is a duplicate / a
+					// co-timestamped pair with optical: it has no interval to integrate, so it takes the
+					// normal path where the dt<=0 guard makes it a harmless no-op.
+					integrate_late_imu_sample(*sample);
+				} else {
+					integrate_imu_sample(*sample);
+					m_imu_log.push_back(ImuLogEntry{*sample});
+				}
 				if (m_imu_log.size() > IMU_LOG_CAP) {
 					m_anchor = capture_checkpoint();
 					m_anchor_valid = true;
@@ -1591,7 +2204,8 @@ namespace {
 	EskfFusion::process_pose(const struct xrt_pose_sample *sample,
 	                         const struct xrt_vec3 *position_variance_optional,
 	                         const struct xrt_vec3 *orientation_variance_optional,
-	                         float residual_limit)
+	                         float residual_limit,
+	                         const struct xrt_pose *hmd_world_pose)
 	{
 		Vector3d pos_var{OPT_POS_STD * OPT_POS_STD, OPT_POS_STD * OPT_POS_STD, OPT_POS_STD * OPT_POS_STD};
 		Vector3d ori_var{OPT_ORI_STD * OPT_ORI_STD, OPT_ORI_STD * OPT_ORI_STD, OPT_ORI_STD * OPT_ORI_STD};
@@ -1608,20 +2222,34 @@ namespace {
 
 		{
 			std::lock_guard<std::mutex> lock(m_filter_lock);
+			set_op_hmd_pose(hmd_world_pose);
 			if (finite) {
-				// Always keep the PnP pose as the bootstrap / divergence re-anchor reference.
-				m_pnp_pose = sample->pose;
-				m_pnp_ns = sample->timestamp_ns;
-				m_pnp_valid = true;
+				// Re-anchor hygiene: m_pnp_pose is the pose the divergence re-anchor snaps onto, so it
+				// must never be a mirror-flipped solve. The front-end's anisotropic prior cost down-ranks
+				// flips it can see, but offline (and during a stale-yaw dropout) one can slip
+				// through; as a filter-side second line, reject a candidate whose orientation grossly
+				// disagrees with the FRESH gyro-propagated filter orientation (the same gyro arbitration
+				// integrate_pose_measurement uses) from becoming the re-anchor reference. A flipped pose
+				// then cannot poison the re-anchor. Bootstrap (untracked, no gyro reference yet) always
+				// takes it — the plausibility gate below guards a bad bootstrap.
+				const Quaterniond q_prior_filt = m_x.q.normalized();
+				const Vector3d dth = log_quat(orient.normalized() * q_prior_filt.conjugate());
+				const bool gyro_fresh = last_optical_ns != 0 &&
+				                        (sample->timestamp_ns - last_optical_ns) < FLIP_GUARD_TRUST_NS;
+				const bool pnp_flipped = tracked && gyro_fresh && dth.norm() > FLIP_REJECT_RAD;
+				if (!pnp_flipped) {
+					m_pnp_pose = sample->pose;
+					m_pnp_ns = sample->timestamp_ns;
+					m_pnp_valid = true;
+				}
 
 				if (!tracked) {
 					// Bootstrap only from a PLAUSIBLE pose. A constellation-tracked controller is within
-					// arm's reach, so a degenerate few-blob PnP hundreds of metres out must not seed the
+					// arm's reach OF THE HMD, so a degenerate few-blob PnP far from the head must not seed the
 					// filter — it would capture last_good_position at an impossible point and be reported
-					// (frozen) there. Mirrors the plausibility gate at every other optical-adoption site;
-					// stay untracked until a real pose arrives. (Found via real-data replay: a session
-					// whose only optical solves were ~33 m degenerates used to bootstrap at 33 m.)
-					if (pos.norm() < MAX_PLAUSIBLE_POS_M) {
+					// (frozen) there. Mirrors the arm-reach gate at every other optical-adoption site; stay
+					// untracked until a real pose arrives.
+					if (position_plausible(pos)) {
 						apply_optical_at(sample->timestamp_ns,
 						                 [&]() { bootstrap_from_pose(sample->pose); });
 						if (m_imu_only && m_imu_only_until_ns == 0) {
@@ -1659,7 +2287,8 @@ namespace {
 	                                     const LEDCameraView &view,
 	                                     const struct xrt_vec2 *pixel_variance,
 	                                     const float max_innov_px,
-	                                     const bool feed)
+	                                     const bool feed,
+	                                     const struct xrt_pose *hmd_world_pose)
 	{
 		// DIAGNOSTIC (feed == false): per-LED reprojection RMS against the current pose, read-only.
 		if (!feed) {
@@ -1693,6 +2322,7 @@ namespace {
 		int seen = 0;
 		{
 			std::lock_guard<std::mutex> lock(m_filter_lock);
+			set_op_hmd_pose(hmd_world_pose);
 			if (!tracked) {
 				return -1.0f; // awaiting a process_pose bootstrap
 			}
@@ -1709,7 +2339,7 @@ namespace {
 					const Vector3d pnp_pos = map_vec3(m_pnp_pose.position).cast<double>();
 					const bool pnp_fresh = m_pnp_valid &&
 					    std::llabs((long long)(m_pnp_ns - timestamp_ns)) < REANCHOR_MAX_AGE_NS &&
-					    pnp_pos.allFinite() && pnp_pos.norm() < MAX_PLAUSIBLE_POS_M;
+					    pnp_pos.allFinite() && position_plausible(pnp_pos);
 					if (pnp_fresh) {
 						reanchor(pnp_pos, flip_guard(map_quat(m_pnp_pose.orientation).cast<double>()));
 					} else {
@@ -1731,7 +2361,9 @@ namespace {
 	}
 
 	void
-	EskfFusion::get_prediction(timepoint_ns when_ns, struct xrt_space_relation *out_relation)
+	EskfFusion::get_prediction(timepoint_ns when_ns,
+	                           struct xrt_space_relation *out_relation,
+	                           const struct xrt_pose *hmd_world_pose)
 	{
 		if (out_relation == NULL) {
 			return;
@@ -1748,18 +2380,33 @@ namespace {
 		const Eigen::Map<const Vector3d> s_avel{snap.angular_velocity};
 		const Eigen::Map<const Vector3d> s_acc{snap.acceleration};
 		const Eigen::Map<const Vector3d> s_lgp{snap.last_good_position};
+		const Eigen::Map<const Vector3d> s_bloff{snap.body_lock_offset};
 		const Eigen::Map<const Quaterniond> s_orient{snap.orientation};
 
-		// Constant-acceleration extrapolation of the snapshot, horizon-bounded. No artificial damping:
-		// the ESKF velocity is a directly estimated state, trustworthy over a render frame.
+		// Uncertainty-aware extrapolation of the snapshot, horizon-bounded. The ESKF VELOCITY is a directly
+		// estimated state, trustworthy over a render frame, so position leans primarily on it. The estimated
+		// world ACCELERATION, by contrast, is noisy (a power-limited controller IMU) and its 1/2·a·dt² lever
+		// amplifies that noise quadratically in dt — visible render-time jitter. Damp the accel contribution
+		// by a Wiener (MMSE) shrinkage gain w = ||a||² / (||a||² + σ_a²(dt)): a confident strong acceleration
+		// (||a||² ≫ σ_a²) keeps w≈1 (no lag on real motion), while a noise-dominated or far-extrapolated accel
+		// is attenuated toward velocity-only. σ_a²(dt) is the world-accel uncertainty propagated over the
+		// horizon from the filter's OWN quantities — the current accel-bias variance plus the filter's declared
+		// accel process growth PROC_ACCEL_CV²·dt — so the damping strengthens with both accel covariance and dt
+		// with no new free knob. At dt→0 the gain is the current accel confidence; gravity is already cancelled
+		// in m_accel_world (zero at rest), so this damps only the linear acceleration.
 		double dt = time_ns_to_s(when_ns - snap.filter_time_ns);
 		if (dt > MAX_PREDICT_AHEAD_S) {
 			dt = MAX_PREDICT_AHEAD_S;
 		} else if (dt < 0.0) {
 			dt = 0.0;
 		}
-		const Vector3d vel = s_lvel + s_acc * dt;
-		const Vector3d pos = s_pos + s_lvel * dt + 0.5 * s_acc * dt * dt;
+		const double accel_var = std::max(0.0, snap.acceleration_var_max);
+		const double sigma_a2 = accel_var + PROC_ACCEL_CV * PROC_ACCEL_CV * dt;
+		const double a2 = s_acc.squaredNorm();
+		const double w_accel = (a2 + sigma_a2 > 0.0) ? a2 / (a2 + sigma_a2) : 0.0;
+		const Vector3d a_eff = w_accel * s_acc;
+		const Vector3d vel = s_lvel + a_eff * dt;
+		const Vector3d pos = s_pos + s_lvel * dt + 0.5 * a_eff * dt * dt;
 
 		// Orientation advances by the world-frame rotation vector omega*dt (global error: left-multiply).
 		const Vector3d rotvec = s_avel * dt;
@@ -1770,32 +2417,92 @@ namespace {
 		}
 		orient.normalize();
 
-		// IMU position dead-reckoning is only good for a fraction of a second; once optical has been
-		// absent past OPTICAL_FREEZE_NS, freeze the reported position. Gyro orientation lasts longer.
-		// (G2_IMU_ONLY diagnostic deliberately keeps reporting the dead-reckoned position so we can SEE
-		// the pure-inertial drift — m_imu_only is set once at construction, so this lock-free read is safe.)
+		// IMU position dead-reckoning is only good for a fraction of a second; past OPTICAL_FREEZE_NS with
+		// no POSITION-CONSTRAINING optical fold, the dead-reckoned position has drifted and must not be
+		// reported. Gyro orientation lasts longer (kept live below). (G2_IMU_ONLY diagnostic deliberately
+		// reports the dead-reckoned position so we can SEE the pure-inertial drift — m_imu_only is set once
+		// at construction, so this lock-free read is safe.)
 		const bool optical_stale =
 		    !m_imu_only &&
 		    (snap.last_optical_ns == 0 || (when_ns - snap.last_optical_ns) > OPTICAL_FREEZE_NS);
+		// Abandoned (set-down) controller: optical lost for longer than the body-lock hold is meant to ride.
+		// The hold covers brief occlusion (a controller momentarily out of view at arm's reach during fast
+		// play); held this long with no re-acquire the controller is genuinely set down, so reporting it
+		// TRACKED at the head would be a lie — drop it to UNTRACKED below (it keeps riding the head visually).
+		const bool body_lock_abandoned =
+		    !m_imu_only && snap.last_optical_ns != 0 &&
+		    (when_ns - snap.last_optical_ns) > BODY_LOCK_ABANDON_NS;
+
+		// BODY-LOCK out-of-view: ride the controller with the LIVE HMD at its last controller-to-HMD offset
+		// (always within arm reach by construction — the offset is gated <= MAX_CONTROLLER_REACH_M at capture).
+		const bool have_hmd = hmd_world_pose != nullptr;
+		Vector3d hmd_pos = Vector3d::Zero();
+		if (have_hmd) {
+			hmd_pos = map_vec3(hmd_world_pose->position).cast<double>();
+		}
+		const bool offset_ok = snap.body_lock_valid && s_bloff.norm() <= MAX_CONTROLLER_REACH_M;
 
 		map_quat(out_relation->pose.orientation) = orient.cast<float>();
 		map_vec3(out_relation->angular_velocity) = s_avel.cast<float>();
-		if (optical_stale) {
-			map_vec3(out_relation->pose.position) = s_lgp.cast<float>();
-			out_relation->linear_velocity = xrt_vec3{0.f, 0.f, 0.f};
-		} else {
-			map_vec3(out_relation->pose.position) = pos.cast<float>();
+
+		// Primary report: the live extrapolation while position is fresh, else the world-frame hold once stale.
+		// Velocity is reported only for the live extrapolation (a held/body-locked controller is static in its
+		// reference frame).
+		bool moving = !optical_stale;
+		bool body_locked = false; // riding the live head at a trusted in-reach offset
+		Vector3d report = optical_stale ? Vector3d(s_lgp) : pos;
+		bool position_trackable = snap.position_tracked;
+
+		// ARM-REACH SAFETY (room-roam-invariant): an LED-tracked controller is physically within arm's reach
+		// of the head. Whenever a live HMD pose is available, the reported controller must never exceed that —
+		// this catches BOTH a stale fly-away AND a depth-along-ray slide / velocity runaway that drifts the
+		// dead-reckoned state past reach while still inside the freeze window. If the primary report is beyond
+		// reach, replace it with the body-lock ride (head + last offset, inherently within reach); if no valid
+		// in-reach offset exists, clamp to the reach sphere toward the head and drop POSITION_TRACKED (the
+		// controller can no longer be trusted as a confident head-relative estimate). Real motion (optical is
+		// always well within reach) is never clipped — only the math-artefact excursions are.
+		if (have_hmd) {
+			const Vector3d rel_v = report - hmd_pos;
+			if (rel_v.norm() > MAX_CONTROLLER_REACH_M) {
+				moving = false;
+				if (offset_ok) {
+					report = hmd_pos + s_bloff; // body-lock ride: rigid, within reach
+					body_locked = true;
+				} else {
+					const double n = rel_v.norm();
+					report = hmd_pos + rel_v * (MAX_CONTROLLER_REACH_M / n); // clamp to reach sphere
+					position_trackable = false;
+				}
+			} else if (optical_stale && offset_ok) {
+				// Stale but the dead-reckon is still within reach: prefer the rigid body-lock ride over the
+				// stale world hold so the controller tracks the head cleanly the moment it stops being observed.
+				report = hmd_pos + s_bloff;
+				body_locked = true;
+			}
+		}
+
+		if (body_lock_abandoned) {
+			position_trackable = false; // abandoned hold reports lost (still rides the head visually)
+		}
+
+		map_vec3(out_relation->pose.position) = report.cast<float>();
+		if (moving) {
 			map_vec3(out_relation->linear_velocity) = vel.cast<float>();
+		} else {
+			out_relation->linear_velocity = xrt_vec3{0.f, 0.f, 0.f};
 		}
 
 		uint64_t flags = 0;
 		if (snap.position_valid) {
 			flags |= XRT_SPACE_RELATION_POSITION_VALID_BIT;
-			if (!optical_stale) {
+			if (moving) {
 				flags |= XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT;
-				if (snap.position_tracked) {
-					flags |= XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
-				}
+			}
+			// TRACKED is a CONFIDENT pose: a fresh in-reach estimate, or a body-locked head-relative one. A
+			// stale world-frame hold (no live head reference) or an out-of-reach clamp is reported but NOT
+			// tracked — the consumer treats it as a stale/uncertain pose.
+			if (position_trackable && (!optical_stale || body_locked)) {
+				flags |= XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
 			}
 		}
 		if (snap.orientation_valid) {
@@ -1820,6 +2527,20 @@ namespace {
 		for (int i = 0; i < 3; i++) {
 			for (int j = 0; j < 3; j++) {
 				cov_row_major[i * 3 + j] = Ppos(i, j);
+			}
+		}
+		return tracked;
+	}
+
+	bool
+	EskfFusion::debug_get_pose_covariance(double cov6_row_major[36])
+	{
+		std::lock_guard<std::mutex> lock(m_filter_lock);
+		// Assemble the 6x6 [position, global-orientation] covariance from the 15x15 P sub-blocks.
+		const int idx[6] = {EP + 0, EP + 1, EP + 2, ET + 0, ET + 1, ET + 2};
+		for (int i = 0; i < 6; i++) {
+			for (int j = 0; j < 6; j++) {
+				cov6_row_major[i * 6 + j] = m_P(idx[i], idx[j]);
 			}
 		}
 		return tracked;
