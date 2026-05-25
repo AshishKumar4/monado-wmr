@@ -121,6 +121,9 @@ struct wmr_inertial_sensor_config
 
 	//! Measurement noise standard deviation. @see slam_tracker::inertial_calibration.
 	struct xrt_vec3 noise_std;
+
+	//! Set once a sensor of this type has been parsed, so duplicate entries are ignored (first wins).
+	bool present;
 };
 
 /* Precomputed transforms to convert between OpenXR and WMR coordinate systems */

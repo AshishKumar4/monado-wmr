@@ -148,6 +148,18 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 	set_target_properties(tests_blobwatch PROPERTIES FOLDER monado_tests)
 endif()
 
+if(XRT_BUILD_DRIVER_WMR)
+	# Regression test for WMR controller IMU calibration selection: the first (ICM-20602) IMU must
+	# win over the co-located "Undefined" duplicate. Compiles wmr_config.c directly to test the parser.
+	add_executable(tests_wmr_config tests_wmr_config.cpp
+									${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/drivers/wmr/wmr_config.c)
+	target_link_libraries(
+		tests_wmr_config PRIVATE xrt-external-catch2 xrt-interfaces aux_math aux_util xrt-external-cjson)
+	target_include_directories(tests_wmr_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/drivers)
+	add_test(NAME tests_wmr_config COMMAND tests_wmr_config --success --allow-running-no-tests)
+	set_target_properties(tests_wmr_config PROPERTIES FOLDER monado_tests)
+endif()
+
 # Standalone telemetry stress + correctness test (own main, stubs u_log, compiles u_g2_telemetry.c
 # directly to stay self-contained — NOT linked against aux_util). A real ctest; guards the wait-free ring
 # + the manifest offsets (incl. the head_pose stream) that the offline harness depends on.

@@ -281,7 +281,19 @@ wmr_inertial_sensors_config_parse(struct wmr_inertial_sensors_config *c, cJSON *
 		return false;
 	}
 
-	return wmr_inertial_sensor_config_parse(target, sensor, log_level);
+	/* WMR controllers list two co-located IMUs per type: the identified ICM-20602 (listed first) and a
+	 * second "Undefined" entry with slightly different extrinsics. Keep the first sensor of each type so
+	 * the ICM-20602 calibration is used, matching the Windows driver (first-match-by-type). Without this,
+	 * the later "Undefined" entry would overwrite it (off by ~1.5-2.9 deg + up to 2.1 mm). */
+	if (target->present) {
+		return true;
+	}
+
+	if (!wmr_inertial_sensor_config_parse(target, sensor, log_level)) {
+		return false;
+	}
+	target->present = true;
+	return true;
 }
 
 static bool
