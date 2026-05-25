@@ -36,11 +36,14 @@ struct tracking_sample_device_state
 	struct xrt_pose P_world_obj_prior;
 	struct xrt_vec3 prior_pos_error;
 	struct xrt_vec3 prior_rot_error;
-	float gravity_error_rad; /* Gravity vector uncertainty in radians 0..M_PI */
-	/* True when the fusion is tracking AND its orientation uncertainty is below the ceiling, i.e. the
-	 * prior orientation is reliable enough to disambiguate a P3P mirror-flip (select the correct twin).
-	 * False at cold start / after a long dropout, where the search must run unconstrained. */
-	bool prior_orient_trusted;
+	/* Prior-orientation trust for the soft mirror-flip cost: true whenever the fusion is tracking, so the
+	 * DRIFTLESS gravity-anchored prior TILT is a valid reference even through an optical dropout (the
+	 * gyro-blind snap-back case). False at cold start, where the search runs on reprojection alone. */
+	bool prior_tilt_trusted;
+	/* Live fusion yaw (orientation) 1-sigma uncertainty, in radians, for the soft mirror-flip cost's
+	 * anisotropic yaw scale. Tight when the yaw prior is fresh (the prior term picks the prior-consistent
+	 * twin); large after a long dropout / cold start (the yaw term vanishes, reprojection decides). */
+	float prior_yaw_sigma_rad;
 
 	/* Last observed pose, in world space */
 	bool have_last_seen_pose;

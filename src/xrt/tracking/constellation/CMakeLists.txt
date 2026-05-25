@@ -11,6 +11,8 @@ add_library(
 	internal/correspondence_search.h
 	internal/debug_draw.cpp
 	internal/debug_draw.h
+	internal/joint_pnp.cpp
+	internal/joint_pnp.h
 	internal/lambdatwist/cubic.h
 	internal/lambdatwist/eig3x3known0.h
 	internal/lambdatwist/lambdatwist_p3p.h

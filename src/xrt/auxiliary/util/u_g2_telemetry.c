@@ -21,8 +21,7 @@
  *
  * The public API (names, signatures, arg order, return types) is owned by
  * u_g2_telemetry.h. The packed on-disk row structs, stream ids and event-type
- * enum used to live in that header; they are internal to this .c now and are
- * defined just below.
+ * enum are internal to this .c and defined just below.
  */
 
 #include "xrt/xrt_config_os.h"
@@ -149,7 +148,10 @@ enum g2_telem_event_type
 	G2_TELEM_EV_RECOVER_ATTEMPT = 2,
 	G2_TELEM_EV_OPTICAL_JUMP_REJECTED = 3,
 	G2_TELEM_EV_IMU_ANOMALY = 4,
-	G2_TELEM_EV_RING_OVERFLOW = 5, //!< value = stream id
+	G2_TELEM_EV_RING_OVERFLOW = 5,      //!< value = stream id
+	G2_TELEM_EV_PARTIAL_FOLD_COUNT = 9, //!< value = number of LEDs gate-folded this frame
+	G2_TELEM_EV_LABEL_PROPAGATED = 10,  //!< value = number of LEDs label-propagated from the predicted pose
+	G2_TELEM_EV_JOINT_PNP = 11,         //!< value = number of contributing cameras in a joint multi-cam PnP solve
 };
 
 //! Stream ids, used as the value of a ring_overflow event and to index internals.
@@ -498,8 +500,8 @@ drain_ring(struct g2_ring *r, uint8_t stream_id)
 	}
 
 	// Overflow visibility: BOTH the log and the marker row are rate-limited to
-	// <=1/s (MINOR-5). Without this, a sustained overflow storm at a fast drain
-	// cadence would append many marker rows to event.bin, inflating event counts.
+	// <=1/s. Without this, a sustained overflow storm at a fast drain cadence
+	// would append many marker rows to event.bin, inflating event counts.
 	uint64_t of = atomic_load_explicit(&r->overflow_total, memory_order_relaxed);
 	if (of != r->last_overflow_logged) {
 		int64_t now = g2_telem_now_ns();
@@ -596,7 +598,7 @@ ring_alloc(struct g2_ring *r, const struct g2_stream_desc *d)
 // ring_emit() (the memcpy into r->slots) when shutdown runs on another thread.
 // Freeing the buffer there would be a use-after-free. The buffers are small,
 // fixed, and live for the process lifetime, so we leak-at-exit on purpose --
-// the OS reclaims them at process teardown. (See MAJOR-4 in the audit.)
+// the OS reclaims them at process teardown.
 static void
 ring_close_file(struct g2_ring *r)
 {
@@ -728,12 +730,12 @@ g2_telem_shutdown(void)
 	}
 	g_telem.started = false; // gate this function against a second call
 
-	// Order matters (MAJOR-4):
+	// Order matters:
 	//  1. Flip the enabled flag OFF so any producer that reaches the gate from
 	//     now on no-ops and never enters ring_emit().
 	//  2. Stop + join the writer thread (its final drain flushes the rings).
 	//     os_thread_helper_destroy() itself stops-and-waits, so a single call
-	//     suffices -- no separate stop_and_wait (MINOR-3).
+	//     suffices.
 	//  3. Close the files. We do NOT free the ring slot buffers: a producer that
 	//     passed the gate just before step 1 may still be mid-emit (memcpy into
 	//     a slot); freeing under it would be a use-after-free. The buffers are

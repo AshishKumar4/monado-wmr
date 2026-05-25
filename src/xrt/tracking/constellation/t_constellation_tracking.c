@@ -27,12 +27,11 @@
 #include "internal/camera_model.h"
 #include "internal/correspondence_search.h"
 #include "internal/debug_draw.h"
+#include "internal/joint_pnp.h"
 #include "internal/ransac_pnp.h"
 #include "internal/sample.h"
 
 DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
-/* Diagnostic: disable the orientation-prior mirror-flip veto (A/B the front-end disambiguation). */
-DEBUG_GET_ONCE_BOOL_OPTION(no_flip_veto, "G2_NO_FLIP_VETO", false)
 
 #define MIN_ROT_ERROR DEG_TO_RAD(30)
 #define MIN_POS_ERROR 0.10
@@ -42,12 +41,49 @@ DEBUG_GET_ONCE_BOOL_OPTION(no_flip_veto, "G2_NO_FLIP_VETO", false)
  * (so when the fusion is confident the gate is no looser, and no tighter, than before -> no
  * regression; flips are rejected by the large rotation error they produce regardless). MAX_*_ERROR
  * are the CEILINGS that bound how far the gate widens after an optical dropout, when the fusion
- * inflates its covariance -> the matcher then accepts the prior-refined frames it used to drop to the
- * slow ab-initio search (the idle). Bigger re-acquisitions beyond the ceiling go through that search,
- * not this gate. One statistical knob (the sigma multiplier); the rest are physical floors/ceilings. */
+ * inflates its covariance -> the matcher accepts the prior-refined frames through the gate instead of
+ * falling through to the slow ab-initio search. Bigger re-acquisitions beyond the ceiling go through that
+ * search, not this gate. One statistical knob (the sigma multiplier); the rest are physical floors/ceilings. */
 #define PRIOR_GATE_SIGMA 3.0 /* ~99.7% per axis */
 #define MAX_POS_ERROR 0.60
 #define MAX_ROT_ERROR DEG_TO_RAD(60)
+
+/* The tight DRIFTLESS tilt sigma for the soft anisotropic mirror-flip cost (both the twin selection and the
+ * ab-initio search). The mirror twin of a few-LED PnP almost always TILTS the controller wrong. Gravity is
+ * driftless: the fusion prior's TILT is gravity-anchored (the ESKF keeps
+ * anchoring from the controller's accel even through an optical dropout) so the prior tilt is a valid
+ * reference even when the yaw prior is stale (the dropout/"snap-back" case the gyro can't catch). A real
+ * frame-to-frame tilt is « this within the tracked regime; a tilt flip is ~>=90 deg (>=3 sigma -> huge
+ * penalty). Equal to the rotation FLOOR (one knob): the tilt scale tracks the per-axis prior bound. */
+#define GRAVITY_TILT_TOL MIN_ROT_ERROR
+
+/* The mirror-flip disambiguation is a SOFT cost re-rank, not a hard veto: for each candidate pose
+ * and its mirror twin, cost = reproj_error_px + pose_metrics_prior_orient_cost(...), and the LOWEST-cost
+ * candidate is committed — a frame is never dropped for ambiguity ("fix, don't reject"). The cost is the
+ * anisotropic squared Mahalanobis distance of the candidate orientation from the prior — tilt scaled by
+ * the tight driftless GRAVITY_TILT_TOL, yaw by the live fusion 1-sigma — Huber-robustified and weighted
+ * into px. A confident prior makes the prior term dominate (a tilt flip's huge distance is never selected),
+ * while an uncertain/untracked prior makes the yaw term vanish and reprojection decide (the
+ * cold-start/ab-initio bootstrap). The
+ * Huber knee reuses the 3-sigma envelope (PRIOR_GATE_SIGMA): within it the penalty is quadratic, beyond
+ * it linear, so a gross outlier (flip) cannot dominate pathologically. FLIP_COST_WEIGHT commensurates the
+ * dimensionless robustified distance with the per-LED reprojection error (px^2). FLIP_COST_YAW_SIGMA_MAX is
+ * the untracked/long-dropout yaw scale: ~half a turn, so the yaw term contributes negligibly and the tilt
+ * term (still gravity-anchored) carries the decision alone. */
+#define FLIP_COST_WEIGHT 1.0
+#define FLIP_COST_HUBER_KNEE_SIGMA PRIOR_GATE_SIGMA
+#define FLIP_COST_YAW_SIGMA_MAX DEG_TO_RAD(180)
+
+/* Covariance-gated partial-fold. When the fast paths cannot solve a PnP (<4 cleanly-labelled LEDs for the
+ * device in any single camera — the dominant fall-through, a visibility limit not a bug) but the fusion HAS
+ * a usable prior, we still fold the
+ * individual LEDs CONFIDENTLY matched to the prior, each gated by the ESKF's anisotropic per-LED
+ * innovation covariance S = H·P·Hᵀ + R (predict_led_gate). A blob<->LED pairing is folded iff its
+ * Mahalanobis distance d² = rᵀS⁻¹r ≤ this χ²₂ quantile. χ²₂ inverse-CDF: -2·ln(1-p). p=0.99 -> 9.21,
+ * matching the fold's own per-LED gate (CHI2_GATE_2DOF) so the two lines of defence are consistent.
+ * The anisotropic S (tight tilt / loose yaw after a dropout) makes a tilt-flipped correspondence land
+ * outside the gate automatically — no separate gravity check needed here. */
+#define PARTIAL_FOLD_CHI2_2DOF 9.21 /* -2*ln(1-0.99) */
 
 #define CT_TRACE(c, ...) U_LOG_IFL_T(c->log_level, __VA_ARGS__)
 #define CT_DEBUG(c, ...) U_LOG_IFL_D(c->log_level, __VA_ARGS__)
@@ -58,21 +94,19 @@ DEBUG_GET_ONCE_BOOL_OPTION(no_flip_veto, "G2_NO_FLIP_VETO", false)
 /* Maximum number of frames to permit waiting in the fast-processing queue */
 #define MAX_FAST_QUEUE_SIZE 2
 
-//! When projecting poses into the camera, we need
-// extra flip around the X axis because OpenCV camera space coordinates have
-// +Y down and +Z away from the user
+//! The OpenCV(+Y down, +Z away) <-> OpenXR(+Y up, +Z toward) camera-basis flip: a 180-deg rotation about
+//! X (i.e. negate Y and Z). Single source for the convention so every CV<->XR conversion agrees.
+static const struct xrt_pose P_YZ_FLIP = {{1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}};
+
+//! Sandwich a pose by the YZ flip (convert a pose between the OpenCV and OpenXR camera bases).
 static void
 pose_flip_YZ(const struct xrt_pose *in, struct xrt_pose *dest)
 {
-	const struct xrt_pose P_YZ_flip = {
-	    {1.0, 0.0, 0.0, 0.0},
-	    {0.0, 0.0, 0.0},
-	};
-
 	struct xrt_pose tmp;
-	math_pose_transform(&P_YZ_flip, in, &tmp);
-	math_pose_transform(&tmp, &P_YZ_flip, dest);
+	math_pose_transform(&P_YZ_FLIP, in, &tmp);
+	math_pose_transform(&tmp, &P_YZ_FLIP, dest);
 }
+
 
 /* Map an xrt_device type to the telemetry device_id (0=HMD, 1=left, 2=right). */
 static uint8_t
@@ -264,6 +298,11 @@ struct t_constellation_tracker
 	struct os_thread_helper long_analysis_thread;
 	struct constellation_tracking_sample *long_analysis_pending_sample;
 
+	//! Frames fully processed through the pipeline (incremented EXACTLY once per frame at every
+	//! pipeline exit). Guarded by long_analysis_thread's lock. Lets the offline harness barrier on
+	//! per-frame completion instead of racing a fixed sleep (debug/test only).
+	uint64_t frames_completed;
+
 	struct xrt_device_masks_sample controller_masks_sample;
 	struct xrt_device_masks_sink *controller_masks_sink;
 };
@@ -305,6 +344,28 @@ constellation_tracked_device_connection_notify_leds(struct t_constellation_track
 		ctdc->cb->push_observed_leds(ctdc->xdev, frame_mono_ns, P_xrworld_cam, cam_calib, leds, led_count);
 	}
 	os_mutex_unlock(&ctdc->lock);
+}
+
+/* Query the fusion's per-LED gate (zhat + 2x2 innovation covariance S) for one candidate blob<->LED
+ * pairing. Returns false (no gate) until the fusion is tracking — i.e. cold start / no usable prior — so
+ * the caller's gated partial fold is a no-op then and the ab-initio path runs (cold-start guard). */
+static bool
+constellation_tracked_device_connection_predict_led_gate(struct t_constellation_tracked_device_connection *ctdc,
+                                                         const struct xrt_pose *P_xrworld_cam,
+                                                         const struct t_constellation_cam_calib *cam_calib,
+                                                         const struct xrt_vec3 *led_obj,
+                                                         float out_zhat[2],
+                                                         float out_S[4])
+{
+	bool ret = false;
+
+	os_mutex_lock(&ctdc->lock);
+	if (!ctdc->disconnected && ctdc->cb->predict_led_gate) {
+		ret = ctdc->cb->predict_led_gate(ctdc->xdev, P_xrworld_cam, cam_calib, led_obj, out_zhat, out_S);
+	}
+	os_mutex_unlock(&ctdc->lock);
+
+	return ret;
 }
 
 static void
@@ -469,6 +530,7 @@ emit_view_led_observations(struct tracking_sample_device_state *dev_state,
 		                      cam->camera_model.calib.fy * ny + cam->camera_model.calib.cy};
 		// led->pos is LED-MODEL frame; the fusion tracks the DEVICE pose, so map model->device after
 		// the OpenCV->OpenXR YZ flip (mirrors the forward model flip(P_xrworld_device . P_device_model)).
+		// Negating Y,Z is P_YZ_FLIP applied to a point (the explicit form is cheapest for a single point).
 		struct xrt_vec3 led_flip = {visible_led->led->pos.x, -visible_led->led->pos.y,
 		                            -visible_led->led->pos.z};
 		math_pose_transform_point(&device->led_model.P_device_model, &led_flip,
@@ -479,9 +541,8 @@ emit_view_led_observations(struct tracking_sample_device_state *dev_state,
 		return;
 	}
 
-	const struct xrt_pose P_YZ = {{1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}};
 	struct xrt_pose P_xrworld_cam;
-	math_pose_transform(&view->P_cam_world, &P_YZ, &P_xrworld_cam);
+	math_pose_transform(&view->P_cam_world, &P_YZ_FLIP, &P_xrworld_cam);
 	const struct t_constellation_cam_calib cam_calib = {cam->camera_model.calib.fx, cam->camera_model.calib.fy,
 	                                                    cam->camera_model.calib.cx, cam->camera_model.calib.cy};
 	constellation_tracked_device_connection_notify_leds(device->connection, sample_ts, &P_xrworld_cam,
@@ -495,7 +556,8 @@ submit_device_pose(struct t_constellation_tracker *ct,
                    struct constellation_tracking_sample *sample,
                    int view_id,
                    struct xrt_pose *P_cam_obj,
-                   bool is_recovered)
+                   bool is_recovered,
+                   bool joint_seed)
 {
 	struct constellation_tracker_camera_state *cam = ct->cam + view_id;
 	struct tracking_sample_frame *view = sample->views + view_id;
@@ -507,24 +569,39 @@ submit_device_pose(struct t_constellation_tracker *ct,
 	                                 &cam->camera_model, &dev_state->blob_match_info);
 	mark_matching_blobs(ct, P_cam_obj, view->bwobs, &device->led_model, &dev_state->blob_match_info);
 
-	struct xrt_pose refine_pose = *P_cam_obj;
-
 	int num_leds_out = 0;
 	int num_inliers = 0;
 
-	if (!ransac_pnp_pose(&refine_pose, view->bwobs->blobs, view->bwobs->num_blobs, &device->led_model,
-	                     &cam->camera_model, &num_leds_out, &num_inliers)) {
-		CT_DEBUG(ct, "Camera %d RANSAC-PnP refinement for device %d from %u blobs failed", view_id,
-		         device->led_model.id, view->bwobs->num_blobs);
-	} else {
-		CT_DEBUG(ct,
-		         "Camera %d RANSAC-PnP refinement for device %d from %u blobs had %d LEDs with %d inliers. "
-		         "Produced pose %f,%f,%f,%f pos %f,%f,%f",
-		         view_id, device->led_model.id, view->bwobs->num_blobs, num_leds_out, num_inliers,
-		         refine_pose.orientation.x, refine_pose.orientation.y, refine_pose.orientation.z,
-		         refine_pose.orientation.w, refine_pose.position.x, refine_pose.position.y,
-		         refine_pose.position.z);
-		*P_cam_obj = refine_pose;
+	/* Per-view single-camera RANSAC-PnP polish: drives the per-LED reprojection error down (the seed pose
+	 * was matched/labelled but not necessarily LM-tight for THIS view). For a multi-camera JOINT seed the
+	 * polish is FLIP-GUARDED: a from-scratch single-view re-solve can land on the front/back mirror the
+	 * joint solve removed, so we keep the polish only when it stays on the joint pose's branch (within the
+	 * driftless tilt tolerance) — accuracy when consistent, the disambiguated joint pose when the polish
+	 * would flip. Single-camera callers (joint_seed=false) take the polish unconditionally as before. */
+	{
+		struct xrt_pose refine_pose = *P_cam_obj;
+		if (!ransac_pnp_pose(&refine_pose, view->bwobs->blobs, view->bwobs->num_blobs, &device->led_model,
+		                     &cam->camera_model, &num_leds_out, &num_inliers)) {
+			CT_DEBUG(ct, "Camera %d RANSAC-PnP refinement for device %d from %u blobs failed", view_id,
+			         device->led_model.id, view->bwobs->num_blobs);
+		} else {
+			bool keep = true;
+			if (joint_seed) {
+				/* geodesic angle between the polished and the joint pose; reject a polish that flipped. */
+				const struct xrt_quat *a = &refine_pose.orientation, *b = &P_cam_obj->orientation;
+				double d = fabs((double)a->x * b->x + (double)a->y * b->y + (double)a->z * b->z +
+				                (double)a->w * b->w);
+				d = d > 1.0 ? 1.0 : d;
+				keep = (2.0 * acos(d)) <= GRAVITY_TILT_TOL;
+			}
+			CT_DEBUG(ct,
+			         "Camera %d RANSAC-PnP refinement for device %d from %u blobs had %d LEDs with %d inliers "
+			         "(kept=%d)",
+			         view_id, device->led_model.id, view->bwobs->num_blobs, num_leds_out, num_inliers, keep);
+			if (keep) {
+				*P_cam_obj = refine_pose;
+			}
+		}
 	}
 
 	os_mutex_lock(&cam->bw_lock);
@@ -534,7 +611,7 @@ submit_device_pose(struct t_constellation_tracker *ct,
 	/* Telemetry: an accepted optical pose. Pose is camera-relative [p,q].
 	 * A pose that came in via the labelled-blob re-acquisition path is marked
 	 * outcome=2 (recovered) so analysts can distinguish recoveries from normal
-	 * accepts (MAJOR-5); all others are outcome=1 (accepted). */
+	 * accepts; all others are outcome=1 (accepted). */
 	if (g2_telem_enabled()) {
 		uint8_t dev_id = telem_device_id(device->connection->xdev);
 		bool is_new_lock = !dev_state->found_device_pose;
@@ -729,7 +806,8 @@ device_try_global_pose(struct t_constellation_tracker *ct,
 		                                      &cam->camera_model, NULL);
 
 		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD | POSE_MATCH_LED_IDS)) {
-			submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj_candidate, false /* not a recovery */);
+			submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj_candidate, false /* not a recovery */,
+			                   false /* single-cam: take the polish unconditionally */);
 			ret = true;
 		}
 	}
@@ -800,17 +878,33 @@ device_solve_view_from_labelled(struct t_constellation_tracker *ct,
 	                                      &dev_state->prior_pos_error, &dev_state->prior_rot_error, bwobs->blobs,
 	                                      bwobs->num_blobs, &device->led_model, &cam->camera_model, NULL);
 
-	/* Mirror-twin disambiguation: prefer the prior-consistent twin (selects the correct mode, kills the
-	 * flip, and recovers a frame the single-solution path would have dropped). */
+	/* Mirror-twin disambiguation by the soft prior-consistency cost (same mechanism as the ab-initio
+	 * re-rank): cost = reproj + soft prior penalty, take the LOWER-cost twin and always commit it (never
+	 * drop the frame for ambiguity). Mirror twins reproject near-identically, so the prior penalty — the
+	 * anisotropic Mahalanobis distance from the prior, tilt-tight/yaw-by-live-sigma, Huber-robustified —
+	 * is what separates them: a tilt flip's huge driftless tilt distance is never selected (decided even
+	 * when the yaw prior is stale), while a fresh-yaw flip is out-ranked by
+	 * its yaw distance. When the prior is untracked the yaw scale widens and reprojection decides. The
+	 * penalty is keyed off the prior only when tilt-trusted (gravity-anchored); otherwise it is zero and
+	 * the comparison is the plain reprojection ordering (cold reacquire). */
 	if (has_twin) {
 		struct pose_metrics twin_score;
 		pose_metrics_evaluate_pose_with_prior(&twin_score, &twin_pose, true, &P_cam_obj_prior,
 		                                      &dev_state->prior_pos_error, &dev_state->prior_rot_error,
 		                                      bwobs->blobs, bwobs->num_blobs, &device->led_model,
 		                                      &cam->camera_model, NULL);
-		const bool primary_good = POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD);
-		const bool twin_good = POSE_HAS_FLAGS(&twin_score, POSE_MATCH_GOOD);
-		if (twin_good && (!primary_good || pose_metrics_score_is_better_pose(&dev_state->score, &twin_score))) {
+		double prim_cost = 0.0, twin_cost = 0.0;
+		if (dev_state->prior_tilt_trusted) {
+			prim_cost = pose_metrics_prior_orient_cost(
+			    &P_cam_obj.orientation, &P_cam_obj_prior.orientation, &view->cam_gravity_vector,
+			    GRAVITY_TILT_TOL, dev_state->prior_yaw_sigma_rad, FLIP_COST_HUBER_KNEE_SIGMA,
+			    FLIP_COST_WEIGHT);
+			twin_cost = pose_metrics_prior_orient_cost(
+			    &twin_pose.orientation, &P_cam_obj_prior.orientation, &view->cam_gravity_vector,
+			    GRAVITY_TILT_TOL, dev_state->prior_yaw_sigma_rad, FLIP_COST_HUBER_KNEE_SIGMA,
+			    FLIP_COST_WEIGHT);
+		}
+		if (pose_metrics_score_is_better_pose_prior(&dev_state->score, prim_cost, &twin_score, twin_cost)) {
 			dev_state->score = twin_score;
 			P_cam_obj = twin_pose;
 		}
@@ -820,7 +914,8 @@ device_solve_view_from_labelled(struct t_constellation_tracker *ct,
 		CT_DEBUG(ct, "Camera %d %s pose for device %d from %d blobs", view_id,
 		         is_recovery ? "recovered" : "prior-refined", leds_model->id, num_blobs);
 		/* submit_device_pose emits the accepted pose_attempt (outcome 2=recovered vs 1=accepted). */
-		submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj, is_recovery);
+		submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj, is_recovery,
+		                   false /* single-cam: take the polish unconditionally */);
 		return true;
 	}
 
@@ -859,17 +954,309 @@ device_try_recover_pose(struct t_constellation_tracker *ct,
 	return false;
 }
 
-/* Prior-refine fast path: seed blob labels from the IMU-predicted pose — project the prior into each
- * view and label the blobs the LEDs land on — then solve. This lets a slightly-off prior be pulled to
- * a full PnP solve instead of falling through to the slow ab-initio search: the main cure for the low
- * accept rate and the re-acquisition dropout/snap. Mislabels from a bad prior are rejected by the
- * prior-consistency gate inside device_solve_view_from_labelled, so it only ever helps. */
+/* Pose-predicted LED label propagation: project the fusion's PREDICTED controller pose's LED
+ * model into one view and assign each blob to the LED it lands on, back-face culled by the LED normals
+ * and bounded by the prior's anisotropic per-LED gate (all inside pose_metrics_match_pose_to_blobs).
+ * This is the PROJECTED-LED-motion prior — the labels follow the predicted pose through head and
+ * controller motion — NOT raw pixel velocity, which parallax and ego-motion make unreliable. Returns
+ * the count of blobs newly labelled to this device, so the caller can decide a view carries enough
+ * propagated IDs to solve (and to count propagation vs the ab-initio fall-through). The label transfer
+ * itself is mark_matching_blobs; this just wraps the project+label so the joint and single-cam paths
+ * seed labels identically (one source of truth for "label a view from the predicted pose"). */
+static int
+device_propagate_labels_in_view(struct t_constellation_tracker *ct,
+                                struct tracking_sample_device_state *dev_state,
+                                struct constellation_tracking_sample *sample,
+                                int view_id)
+{
+	struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
+	struct tracking_sample_frame *view = sample->views + view_id;
+	struct constellation_tracker_camera_state *cam = ct->cam + view_id;
+
+	if (view->bwobs == NULL || view->bwobs->num_blobs == 0) {
+		return 0;
+	}
+
+	struct xrt_pose P_cam_obj_prior;
+	math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
+
+	/* Project the predicted pose's (front-facing, in-frame) LEDs and match each to a blob within its
+	 * prior-sized gate; mark_matching_blobs then writes the LED IDs onto the matched blobs. */
+	pose_metrics_match_pose_to_blobs(&P_cam_obj_prior, view->bwobs->blobs, view->bwobs->num_blobs,
+	                                 &device->led_model, &cam->camera_model, &dev_state->blob_match_info);
+	mark_matching_blobs(ct, &P_cam_obj_prior, view->bwobs, &device->led_model, &dev_state->blob_match_info);
+
+	int n_labelled = 0;
+	for (int i = 0; i < dev_state->blob_match_info.num_visible_leds; i++) {
+		if (dev_state->blob_match_info.visible_leds[i].matched_blob != NULL) {
+			n_labelled++;
+		}
+	}
+	return n_labelled;
+}
+
+/* Commit a joint multi-camera pose to every view that sees the device: score it against the prior, fold
+ * each view's matched LEDs, and submit. P_imu_obj is the joint solution in the rig (IMU) frame; per view
+ * the camera-relative pose is inv(P_imu_cam) . P_imu_obj. submit_device_pose is called with joint_seed so
+ * its per-view RANSAC polish is FLIP-GUARDED against the joint pose — keeping the polish's accuracy but
+ * rejecting any re-solve that flips back to the mirror the joint solve removed. Returns true if at least
+ * one view accepted the joint pose. */
+static bool
+device_submit_joint_pose(struct t_constellation_tracker *ct,
+                         struct tracking_sample_device_state *dev_state,
+                         struct constellation_tracking_sample *sample,
+                         const struct xrt_pose *P_imu_obj,
+                         int contributing_views)
+{
+	struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
+	const uint8_t telem_dev = telem_device_id(device->connection->xdev);
+	bool submitted_any = false;
+
+	for (int view_id = 0; view_id < sample->n_views; view_id++) {
+		struct tracking_sample_frame *view = sample->views + view_id;
+		struct constellation_tracker_camera_state *cam = ct->cam + view_id;
+		if (view->bwobs == NULL || view->bwobs->num_blobs == 0) {
+			continue;
+		}
+
+		/* Per-view camera-relative pose from the rig-frame joint solution. */
+		struct xrt_pose P_cam_imu;
+		math_pose_invert(&cam->P_imu_cam, &P_cam_imu);
+		struct xrt_pose P_cam_obj;
+		math_pose_transform(&P_cam_imu, P_imu_obj, &P_cam_obj);
+
+		struct xrt_pose P_cam_obj_prior;
+		math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
+
+		/* prior_must_match=true: a view accepts the joint pose only when it scores GOOD AND is consistent
+		 * with the prior (position + orientation within the live covariance bounds) — the same canonical
+		 * gate device_solve_view_from_labelled uses. A joint solution that fits the rays but disagrees with
+		 * the prior in a view (the marginal wrong-branch / extrinsic-biased case) is not committed there. */
+		pose_metrics_evaluate_pose_with_prior(&dev_state->score, &P_cam_obj, true, &P_cam_obj_prior,
+		                                      &dev_state->prior_pos_error, &dev_state->prior_rot_error,
+		                                      view->bwobs->blobs, view->bwobs->num_blobs, &device->led_model,
+		                                      &cam->camera_model, NULL);
+
+		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD)) {
+			submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj, false /* normal accept */,
+			                   true /* joint seed: flip-guard the polish */);
+			submitted_any = true;
+		}
+	}
+
+	if (submitted_any && g2_telem_enabled()) {
+		/* The joint multi-camera solve resolved this device this frame (value = contributing cameras). */
+		g2_telem_event(telem_dev, (uint64_t)sample->timestamp, 11 /* joint_pnp */, (float)contributing_views);
+	}
+	return submitted_any;
+}
+
+/* Multi-camera JOINT (generalised / non-central) PnP fast path. A single camera that sees only a
+ * near-planar LED subset has the intrinsic front/back mirror two-fold; the soft prior cost can only
+ * re-RANK it away. When 2+ cameras co-see the controller, pooling their LED bearing rays through the
+ * rig extrinsics into ONE generalised PnP constrains the pose jointly and the mirror dissolves by
+ * construction (the flip no longer fits both cameras). We seed labels in every view from the predicted
+ * pose, pool the views that carry >= 3 labelled LEDs, and if >= 2 such
+ * views exist run the joint solve in the rig frame seeded by the prior. On success the joint pose is
+ * committed to all contributing views; otherwise we return false and the single-camera fast paths run
+ * (only one camera sees the device). */
+static bool
+device_try_joint_pnp(struct t_constellation_tracker *ct,
+                     struct tracking_sample_device_state *dev_state,
+                     struct constellation_tracking_sample *sample)
+{
+	struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
+
+	/* Snapshot this device's blob labels across all views before the predicted-pose labelling below, so a
+	 * DECLINED joint attempt restores them exactly — the joint path must be a no-op when it doesn't commit
+	 * (it labels views the single-camera cascade might not have reached, and that must not leak into the
+	 * frame-to-frame label carry / the prior-refine that follows). */
+	uint16_t saved_led_id[CONSTELLATION_MAX_CAMERAS][MAX_BLOBS_PER_FRAME];
+	uint16_t saved_prev_led_id[CONSTELLATION_MAX_CAMERAS][MAX_BLOBS_PER_FRAME];
+	for (int v = 0; v < sample->n_views; v++) {
+		struct tracking_sample_frame *view = sample->views + v;
+		if (view->bwobs == NULL) {
+			continue;
+		}
+		for (int b = 0; b < view->bwobs->num_blobs && b < MAX_BLOBS_PER_FRAME; b++) {
+			saved_led_id[v][b] = view->bwobs->blobs[b].led_id;
+			saved_prev_led_id[v][b] = view->bwobs->blobs[b].prev_led_id;
+		}
+	}
+
+	struct joint_pnp_view jviews[JOINT_PNP_MAX_VIEWS];
+	int n_jviews = 0;
+	int n_multi = 0; /* views carrying enough labelled LEDs to contribute a constraint */
+
+	for (int view_id = 0; view_id < sample->n_views && n_jviews < JOINT_PNP_MAX_VIEWS; view_id++) {
+		struct tracking_sample_frame *view = sample->views + view_id;
+		struct constellation_tracker_camera_state *cam = ct->cam + view_id;
+		if (view->bwobs == NULL || view->bwobs->num_blobs == 0) {
+			continue;
+		}
+
+		/* Seed labels from the predicted pose, so the joint solve has correspondences in
+		 * each co-visible view without depending on frame-to-frame label carry. */
+		const int n_labelled = device_propagate_labels_in_view(ct, dev_state, sample, view_id);
+		if (n_labelled < 3) {
+			continue; /* too few rays in this view to help constrain the joint solve */
+		}
+		jviews[n_jviews].blobs = view->bwobs->blobs;
+		jviews[n_jviews].num_blobs = view->bwobs->num_blobs;
+		jviews[n_jviews].calib = &cam->camera_model;
+		jviews[n_jviews].P_imu_cam = cam->P_imu_cam;
+		n_jviews++;
+		n_multi++;
+	}
+
+	/* Restore the saved labels and decline (a no-op). */
+	bool declined = false;
+
+	/* Only worthwhile when at least two cameras co-see the controller — the case that makes the joint
+	 * solve disambiguate. With one (or zero) the geometry is the single-camera mirror case; decline. */
+	if (n_multi < 2) {
+		declined = true;
+	}
+
+	struct constellation_tracker_camera_state *seed_cam = NULL;
+	struct tracking_sample_frame *seed_vw = NULL;
+	struct xrt_pose P_cam_obj_prior = XRT_POSE_IDENTITY, P_cam_imu, P_imu_obj = XRT_POSE_IDENTITY;
+	int num_rays = 0, num_inliers = 0;
+
+	if (!declined) {
+		/* The prior in the rig (IMU) frame: P_imu_obj = P_imu_cam[v] . P_cam_world . P_world_obj for any
+		 * contributing view (they agree). Use the first contributing view to build it. */
+		int seed_view = -1;
+		for (int view_id = 0; view_id < sample->n_views; view_id++) {
+			struct tracking_sample_frame *view = sample->views + view_id;
+			if (view->bwobs != NULL && view->bwobs->num_blobs > 0) {
+				seed_view = view_id;
+				break;
+			}
+		}
+		seed_cam = ct->cam + seed_view;
+		seed_vw = sample->views + seed_view;
+		math_pose_transform(&seed_vw->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
+		math_pose_invert(&seed_cam->P_imu_cam, &P_cam_imu);
+		/* P_imu_obj = P_imu_cam . P_cam_obj (camera-in-rig . object-in-camera); P_cam_imu below maps back. */
+		math_pose_transform(&seed_cam->P_imu_cam, &P_cam_obj_prior, &P_imu_obj);
+
+		if (!joint_pnp_solve(&P_imu_obj, jviews, n_jviews, &device->led_model, &num_rays, &num_inliers)) {
+			declined = true; /* not enough cross-camera information / no consistent joint fit */
+		}
+	}
+
+	/* Gate the commit by the DRIFTLESS gravity-anchored prior tilt, the same cue the rest of the
+	 * front-end uses to reject flips: the joint solve dissolves the mirror by construction, but on a
+	 * marginal frame its dual-seed could still settle on the wrong branch. Only pre-empt the single-camera
+	 * cascade when the joint orientation's tilt agrees with the prior (within GRAVITY_TILT_TOL) — when the
+	 * fusion is tracking (tilt-trusted). Otherwise defer to the cascade rather than commit a possibly-
+	 * flipped joint pose. (Cold start: no trusted tilt -> let the cascade/ab-initio bootstrap run.) */
+	if (!declined && dev_state->prior_tilt_trusted) {
+		struct xrt_pose P_cam_obj_joint;
+		math_pose_transform(&P_cam_imu, &P_imu_obj, &P_cam_obj_joint); /* P_cam_obj = inv(P_imu_cam) . P_imu_obj */
+		double tilt_rad = 0.0, yaw_rad = 0.0;
+		pose_metrics_prior_orient_split(&P_cam_obj_joint.orientation, &P_cam_obj_prior.orientation,
+		                                &seed_vw->cam_gravity_vector, &tilt_rad, &yaw_rad);
+		if (tilt_rad > GRAVITY_TILT_TOL) {
+			declined = true; /* the joint pose is on the wrong tilt branch -> defer to the cascade */
+		}
+	}
+
+	if (declined) {
+		/* Restore the labels the predicted-pose seeding wrote, so a non-committing joint attempt leaves the
+		 * blob state untouched for the single-camera cascade and the frame-to-frame carry (no leak). */
+		for (int v = 0; v < sample->n_views; v++) {
+			struct tracking_sample_frame *view = sample->views + v;
+			if (view->bwobs == NULL) {
+				continue;
+			}
+			for (int b = 0; b < view->bwobs->num_blobs && b < MAX_BLOBS_PER_FRAME; b++) {
+				view->bwobs->blobs[b].led_id = saved_led_id[v][b];
+				view->bwobs->blobs[b].prev_led_id = saved_prev_led_id[v][b];
+			}
+		}
+		return false;
+	}
+
+	return device_submit_joint_pose(ct, dev_state, sample, &P_imu_obj, n_multi);
+}
+
+/* Prior-refine fast path: seed blob labels from the IMU-predicted pose and solve per
+ * view. This lets a slightly-off prior be pulled to a full PnP solve instead of falling through to the
+ * slow ab-initio search: the main cure for the low accept rate and the re-acquisition dropout/snap.
+ * Mislabels from a bad prior are rejected by the prior-consistency gate inside
+ * device_solve_view_from_labelled, so it only ever helps. */
 static bool
 device_try_prior_refine(struct t_constellation_tracker *ct,
                         struct tracking_sample_device_state *dev_state,
                         struct constellation_tracking_sample *sample)
 {
 	struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
+	const uint8_t telem_dev = telem_device_id(device->connection->xdev);
+
+	for (int view_id = 0; view_id < sample->n_views; view_id++) {
+		struct tracking_sample_frame *view = sample->views + view_id;
+		if (view->bwobs == NULL || view->bwobs->num_blobs == 0) {
+			continue;
+		}
+
+		const int n_labelled = device_propagate_labels_in_view(ct, dev_state, sample, view_id);
+
+		if (device_solve_view_from_labelled(ct, dev_state, sample, view_id, false /* normal accept */)) {
+			if (g2_telem_enabled()) {
+				/* This device was resolved by predicted-pose label propagation (value = LEDs propagated)
+				 * rather than falling through to the ab-initio search. */
+				g2_telem_event(telem_dev, (uint64_t)sample->timestamp, 10 /* label_propagated */,
+				               (float)n_labelled);
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Partial-information fold with a covariance gate.
+ *
+ * The fast paths require >=4 cleanly-PnP-able LEDs in a single camera; below that they bail and the
+ * frame's optical information is DISCARDED to the slow ab-initio search (the dominant fall-through,
+ * ~92% of fast bails — a visibility limit, edge-on/far/occluded controller). This folds the few LEDs
+ * that ARE confidently matched to the prior, WITHOUT committing a pose: for each prior-visible LED we
+ * ask the fusion for its predicted image point + 2x2 innovation covariance S = H·P·Hᵀ + R
+ * (predict_led_gate), then accept the blob whose Mahalanobis distance d²=rᵀS⁻¹r is smallest AND
+ * ≤ χ²₂(0.99). Only in-gate LEDs are folded (the ESKF then grows covariance honestly on 1-3 LEDs).
+ *
+ * Guards (the contract):
+ *  - COLD START / no prior: predict_led_gate returns false until the fusion is tracking, AND we require
+ *    prior_tilt_trusted (= the fusion is tracking, gravity-anchored prior available). Untracked => no-op
+ *    => the existing ab-initio bootstrap runs unchanged. Never folds against an unreliable reference.
+ *  - MISLABEL: the anisotropic S is the guard. A flipped/garbage correspondence reprojects far from
+ *    zhat (in tilt especially — S is tight there), so d² blows past the gate and the LED is NOT folded.
+ *    The per-LED χ² gate inside fold_led_observations is the second, consistent line of defence.
+ *  - Each blob is assigned to at most one LED: LED-order greedy (LEDs scanned in index order, each claims
+ *    its min-d² of the still-free in-gate blobs; blob_taken[] enforces one blob per LED and one LED per
+ *    blob). Deterministic; harmless with 1-3 sparse LEDs (each fold is re-gated by the ESKF's own χ²).
+ *
+ * Does NOT report a pose (no submit_device_pose, no PnP "accept"); it only feeds the filter, so the
+ * device keeps reporting its covariance-grown prior and the frame still falls through to ab-initio for a
+ * genuine (re)acquire. Returns true iff at least one LED was gate-folded (diagnostic). A <4-LED frame is
+ * used productively here; the accept/flip decision stays with the anisotropic prior-cost paths (the
+ * ab-initio few-LED accept is flip-ranked by the same prior split). */
+static bool
+device_try_partial_fold(struct t_constellation_tracker *ct,
+                        struct tracking_sample_device_state *dev_state,
+                        struct constellation_tracking_sample *sample)
+{
+	struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
+
+	/* No reliable prior to gate with (cold start) -> no-op, fall back to ab-initio. The covariance gate
+	 * needs a tracking filter (predict_led_gate returns false otherwise); prior_tilt_trusted is exactly
+	 * "the fusion is tracking" (the gravity-anchored prior is available, even through a dropout). The
+	 * anisotropic S handles tilt/yaw weighting itself, so no yaw-trust requirement here. */
+	if (!dev_state->prior_tilt_trusted) {
+		return false;
+	}
+	bool folded_any = false;
 
 	for (int view_id = 0; view_id < sample->n_views; view_id++) {
 		struct tracking_sample_frame *view = sample->views + view_id;
@@ -878,20 +1265,98 @@ device_try_prior_refine(struct t_constellation_tracker *ct,
 		if (view->bwobs == NULL || view->bwobs->num_blobs == 0) {
 			continue;
 		}
+		blobservation *bwobs = view->bwobs;
 
 		struct xrt_pose P_cam_obj_prior;
 		math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
 
-		/* Label this view's blobs from where the predicted pose says the LEDs project. */
-		pose_metrics_match_pose_to_blobs(&P_cam_obj_prior, view->bwobs->blobs, view->bwobs->num_blobs,
-		                                 &device->led_model, &cam->camera_model, &dev_state->blob_match_info);
-		mark_matching_blobs(ct, &P_cam_obj_prior, view->bwobs, &device->led_model, &dev_state->blob_match_info);
+		/* Enumerate the prior-visible (front-facing, in-frame) LEDs for this view. We do NOT use the
+		 * fixed-radius matched_blob it fills — the covariance gate below makes the real association. */
+		pose_metrics_match_pose_to_blobs(&P_cam_obj_prior, bwobs->blobs, bwobs->num_blobs, &device->led_model,
+		                                 &cam->camera_model, &dev_state->blob_match_info);
 
-		if (device_solve_view_from_labelled(ct, dev_state, sample, view_id, false /* normal accept */)) {
-			return true;
+		/* The extrinsic + intrinsics the fusion gate must use (identical to emit_view_led_observations). */
+		struct xrt_pose P_xrworld_cam;
+		math_pose_transform(&view->P_cam_world, &P_YZ_FLIP, &P_xrworld_cam);
+		const struct t_constellation_cam_calib cam_calib = {
+		    cam->camera_model.calib.fx, cam->camera_model.calib.fy, cam->camera_model.calib.cx,
+		    cam->camera_model.calib.cy};
+
+		/* Precompute each blob's undistorted PIXEL position once (matches the gate's zhat units). */
+		struct xrt_vec2 blob_px[MAX_BLOBS_PER_FRAME];
+		bool blob_taken[MAX_BLOBS_PER_FRAME] = {false};
+		const int num_blobs = bwobs->num_blobs < MAX_BLOBS_PER_FRAME ? bwobs->num_blobs : MAX_BLOBS_PER_FRAME;
+		for (int b = 0; b < num_blobs; b++) {
+			float nx = 0.f, ny = 0.f;
+			t_camera_models_undistort(&cam->camera_model.calib, bwobs->blobs[b].x, bwobs->blobs[b].y, &nx, &ny);
+			blob_px[b].x = cam->camera_model.calib.fx * nx + cam->camera_model.calib.cx;
+			blob_px[b].y = cam->camera_model.calib.fy * ny + cam->camera_model.calib.cy;
+		}
+
+		int n_matched = 0;
+		for (int i = 0; i < dev_state->blob_match_info.num_visible_leds; i++) {
+			struct pose_metrics_visible_led_info *visible_led = &dev_state->blob_match_info.visible_leds[i];
+			visible_led->matched_blob = NULL; /* covariance gate decides; ignore the radius match */
+
+			/* led_obj in the OpenXR object frame, exactly as emit_view_led_observations builds it. */
+			struct xrt_vec3 led_flip = {visible_led->led->pos.x, -visible_led->led->pos.y,
+			                            -visible_led->led->pos.z};
+			struct xrt_vec3 led_obj;
+			math_pose_transform_point(&device->led_model.P_device_model, &led_flip, &led_obj);
+
+			float zhat[2], S[4];
+			if (!constellation_tracked_device_connection_predict_led_gate(
+			        device->connection, &P_xrworld_cam, &cam_calib, &led_obj, zhat, S)) {
+				/* Untracked / non-finite -> no usable gate for any LED this frame: stop (cold start). */
+				return false;
+			}
+
+			/* S = [[s0,s1],[s2,s3]]; S^-1 = 1/det [[s3,-s1],[-s2,s0]]. d² = rᵀ S⁻¹ r. */
+			const double det = (double)S[0] * S[3] - (double)S[1] * S[2];
+			if (!(det > 1e-9)) {
+				continue; /* degenerate covariance -> skip this LED (no fold) */
+			}
+			const double inv00 = S[3] / det, inv01 = -S[1] / det, inv10 = -S[2] / det, inv11 = S[0] / det;
+
+			int best_b = -1;
+			double best_d2 = PARTIAL_FOLD_CHI2_2DOF;
+			for (int b = 0; b < num_blobs; b++) {
+				if (blob_taken[b]) {
+					continue;
+				}
+				/* Skip blobs already labelled to ANOTHER device (unlabelled == LED_INVALID_ID is OK). */
+				const uint16_t bid = bwobs->blobs[b].led_id;
+				if (bid != LED_INVALID_ID && LED_OBJECT_ID(bid) != device->led_model.id) {
+					continue;
+				}
+				const double rx = (double)blob_px[b].x - zhat[0];
+				const double ry = (double)blob_px[b].y - zhat[1];
+				const double d2 = rx * (inv00 * rx + inv01 * ry) + ry * (inv10 * rx + inv11 * ry);
+				if (d2 < best_d2) {
+					best_d2 = d2;
+					best_b = b;
+				}
+			}
+			if (best_b >= 0) {
+				visible_led->matched_blob = &bwobs->blobs[best_b];
+				blob_taken[best_b] = true;
+				n_matched++;
+			}
+		}
+
+		/* Fold ONLY the covariance-gated LEDs (each re-gated by the fusion's own per-LED χ²). One or two
+		 * gated LEDs are enough to keep the filter informed without committing a (flip-prone) pose. */
+		if (n_matched > 0) {
+			emit_view_led_observations(dev_state, device, cam, view, view_id, sample->timestamp);
+			folded_any = true;
+			if (g2_telem_enabled()) {
+				g2_telem_event(telem_device_id(device->connection->xdev), (uint64_t)sample->timestamp,
+				               9 /* partial_fold_count */, (float)n_matched);
+			}
 		}
 	}
-	return false;
+
+	return folded_any; /* true == at least one LED was gate-folded this frame (diagnostic) */
 }
 
 // Fast frame processing: blob extraction and match to existing predictions
@@ -1040,22 +1505,27 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		 * when confident. */
 		float pos_bound = MIN_POS_ERROR, rot_bound = MIN_ROT_ERROR;
 		double pos_std = 0.0, rot_std = 0.0;
-		bool orient_trusted = false;
+		bool tilt_trusted = false;
+		/* Soft mirror-flip cost's yaw scale: the live fusion yaw 1-sigma when tracking, else half a turn
+		 * (untracked -> the yaw term vanishes). Floored at the tilt bound so a falsely-tiny reported sigma
+		 * can't make the yaw term explode and over-penalise a real drifted yaw. */
+		float yaw_sigma = (float)FLIP_COST_YAW_SIGMA_MAX;
 		if (constellation_tracked_device_connection_get_pose_uncertainty(device->connection, &pos_std,
 		                                                                 &rot_std)) {
 			pos_bound = (float)fmin(fmax(PRIOR_GATE_SIGMA * pos_std, MIN_POS_ERROR), MAX_POS_ERROR);
 			rot_bound = (float)fmin(fmax(PRIOR_GATE_SIGMA * rot_std, MIN_ROT_ERROR), MAX_ROT_ERROR);
-			/* Trust the prior orientation to veto mirror-flips only while the fusion is tracking AND its
-			 * 3-sigma orientation uncertainty is below the gate ceiling. Past the ceiling (long dropout)
-			 * the prior is too uncertain to disambiguate, so the search runs unconstrained (cold reacquire). */
-			orient_trusted = (PRIOR_GATE_SIGMA * rot_std) < MAX_ROT_ERROR;
+			yaw_sigma = (float)fmin(fmax(rot_std, GRAVITY_TILT_TOL), FLIP_COST_YAW_SIGMA_MAX);
+			/* TILT is driftless (gravity-anchored): trusted whenever the fusion is tracking, even through a
+			 * dropout. The soft cost's yaw scale (yaw_sigma) widens with the live yaw uncertainty, so a
+			 * stale yaw self-deweights rather than needing a binary trust flag. */
+			tilt_trusted = true; /* get_pose_uncertainty returned true => tracking => gravity-anchored prior */
 		}
-		dev_state->prior_orient_trusted = orient_trusted && !debug_get_bool_option_no_flip_veto();
+		dev_state->prior_tilt_trusted = tilt_trusted;
+		dev_state->prior_yaw_sigma_rad = yaw_sigma;
 		dev_state->prior_pos_error.x = dev_state->prior_pos_error.y = dev_state->prior_pos_error.z =
 		    pos_bound;
 		dev_state->prior_rot_error.x = dev_state->prior_rot_error.y = dev_state->prior_rot_error.z =
 		    rot_bound;
-		dev_state->gravity_error_rad = MIN_ROT_ERROR;
 
 		dev_state->have_last_seen_pose = device->have_last_seen_pose;
 		dev_state->last_seen_pose = device->last_seen_pose;
@@ -1081,6 +1551,18 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 
 		CT_DEBUG(ct, "Doing fast match search for device %d", device->led_model.id);
 
+		/* When 2+ cameras co-see the controller, solve ONE generalised (non-central) PnP over their pooled
+		 * LED bearing rays FIRST: the cross-camera baseline dissolves the single-camera front/back mirror by
+		 * construction (the flip cannot fit both cameras), so a multi-cam frame is resolved by the
+		 * disambiguated joint pose and never commits a single-camera flip. The commit is heavily gated
+		 * (>= 2 cameras each strongly supporting it, prior-position+orientation match, gravity-anchored tilt
+		 * agreement) and is a no-op (labels restored, false returned) otherwise — so a marginal frame falls
+		 * straight through to the single-camera cascade below. */
+		if (device_try_joint_pnp(ct, dev_state, sample)) {
+			CT_DEBUG(ct, "Resolved device %d by multi-camera joint PnP in view %d", device->led_model.id,
+			         dev_state->found_pose_view_id);
+			continue;
+		}
 		if (device_try_global_pose(ct, dev_state, sample, &dev_state->P_world_obj_prior)) {
 			CT_DEBUG(ct, "Found fast match search for device %d in view %d from prior pose",
 			         device->led_model.id, dev_state->found_pose_view_id);
@@ -1105,6 +1587,13 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 			         dev_state->found_pose_view_id);
 			continue;
 		}
+		/* No PnP-able pose this frame (the <4-LED visibility wall). Before discarding the frame to the
+		 * slow ab-initio search, FOLD the individual LEDs that are confidently matched to the prior,
+		 * each gated by the ESKF's anisotropic per-LED covariance. No-op at cold start (no prior). If it
+		 * folds anything, the frame's information is used and we DON'T run the flip-prone ab-initio
+		 * few-LED accept on the same LEDs (~92-100% of flips). If it can't fold (no prior / no in-gate
+		 * LED), ab-initio still runs as the genuine (re)acquire fallback. */
+		device_try_partial_fold(ct, dev_state, sample);
 		if (!dev_state->found_device_pose) {
 			need_full_search = true;
 		}
@@ -1168,12 +1657,19 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		/* Send the sample for long analysis */
 		os_thread_helper_lock(&ct->long_analysis_thread);
 		if (ct->long_analysis_pending_sample != NULL) {
+			/* (b) a queued sample is dropped before the long thread ever processes it: that frame
+			 * exits the pipeline here, so count it. */
 			constellation_tracking_sample_free(ct->long_analysis_pending_sample);
+			ct->frames_completed++;
 		}
 		ct->long_analysis_pending_sample = sample;
 		os_thread_helper_signal_locked(&ct->long_analysis_thread);
 		os_thread_helper_unlock(&ct->long_analysis_thread);
 	} else {
+		/* (a) fast path done, no long analysis: this frame exits the pipeline here. */
+		os_thread_helper_lock(&ct->long_analysis_thread);
+		ct->frames_completed++;
+		os_thread_helper_unlock(&ct->long_analysis_thread);
 		/* not sending for long analysis: free it */
 		constellation_tracking_sample_free(sample);
 	}
@@ -1215,10 +1711,14 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
 					break; /* This device was already found on the previous pass */
 
 				enum correspondence_search_flags search_flags =
-				    CS_FLAG_STOP_FOR_STRONG_MATCH | CS_FLAG_HAVE_POSE_PRIOR | CS_FLAG_MATCH_GRAVITY;
+				    CS_FLAG_STOP_FOR_STRONG_MATCH | CS_FLAG_HAVE_POSE_PRIOR;
 
-				/* Select the prior-consistent P3P twin (reject mirror-flips) when the prior is reliable. */
-				if (dev_state->prior_orient_trusted)
+				/* THE soft anisotropic prior cost: enabled whenever the (gravity-anchored, driftless)
+				 * prior TILT is trusted — i.e. the fusion is tracking. It out-ranks the tilt-flipped P3P
+				 * twin even when the yaw prior is stale (the dropout/snap-back case); the yaw term widens as
+				 * the live yaw sigma grows. Cold start (untracked) leaves it off, so the search runs on
+				 * reprojection alone (cold reacquire). */
+				if (dev_state->prior_tilt_trusted)
 					search_flags |= CS_FLAG_TRUST_PRIOR_ORIENT;
 
 				if (pass == 0) {
@@ -1232,13 +1732,17 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
 				struct xrt_pose P_cam_obj;
 				math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj);
 
+				/* tilt scale = the tight driftless GRAVITY_TILT_TOL; yaw scale = the live fusion yaw
+				 * 1-sigma (large when stale -> the yaw term vanishes); Huber knee + weight as derived. */
 				if (correspondence_search_find_one_pose(
 				        cam->cs, device->search_led_model, search_flags, &P_cam_obj,
-				        &dev_state->prior_pos_error, &dev_state->prior_rot_error,
-				        &view->cam_gravity_vector, dev_state->gravity_error_rad, &dev_state->score)) {
+				        &dev_state->prior_pos_error, &dev_state->prior_rot_error, &view->cam_gravity_vector,
+				        (float)GRAVITY_TILT_TOL, dev_state->prior_yaw_sigma_rad,
+				        (float)FLIP_COST_HUBER_KNEE_SIGMA, (float)FLIP_COST_WEIGHT, &dev_state->score)) {
 					CT_DEBUG(ct, "Found a pose on cam %u device %d long search pass %d", view_id,
 					         device->led_model.id, pass);
-					submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj, false /* not a recovery */);
+					submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj, false /* not a recovery */,
+					                   false /* single-cam: take the polish unconditionally */);
 					dev_found[d] = true;
 					break;
 				}
@@ -1313,6 +1817,10 @@ constellation_tracking_long_analysis_thread(void *ptr)
 		}
 
 		os_thread_helper_lock(&ct->long_analysis_thread);
+		if (sample != NULL) {
+			/* (c) the long thread finished this frame: it exits the pipeline here. */
+			ct->frames_completed++;
+		}
 	}
 	os_thread_helper_unlock(&ct->long_analysis_thread);
 
@@ -1404,6 +1912,7 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
 	ct->debug_draw_blob_ids = true;
 	ct->hmd_xdev = hmd_xdev;
 	ct->controller_masks_sink = controller_mask_sink;
+	ct->frames_completed = 0;
 
 	// Set up the per-camera constellation tracking pieces config and pose
 	ct->cam_count = cams->cam_count;
@@ -1605,4 +2114,13 @@ t_constellation_tracked_device_connection_disconnect(struct t_constellation_trac
 	if (xrt_reference_dec_and_is_zero(&ctdc->ref)) {
 		constellation_tracked_device_connection_destroy(ctdc);
 	}
+}
+
+uint64_t
+t_constellation_tracker_debug_frames_completed(struct t_constellation_tracker *ct)
+{
+	os_thread_helper_lock(&ct->long_analysis_thread);
+	uint64_t n = ct->frames_completed;
+	os_thread_helper_unlock(&ct->long_analysis_thread);
+	return n;
 }

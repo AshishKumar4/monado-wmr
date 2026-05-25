@@ -17,6 +17,10 @@
 #include "camera_model.h"
 #include "pose_metrics.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define MAX_BLOB_SEARCH_DEPTH 5
 
 enum correspondence_search_flags
@@ -29,11 +33,13 @@ enum correspondence_search_flags
 	CS_FLAG_MATCH_ALL_BLOBS =
 	    0x8, /* Allow matching against all blobs, not just unlabelled ones or for the current device */
 	CS_FLAG_HAVE_POSE_PRIOR = 0x10, /* If the input obj_cam_pose contains a valid prior */
-	CS_FLAG_MATCH_GRAVITY = 0x20,   /* Use the provided gravity vector to check pose verticality */
 	CS_FLAG_TRUST_PRIOR_ORIENT =
-	    0x40, /* Veto candidates whose full orientation grossly disagrees with the prior (mirror-flip
-	             rejection). Only set when the prior orientation is trustworthy; selects the correct P3P
-	             twin instead of dropping the frame. Requires CS_FLAG_HAVE_POSE_PRIOR. */
+	    0x20, /* Apply the soft anisotropic prior-consistency cost (mirror-flip re-rank): add a robust prior
+	             penalty to each candidate's reprojection cost so the prior-consistent twin out-ranks the
+	             flip, without ever dropping a candidate. The penalty is the anisotropic Mahalanobis distance
+	             of the candidate orientation from the prior (TILT scaled by the tight driftless sigma, YAW by
+	             the live fusion sigma), Huber-robustified. Requires CS_FLAG_HAVE_POSE_PRIOR + an up_vector
+	             (the world-up in camera frame). */
 };
 
 struct cs_image_point
@@ -62,6 +68,15 @@ struct cs_model_info
 	enum pose_match_flags match_flags;
 
 	struct pose_metrics best_score;
+	double best_prior_cost; /* soft prior penalty (px^2) of best_pose; folded into the candidate ranking */
+
+	/* Admissible-bound prune state, cached when best_pose updates (CS_FLAG_TRUST_PRIOR_ORIENT). A new
+	 * candidate's prior penalty alone lower-bounds its combined cost (reproj >= 0), so a candidate whose
+	 * cheap prior cost / orient error already loses every score_is_better branch against the current GOOD
+	 * best is skipped before the expensive reprojection — the accepted pose is unchanged. */
+	double best_combined_cost;  /* best_score.reprojection_error + best_prior_cost */
+	double best_cost_per_led;   /* best_combined_cost / best_score.matched_blobs */
+	double best_orient_err_len; /* |ln(best^-1 . prior)| (the score_is_better orient tiebreak metric) */
 
 	/* Search parameters */
 	double search_start_time;
@@ -78,10 +93,16 @@ struct cs_model_info
 	struct xrt_vec3 *pos_error_thresh;
 	struct xrt_vec3 *rot_error_thresh;
 
-	/* Used when CS_FLAG_MATCH_GRAVITY is set */
-	struct xrt_vec3 gravity_vector;
-	struct xrt_quat gravity_swing;
-	float gravity_tolerance_rad;
+	/* Anisotropic soft prior-orientation cost (CS_FLAG_TRUST_PRIOR_ORIENT). up_vector = world-up in the
+	 * camera frame (the swing/twist axis). sigma_tilt_rad = the tight DRIFTLESS gravity-swing (tilt) scale;
+	 * sigma_yaw_rad = the live fusion yaw 1-sigma (large when stale -> the yaw term vanishes). huber_knee_sigma
+	 * bends a gross outlier's penalty to linear; cost_weight commensurates it with the reprojection error.
+	 * See pose_metrics_prior_orient_cost. */
+	struct xrt_vec3 up_vector;
+	float sigma_tilt_rad;
+	float sigma_yaw_rad;
+	float huber_knee_sigma;
+	float cost_weight;
 };
 
 struct correspondence_search
@@ -92,6 +113,7 @@ struct correspondence_search
 
 	unsigned int num_trials;
 	unsigned int num_pose_checks;
+	unsigned int num_pose_checks_pruned; /* candidates skipped by the admissible-bound prior prune */
 
 	struct camera_model *calib;
 
@@ -114,11 +136,18 @@ correspondence_search_find_one_pose(struct correspondence_search *cs,
                                     struct xrt_pose *pose,
                                     struct xrt_vec3 *pos_error_thresh,
                                     struct xrt_vec3 *rot_error_thresh,
-                                    struct xrt_vec3 *gravity_vector,
-                                    float gravity_tolerance_rad,
+                                    struct xrt_vec3 *up_vector,
+                                    float sigma_tilt_rad,
+                                    float sigma_yaw_rad,
+                                    float huber_knee_sigma,
+                                    float cost_weight,
                                     struct pose_metrics *score);
 bool
 correspondence_search_have_pose(struct correspondence_search *cs,
                                 int model_id,
                                 struct xrt_pose *pose,
                                 struct pose_metrics *score);
+
+#ifdef __cplusplus
+}
+#endif

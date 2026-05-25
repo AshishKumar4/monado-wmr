@@ -11,6 +11,7 @@
  * @ingroup constellation
  */
 #include <assert.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,6 +32,44 @@
 /* Set to 1 to do extra array tracking consistency checks */
 #define CONSISTENCY_CHECKS 0
 
+/* --- Blob-detection tuning ---
+ * Few knobs, all derived where possible. Values calibrated against real G2
+ * controller captures (short LED-flash exposure: dim spots peak ~24..200;
+ * fill ~0.7..0.9; peak/mean ~1.1..2.6, lower for dimmer LEDs). */
+
+/* Local adaptive threshold: a pixel only counts as blob if it is both above
+ * the global floor AND at least this many counts above its local background.
+ * This separates a dim LED next to a bright window and stops a uniformly
+ * bright background becoming blobs, without a full second pass. Kept small so
+ * it lifts the floor without eroding real LED spots (validated on captures:
+ * ~99% of dark-frame LEDs retained, bright-room false blobs cut >10x). */
+#define ADAPT_MARGIN 6
+/* Half-size of the local-background box (window = 2*r+1). Large enough to
+ * straddle an LED spot so the LED itself barely lifts its own background. */
+#define ADAPT_BG_RADIUS 12
+
+/* A pixel >= this is treated as saturated/clipped. 255 is the 8-bit physical ceiling; the 5-count guard
+ * band also catches near-clipped pixels whose greysum centroid is already biased. */
+#define SATURATION_LEVEL (255 - 5)
+
+/* Blob qualification (reject reflections / streaks / window edges). */
+#define MIN_FILL_RATIO 0.40f /* area / bbox-area; round spot is high, streak low */
+/* Peaked LED spot vs flat bright patch. Validated on real captures: across 209 certain LEDs (peak>=32)
+ * the ratio is always >=1.61 (0% dropped at 1.30), while room-noise blobs cluster <=1.26 (93% rejected). */
+#define MIN_PEAK_TO_MEAN 1.30f
+#define MIN_BLOB_AREA 3 /* drop salt-and-pepper specks */
+
+/* Centroid-uncertainty (R) inflation factors. A fully clipped or frame-edge-truncated spot has lost the
+ * symmetry information its centre relies on, so its variance is inflated up to these multiples. Derived as
+ * worst-case multipliers on the measured spread, not absolute pixel magic numbers: at full saturation the
+ * usable signal is the contour alone (~SAT_R_INFLATE_MAX wider), and a contour cut by the frame border is
+ * one-sided (~EDGE_R_INFLATE wider). A blob far dimmer than the frame's brightest credible spot is a weaker
+ * LED candidate (possible faint reflection), so its R is scaled up to DIM_R_INFLATE_MAX as it approaches the
+ * detect floor. All are linear blends keyed to a measured fraction in [0,1] -> no abrupt cull. */
+#define SAT_R_INFLATE_MAX 4.0f
+#define EDGE_R_INFLATE 3.0f
+#define DIM_R_INFLATE_MAX 4.0f
+
 #define QUEUE_ENTRIES (NUM_FRAMES_HISTORY + 1)
 
 #define abs(x) ((x) >= 0 ? (x) : -(x))
@@ -49,6 +88,11 @@ struct extent
 
 	/* Maximum pixel colour detected */
 	uint8_t max_pixel;
+
+	/* Accumulated over the whole (merged) blob for qualification, so no
+	 * second pass over the pixels is needed. */
+	uint32_t intensity_sum; /* sum of pixel values (for peak/mean) */
+	uint32_t sat_count;     /* number of saturated pixels */
 };
 
 struct extent_line
@@ -103,11 +147,10 @@ struct blobwatch
 	uint8_t cam_id;                  /* Camera index this blobwatch processes (for telemetry) */
 	int blob_max_wh;
 
-	/* Blob qualification: reject non-LED shapes (window edges, reflections, streaks). An LED images
-	 * as a small, roughly round, well-filled spot, so reject blobs too elongated or too sparse for
-	 * their bounding box. Lenient defaults; set 0 to disable a test. Tunable so a bright-room capture
-	 * can refine them. */
-	float blob_min_fill;   /* min area/(w*h): ~0.78 for a filled disk, far lower for a streak/edge */
+	/* Blob qualification: reject elongated non-LED shapes (window edges, reflections, streaks). An LED
+	 * images as a small, roughly round spot. Fill-ratio and peak-to-mean are compile-time shape priors
+	 * (MIN_FILL_RATIO / MIN_PEAK_TO_MEAN, data-validated); aspect stays a field as it is the one shape
+	 * cut a per-unit/bright-room calibration may want to vary. Set 0 to disable. */
 	float blob_min_aspect; /* min(w,h)/max(w,h): ~1 for an LED, low for a streak */
 
 	bool debug;
@@ -117,6 +160,11 @@ struct blobwatch
 	blobservation_queue observation_q;
 
 	blobservation *last_observation;
+
+	/* Integral image of the frame, used for an O(1) local-background box mean
+	 * per pixel (adaptive threshold). Lazily (re)allocated to frame size. */
+	uint32_t *integral;
+	int integral_w, integral_h; /* allocated dims = frame (w+1) x (h+1) */
 };
 
 /*
@@ -148,7 +196,6 @@ blobwatch_new(uint8_t pixel_threshold, uint8_t blob_required_threshold, uint8_t 
 	/* Don't store blobs that are too big to be LEDs sensibly
 	 * (arbitrary 35 pixel cut-off. FIXME: revisit this number) */
 	bw->blob_max_wh = 35;
-	bw->blob_min_fill = 0.30f;
 	bw->blob_min_aspect = 0.30f;
 
 	bw->last_observation = NULL;
@@ -165,18 +212,148 @@ blobwatch_new(uint8_t pixel_threshold, uint8_t blob_required_threshold, uint8_t 
 void
 blobwatch_free(blobwatch *bw)
 {
+	free(bw->integral);
 	free(bw);
 }
 
+/*
+ * Builds an integral image of the frame (single pass), so the mean of any
+ * box can be read in O(1). Used for the local adaptive threshold.
+ */
 static void
-compute_greysum(blobwatch *bw, struct xrt_frame *frame, struct extent *e, int end_y, float *led_x, float *led_y)
+build_integral(blobwatch *bw, struct xrt_frame *frame)
+{
+	const int w = frame->width, h = frame->height;
+	const int iw = w + 1, ih = h + 1;
+
+	if (bw->integral == NULL || bw->integral_w != iw || bw->integral_h != ih) {
+		free(bw->integral);
+		bw->integral = malloc((size_t)iw * ih * sizeof(uint32_t));
+		if (bw->integral == NULL) {
+			/* OOM on the realtime camera thread: degrade to the global-threshold-only path
+			 * (local_bg_mean returns 0 when integral==NULL) instead of dereferencing NULL; the
+			 * zeroed dims make the next frame retry the allocation. */
+			bw->integral_w = bw->integral_h = 0;
+			return;
+		}
+		bw->integral_w = iw;
+		bw->integral_h = ih;
+	}
+
+	/* uint32 holds the running sum: max value = w*h*255; safe for any sensor up to ~16.8 Mpx
+	 * (UINT32_MAX/255). The G2 cameras are 640x480, far inside that bound. */
+	uint32_t *I = bw->integral;
+	memset(I, 0, (size_t)iw * sizeof(uint32_t)); /* top border row */
+
+	for (int y = 0; y < h; y++) {
+		const uint8_t *src = frame->data + (size_t)frame->stride * y;
+		uint32_t *row = I + (size_t)(y + 1) * iw;
+		const uint32_t *prev = I + (size_t)y * iw;
+		uint32_t run = 0;
+		row[0] = 0; /* left border column */
+		for (int x = 0; x < w; x++) {
+			run += src[x];
+			row[x + 1] = prev[x + 1] + run;
+		}
+	}
+}
+
+/* Local background mean around (x,y) from the integral image. Returns 0 if the integral image is
+ * unavailable (OOM fallback), which makes the adaptive threshold degrade to the global floor. */
+static inline uint32_t
+local_bg_mean(const blobwatch *bw, int x, int y, int w, int h)
+{
+	if (bw->integral == NULL) {
+		return 0;
+	}
+	const int iw = bw->integral_w;
+	int x0 = x - ADAPT_BG_RADIUS, x1 = x + ADAPT_BG_RADIUS;
+	int y0 = y - ADAPT_BG_RADIUS, y1 = y + ADAPT_BG_RADIUS;
+	if (x0 < 0)
+		x0 = 0;
+	if (y0 < 0)
+		y0 = 0;
+	if (x1 >= w)
+		x1 = w - 1;
+	if (y1 >= h)
+		y1 = h - 1;
+
+	const uint32_t *I = bw->integral;
+	uint32_t sum = I[(size_t)(y1 + 1) * iw + (x1 + 1)] - I[(size_t)y0 * iw + (x1 + 1)] -
+	               I[(size_t)(y1 + 1) * iw + x0] + I[(size_t)y0 * iw + x0];
+	uint32_t cnt = (uint32_t)(x1 - x0 + 1) * (uint32_t)(y1 - y0 + 1);
+	return sum / cnt;
+}
+
+/*
+ * Saturation-contour centre of one axis.
+ *
+ * A clipped spot has a flat plateau, so the intensity-weighted centroid is
+ * driven by the (possibly asymmetric) skirt rather than the true centre. The
+ * saturated region itself, however, is symmetric about the spot centre for a
+ * symmetric PSF regardless of plateau width: its centre is the midpoint of the
+ * first and last saturated samples projected onto the axis. @p lo / @p hi are
+ * the smallest/largest saturated coordinate on this axis (inclusive, in the
+ * extent's local 0-based frame); @p origin places them in absolute pixel coords.
+ * The midpoint origin + (lo+hi)/2 is the sub-pixel centre under the same
+ * pixel-index = pixel-centre convention as the greysum centroid (which is why no
+ * extra half-pixel offset is added). Returns false if no saturated sample seen.
+ */
+static inline bool
+sat_contour_center(int lo, int hi, float origin, float *out)
+{
+	if (lo > hi) {
+		return false;
+	}
+	*out = origin + (lo + hi) * 0.5f;
+	return true;
+}
+
+/*
+ * Sub-pixel centroid of one blob, plus its centroid measurement variance (R, px^2).
+ *
+ * Unsaturated: intensity-weighted greysum centre, then a parabolic (3-point)
+ * peak fit on the row/column profiles through the brightest pixel, which lowers
+ * centroid noise on a roughly Gaussian spot.
+ *
+ * Saturated: the clipped plateau biases the greysum, so the centre is taken from
+ * the saturation contour (the midpoint of the saturated span on each axis), which
+ * is symmetric about the true centre independent of the plateau width or skirt
+ * asymmetry. Falls back to the bbox centre only if the contour is somehow empty.
+ *
+ * The variance is derived from the spot's own intensity-weighted spatial spread
+ * (second central moment): a fat spot localises its centre less precisely. It is
+ * the source-of-truth per-blob R that a downstream matcher can use to weight the
+ * reprojection cost; @ref store_blob inflates it further for saturation, frame-edge
+ * truncation and relative dimness.
+ */
+static void
+compute_greysum(blobwatch *bw,
+                struct xrt_frame *frame,
+                struct extent *e,
+                int end_y,
+                bool saturated,
+                float *led_x,
+                float *led_y,
+                float *pos_var_px2)
 {
 	const uint16_t width = e->right - e->left + 1;
 	const uint16_t height = end_y - e->top + 1;
+	const uint8_t weight_cap = saturated ? (SATURATION_LEVEL - 1) : 255;
 	uint8_t *pixels;
 	uint16_t x, y;
 	uint32_t x_pos, y_pos;
-	uint32_t greysum_total = 0, greysum_x = 0, greysum_y = 0;
+	uint64_t greysum_total = 0, greysum_x = 0, greysum_y = 0;
+	/* Second moments (for the centroid variance), accumulated about the extent origin. */
+	uint64_t greysum_xx = 0, greysum_yy = 0;
+
+	/* Brightest-pixel location and its row/column neighbour values, for the
+	 * parabolic peak fit (only meaningful when not saturated). */
+	uint32_t peak_val = 0;
+	int peak_x = 0, peak_y = 0;
+
+	/* Saturation-contour bounds (local 0-based extent coords) for the saturated centre. */
+	int sat_x_lo = INT_MAX, sat_x_hi = -1, sat_y_lo = INT_MAX, sat_y_hi = -1;
 
 	/* Point to top left pixel of the extent */
 	pixels = frame->data + frame->stride * e->top + e->left;
@@ -189,17 +366,102 @@ compute_greysum(blobwatch *bw, struct xrt_frame *frame, struct extent *e, int en
 		for (x = 0; x < width; x++) {
 			uint32_t pix = pixels[x];
 
-			greysum_total += pix;
-			greysum_x += x_pos * pix;
-			greysum_y += y_pos * pix;
+			if (pix > peak_val) {
+				peak_val = pix;
+				peak_x = e->left + x;
+				peak_y = e->top + y;
+			}
+			if (pix >= SATURATION_LEVEL) {
+				if (x < sat_x_lo)
+					sat_x_lo = x;
+				if (x > sat_x_hi)
+					sat_x_hi = x;
+				if (y < sat_y_lo)
+					sat_y_lo = y;
+				if (y > sat_y_hi)
+					sat_y_hi = y;
+			}
+
+			/* Drop the clipped plateau from the weighted sums for saturated blobs: their centre
+			 * comes from the saturation contour below, and these moments then measure only the
+			 * informative skirt spread (the variance). Unsaturated blobs weight every pixel. */
+			uint32_t w = pix <= weight_cap ? pix : 0;
+			greysum_total += w;
+			greysum_x += (uint64_t)x_pos * w;
+			greysum_y += (uint64_t)y_pos * w;
+			greysum_xx += (uint64_t)x_pos * x_pos * w;
+			greysum_yy += (uint64_t)y_pos * y_pos * w;
 			x_pos++;
 		}
 
 		pixels += frame->stride;
 	}
 
-	*led_x = (float)(greysum_x) / greysum_total - 1;
-	*led_y = (float)(greysum_y) / greysum_total - 1;
+	/* Centroid variance from the intensity-weighted spatial spread: Var = E[r^2] - E[r]^2 per axis
+	 * (the spot's second central moment), averaged over both axes for an isotropic 1-DoF R. A larger,
+	 * more spread-out spot pins its centre less tightly. Floor at sub-pixel so a clean tight spot still
+	 * carries a small, finite R (never zero -> downstream division stays well-posed). */
+	if (greysum_total > 0) {
+		const double mx = (double)greysum_x / greysum_total;
+		const double my = (double)greysum_y / greysum_total;
+		double vx = (double)greysum_xx / greysum_total - mx * mx;
+		double vy = (double)greysum_yy / greysum_total - my * my;
+		if (vx < 0.0)
+			vx = 0.0;
+		if (vy < 0.0)
+			vy = 0.0;
+		*pos_var_px2 = (float)(0.5 * (vx + vy));
+	} else {
+		/* Fully-saturated spot: no weighted spread, fall back to the bbox half-extent as the spread. */
+		const float r = 0.5f * (width + height) * 0.5f;
+		*pos_var_px2 = r * r;
+	}
+	if (*pos_var_px2 < 0.25f)
+		*pos_var_px2 = 0.25f; /* >= (0.5 px)^2 */
+
+	if (saturated) {
+		/* Saturation-contour centre (robust to clipped plateau + skirt asymmetry). */
+		float cx, cy;
+		bool okx = sat_contour_center(sat_x_lo, sat_x_hi, (float)e->left, &cx);
+		bool oky = sat_contour_center(sat_y_lo, sat_y_hi, (float)e->top, &cy);
+		*led_x = okx ? cx : e->left + (width - 1) * 0.5f;
+		*led_y = oky ? cy : e->top + (height - 1) * 0.5f;
+		return;
+	}
+
+	if (greysum_total == 0) {
+		/* Tiny unsaturated blob whose only pixels were clipped (shouldn't happen here, but stay safe) */
+		*led_x = e->left + (width - 1) * 0.5f;
+		*led_y = e->top + (height - 1) * 0.5f;
+		return;
+	}
+
+	*led_x = (float)greysum_x / greysum_total - 1;
+	*led_y = (float)greysum_y / greysum_total - 1;
+
+	/* Parabolic peak refinement: blend the greysum centre toward the
+	 * sub-pixel peak of the 3-point profile through the brightest pixel.
+	 * Skipped for saturated blobs (no single peak) and at frame edges. */
+	if (peak_x > 0 && peak_x < (int)frame->width - 1 && peak_y > 0 && peak_y < (int)frame->height - 1) {
+		uint8_t *p = frame->data + frame->stride * peak_y + peak_x;
+		float c = peak_val;
+		float lx = p[-1], rx = p[1];
+		float ux = p[-frame->stride], dx = p[frame->stride];
+
+		float denx = lx - 2.0f * c + rx;
+		float deny = ux - 2.0f * c + dx;
+		/* Only accept a concave (true peak) fit; clamp the shift to ±0.5 px */
+		if (denx < 0.0f) {
+			float dxs = 0.5f * (lx - rx) / denx;
+			if (dxs > -0.5f && dxs < 0.5f)
+				*led_x = peak_x + dxs;
+		}
+		if (deny < 0.0f) {
+			float dys = 0.5f * (ux - dx) / deny;
+			if (dys > -0.5f && dys < 0.5f)
+				*led_y = peak_y + dys;
+		}
+	}
 }
 
 /*
@@ -214,12 +476,14 @@ store_blob(struct extent *e,
            uint32_t blob_id,
            float led_x,
            float led_y,
+           float pos_var_px2,
            uint8_t brightness)
 {
 	b += index;
 	b->blob_id = blob_id;
 	b->x = led_x;
 	b->y = led_y;
+	b->pos_var_px2 = pos_var_px2;
 	b->vx = 0;
 	b->vy = 0;
 
@@ -248,39 +512,67 @@ extent_to_blobs(blobwatch *bw, blobservation *ob, struct extent *e, int y, struc
 	}
 
 	/* Don't store 1x1 blobs */
-	if (e->top == y && e->left == e->right)
+	if (e->top == y && e->left == e->right) {
+		ob->dropped_shape_blobs++;
 		return;
+	}
 
 	/* Check width and height against the blob "maximum size" */
-	if (y - e->top > bw->blob_max_wh || e->right - e->left > bw->blob_max_wh)
+	if (y - e->top > bw->blob_max_wh || e->right - e->left > bw->blob_max_wh) {
+		ob->dropped_shape_blobs++;
 		return;
+	}
 
-	/* Reject non-LED shapes: an LED images as a small, roughly round, well-filled spot, so a very
-	 * elongated or sparse blob is a window edge / reflection / streak, not an LED. This is the main
-	 * defence against bright-room false blobs that pollute the constellation matcher. */
+	const uint32_t bb_w = e->right - e->left + 1;
+	const uint32_t bb_h = y - e->top + 1;
+
+	/* Drop tiny specks (sensor noise that survived the adaptive threshold). */
+	if (e->area < MIN_BLOB_AREA) {
+		ob->dropped_shape_blobs++;
+		return;
+	}
+
+	/* Reject non-LED shapes (window edges / reflections / streaks): an LED images as a small, roughly
+	 * round, well-filled, peaked spot. Aspect-ratio rejects elongated streaks/edges; fill-ratio rejects
+	 * sparse blobs; peak-to-mean rejects flat bright patches — before they pollute the matcher. */
 	{
-		const int blob_w = e->right - e->left + 1;
-		const int blob_h = y - e->top + 1;
-		const int lo = min(blob_w, blob_h);
-		const int hi = max(blob_w, blob_h);
+		const uint32_t lo = (bb_w < bb_h) ? bb_w : bb_h;
+		const uint32_t hi = (bb_w > bb_h) ? bb_w : bb_h;
 		if (bw->blob_min_aspect > 0.0f && hi > 0 && (float)lo / (float)hi < bw->blob_min_aspect) {
 			ob->dropped_shape_blobs++;
 			return;
 		}
-		if (bw->blob_min_fill > 0.0f && (float)e->area / (float)(blob_w * blob_h) < bw->blob_min_fill) {
-			ob->dropped_shape_blobs++;
-			return;
-		}
+	}
+	const float fill_ratio = (float)e->area / (float)(bb_w * bb_h);
+	const float mean = (float)e->intensity_sum / (float)e->area;
+	const float peak_to_mean = (float)e->max_pixel / (mean > 0.0f ? mean : 1.0f);
+	const bool saturated = e->sat_count > 0;
+	if (fill_ratio < MIN_FILL_RATIO || peak_to_mean < MIN_PEAK_TO_MEAN) {
+		ob->dropped_shape_blobs++; // a shape/quality reject, not a brightness (dark) one
+		return;
 	}
 
 	/* In the future we could generate multiple blobs from one extent if we detect
 	 * it as multiple LEDs */
 	while (ob->num_blobs < max_blobs) {
-		float led_x, led_y;
+		float led_x, led_y, pos_var_px2;
 
-		compute_greysum(bw, frame, e, y, &led_x, &led_y);
+		compute_greysum(bw, frame, e, y, saturated, &led_x, &led_y, &pos_var_px2);
 
-		store_blob(e, ob->num_blobs++, y, blobs, bw->next_blob_id++, led_x, led_y, e->max_pixel);
+		/* Inflate R for centroid information lost to clipping and to frame-border truncation. The
+		 * saturated fraction (clipped pixels / area) interpolates toward SAT_R_INFLATE_MAX; touching
+		 * the frame border multiplies by EDGE_R_INFLATE (its skirt/contour is one-sided). The remaining
+		 * dimness term is applied in process_frame once the brightest blob is known. */
+		const float sat_frac = (float)e->sat_count / (float)e->area;
+		float infl = 1.0f + sat_frac * (SAT_R_INFLATE_MAX - 1.0f);
+		const bool on_edge = e->left == 0 || e->top == 0 || (int)e->right == (int)frame->width - 1 ||
+		                     y == (int)frame->height - 1;
+		if (on_edge)
+			infl *= EDGE_R_INFLATE;
+		pos_var_px2 *= infl;
+
+		store_blob(e, ob->num_blobs++, y, blobs, bw->next_blob_id++, led_x, led_y, pos_var_px2,
+		           e->max_pixel);
 		break;
 	}
 }
@@ -318,17 +610,32 @@ process_scanline(uint8_t *line,
 		int start, end;
 		bool is_new_extent = true;
 		uint8_t max_pixel = 0;
+		uint32_t intensity_sum = 0;
+		uint32_t sat_count = 0;
 
-		/* Loop until pixel value exceeds threshold */
-		if (line[x] <= bw->pixel_threshold)
+		/* Adaptive threshold: a pixel must clear the global floor AND stand
+		 * out from its local background. Cheap (one integral-image lookup),
+		 * separates dim LEDs from bright reflections and stops a uniformly
+		 * bright background from forming blobs. */
+		if (line[x] <= bw->pixel_threshold ||
+		    line[x] < local_bg_mean(bw, x, y, frame->width, frame->height) + ADAPT_MARGIN)
 			continue;
 
-		start = x++;
+		start = x;
+		max_pixel = line[x];
+		intensity_sum += line[x];
+		if (line[x] >= SATURATION_LEVEL)
+			sat_count++;
+		x++;
 
 		/* Loop until pixel value falls below threshold */
-		while (x < frame->width && line[x] > bw->pixel_threshold) {
+		while (x < frame->width && line[x] > bw->pixel_threshold &&
+		       line[x] >= local_bg_mean(bw, x, y, frame->width, frame->height) + ADAPT_MARGIN) {
 			if (line[x] > max_pixel)
 				max_pixel = line[x];
+			intensity_sum += line[x];
+			if (line[x] >= SATURATION_LEVEL)
+				sat_count++;
 			x++;
 		}
 
@@ -340,6 +647,8 @@ process_scanline(uint8_t *line,
 		extent->end = end;
 		extent->area = x - start;
 		extent->max_pixel = max_pixel;
+		extent->intensity_sum = intensity_sum;
+		extent->sat_count = sat_count;
 
 		if (prev_el) {
 			/*
@@ -362,6 +671,8 @@ process_scanline(uint8_t *line,
 				if (le->max_pixel > extent->max_pixel)
 					extent->max_pixel = le->max_pixel;
 				extent->area += le->area;
+				extent->intensity_sum += le->intensity_sum;
+				extent->sat_count += le->sat_count;
 				is_new_extent = false;
 				le++;
 			}
@@ -417,12 +728,35 @@ process_frame(blobwatch *bw, blobservation *ob, struct xrt_frame *frame)
 	ob->dropped_dark_blobs = 0;
 	ob->dropped_shape_blobs = 0;
 
+	/* Integral image for the per-pixel local-background lookup (adaptive threshold) */
+	build_integral(bw, frame);
+
 	uint8_t *line = frame->data;
 	process_scanline(line, bw, 0, &el1, NULL, frame, ob);
 
 	for (uint32_t y = 1; y < frame->height; y++) {
 		process_scanline(line, bw, y, y & 1 ? &el2 : &el1, y & 1 ? &el1 : &el2, frame, ob);
 		line += frame->stride;
+	}
+
+	/* Relative-dimness R inflation (within-frame intensity rank): the brightest blob is the strongest LED
+	 * candidate; a much dimmer blob is more likely a faint reflection, so its centroid R is scaled up
+	 * toward DIM_R_INFLATE_MAX as its peak falls from the frame max toward the detect floor. Uncertainty-
+	 * aware (no cull) and self-referenced (no absolute brightness constant). Single blob -> no rank, no-op. */
+	if (ob->num_blobs >= 2) {
+		uint8_t bmax = 0;
+		for (int i = 0; i < ob->num_blobs; i++)
+			bmax = max(bmax, ob->blobs[i].brightness);
+		const float span = (float)bmax - (float)bw->blob_required_threshold;
+		if (span > 0.0f) {
+			for (int i = 0; i < ob->num_blobs; i++) {
+				struct blob *b = &ob->blobs[i];
+				float dim = ((float)bmax - (float)b->brightness) / span; /* 0 at peak, 1 at floor */
+				if (dim < 0.0f)
+					dim = 0.0f;
+				b->pos_var_px2 *= 1.0f + dim * (DIM_R_INFLATE_MAX - 1.0f);
+			}
+		}
 	}
 }
 
@@ -506,7 +840,7 @@ blobwatch_process(blobwatch *bw, struct xrt_frame *frame, uint16_t exposure, uin
 	/* Telemetry: one row per processed frame per camera. n_blobs is what we just
 	 * produced; frame_seq comes from the source frame. hw_ts_ns uses frame->timestamp,
 	 * the monotonic-converted frame time (NOT the raw device-clock source_timestamp),
-	 * so it shares the common clock with every other stream's t_mono_ns (MAJOR-3).
+	 * so it shares the common clock with every other stream's t_mono_ns.
 	 * exposure is the authoritative per-frame value read from the camera's pixel header
 	 * (plumbed in by the caller); gain is the commanded value (0 if unknown). */
 	g2_telem_frame(bw->cam_id, (uint64_t)frame->timestamp, (uint32_t)frame->source_sequence,

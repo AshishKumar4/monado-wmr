@@ -255,6 +255,45 @@ dump_pose(struct correspondence_search *cs,
 }
 #endif
 
+/* |ln(pose^-1 . prior)|: the orientation-error magnitude pose_metrics_score_is_better_pose_prior uses for
+ * its final tiebreak, computed from orientations alone (no reprojection) — same operations as
+ * check_pose_prior so the prune metric cannot drift from the comparator's. */
+static double
+prior_orient_err_len(const struct xrt_pose *pose, const struct xrt_pose *prior)
+{
+	struct xrt_quat orient_diff;
+	math_quat_unrotate(&pose->orientation, &prior->orientation, &orient_diff);
+	math_quat_normalize(&orient_diff);
+	struct xrt_vec3 err;
+	math_quat_ln(&orient_diff, &err);
+	return m_vec3_len(err);
+}
+
+/* Admissible-bound prune: skip the expensive reprojection for a candidate that provably loses every
+ * pose_metrics_score_is_better_pose_prior branch against the current GOOD best. The candidate's prior
+ * penalty alone lower-bounds its combined cost (reproj >= 0) and its matched-blob count is bounded by the
+ * available blobs, so the cheap prior_cost + orient error decide it WITHOUT the projection. Only active once
+ * a GOOD best exists (else branch 1 — old-not-GOOD — could accept any GOOD candidate). With no prior trust
+ * prior_cost == 0 -> branch-4 guard fails -> never prunes (cold start untouched). */
+static bool
+prune_by_prior_bound(const struct cs_model_info *mi, double prior_cost, double cand_orient_err_len, int num_blobs)
+{
+	if (!(mi->match_flags & POSE_MATCH_GOOD) || num_blobs <= 0)
+		return false;
+	/* Branch 4 (equal blobs, lower combined cost): new_cost >= prior_cost, so prior_cost >= best_combined
+	 * makes it impossible. */
+	if (prior_cost < mi->best_combined_cost)
+		return false;
+	/* Branches 2,3 (more matched blobs): min new_cost_per_led = prior_cost / new_matched >= prior_cost /
+	 * num_blobs; the looser 1.1x bound dominates the 1.0x one. */
+	if (prior_cost / num_blobs < mi->best_cost_per_led * 1.1)
+		return false;
+	/* Branch 5 (orient tiebreak): only fires when the candidate's orient error is strictly smaller. */
+	if (cand_orient_err_len < mi->best_orient_err_len)
+		return false;
+	return true;
+}
+
 static bool
 correspondence_search_project_pose(struct correspondence_search *cs,
                                    struct t_constellation_search_model *model,
@@ -266,57 +305,36 @@ correspondence_search_project_pose(struct correspondence_search *cs,
 	/* If enough match, print out the pose */
 	struct t_constellation_led_model *leds = model->led_model;
 
-	/* Increment stats */
-	cs->num_pose_checks++;
-
 	if (pose->position.z < 0.05 || pose->position.z > 15) { /* Invalid position, out of range */
 		LOG("Pose out of range - Z @ %f metres\n", pose->position.z);
 		return false;
 	}
 
-	/* See if we need to make a gravity vector alignment check */
-	if (mi->search_flags & CS_FLAG_MATCH_GRAVITY) {
-		struct xrt_quat pose_gravity_swing, pose_gravity_twist;
-
-		math_quat_decompose_swing_twist(&pose->orientation, &mi->gravity_vector, &pose_gravity_swing,
-		                                &pose_gravity_twist);
-
-		// Calculate the difference between the amount of gravity swing, ignoring axis
-		float pose_angle = fabs(acosf(pose_gravity_swing.w)) - fabs(acosf(mi->gravity_swing.w));
-		if (pose_angle > mi->gravity_tolerance_rad) {
-			DEBUG(
-			    "model %d failed pose match - orientation was not within tolerance (error %f deg > %f "
-			    "deg)\n"
-			    "gravity vec %f %f %f pose %f %f %f %f swing %f %f %f %f prior swing %f %f %f %f\n",
-			    mi->id, RAD_TO_DEG(pose_angle), RAD_TO_DEG(mi->gravity_tolerance_rad), mi->gravity_vector.x,
-			    mi->gravity_vector.y, mi->gravity_vector.z, pose->orientation.x, pose->orientation.y,
-			    pose->orientation.z, pose->orientation.w, pose_gravity_swing.x, pose_gravity_swing.y,
-			    pose_gravity_swing.z, pose_gravity_swing.w, mi->gravity_swing.x, mi->gravity_swing.y,
-			    mi->gravity_swing.z, mi->gravity_swing.w);
-			return false;
-		}
-	}
-
-	/* Orientation-prior veto (mirror-flip rejection). With a TRUSTWORTHY fusion prior, a candidate whose
-	 * full orientation grossly disagrees with the prior is a P3P mirror twin, not real motion: the gyro-
-	 * propagated prior is accurate to a few degrees over the inter-frame interval, so a >90 deg jump is
-	 * astronomically unlikely under it regardless of how well it reprojects (the two twins reproject
-	 * near-identically). The CORRECT twin is also generated as a candidate, so vetoing the flip here SELECTS
-	 * the right one rather than dropping the frame. Bound = the covariance-driven rot_error_thresh (norm);
-	 * legitimate frame-to-frame motion (<~10 deg) is far inside it, a flip (120-180 deg) far outside. Gated
-	 * on CS_FLAG_TRUST_PRIOR_ORIENT so cold acquisition / long-dropout re-acquire run unconstrained. */
+	/* Soft anisotropic prior-orientation cost (mirror-flip re-rank). Split the candidate-vs-prior orientation
+	 * difference about the camera-frame world-up into TILT (driftless gravity swing) + YAW (drifting twist),
+	 * form the Huber-robustified anisotropic Mahalanobis penalty, and fold it into the candidate ranking
+	 * below. A tilt flip's huge driftless tilt distance out-ranks it (decided even when the yaw prior is
+	 * stale); a fresh-yaw flip is out-ranked by its yaw distance; an uncertain/untracked yaw widens sigma_yaw
+	 * so reprojection decides. Both P3P twins are generated as candidates, so this SELECTS the correct twin
+	 * instead of dropping the frame, and never rejects a candidate outright. Keyed on
+	 * CS_FLAG_TRUST_PRIOR_ORIENT (cold re-acquire => zero penalty). */
+	double prior_cost = 0.0;
 	if (mi->search_flags & CS_FLAG_TRUST_PRIOR_ORIENT) {
-		const struct xrt_quat *pq = &pose->orientation, *rq = &mi->pose_prior.orientation;
-		double dot = (double)pq->x * rq->x + (double)pq->y * rq->y + (double)pq->z * rq->z + (double)pq->w * rq->w;
-		double ang = 2.0 * acos(fmin(1.0, fabs(dot))); // geodesic angle candidate<->prior
-		const struct xrt_vec3 *re = mi->rot_error_thresh;
-		double bound = sqrt((double)re->x * re->x + (double)re->y * re->y + (double)re->z * re->z);
-		if (ang > bound) {
-			DEBUG("model %d orientation-prior veto: %.1f deg > %.1f deg (mirror-flip candidate)\n", mi->id,
-			      RAD_TO_DEG(ang), RAD_TO_DEG(bound));
+		prior_cost = pose_metrics_prior_orient_cost(&pose->orientation, &mi->pose_prior.orientation,
+		                                            &mi->up_vector, mi->sigma_tilt_rad, mi->sigma_yaw_rad,
+		                                            mi->huber_knee_sigma, mi->cost_weight);
+
+		/* Early prune from the cheap prior cost + orient error: a candidate that loses every ranking
+		 * branch against the current GOOD best is skipped before the projection, the accept unchanged. */
+		double cand_orient_err_len = prior_orient_err_len(pose, &mi->pose_prior);
+		if (prune_by_prior_bound(mi, prior_cost, cand_orient_err_len, cs->num_points)) {
+			cs->num_pose_checks_pruned++;
 			return false;
 		}
 	}
+
+	/* Increment stats */
+	cs->num_pose_checks++;
 
 	struct pose_metrics score;
 
@@ -334,9 +352,17 @@ correspondence_search_project_pose(struct correspondence_search *cs,
 
 	/* If this pose is any good, test it further */
 	if (POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD)) {
-		if (pose_metrics_score_is_better_pose(&mi->best_score, &score)) {
+		if (pose_metrics_score_is_better_pose_prior(&mi->best_score, mi->best_prior_cost, &score,
+		                                            prior_cost)) {
 			mi->best_score = score;
+			mi->best_prior_cost = prior_cost;
 			mi->best_pose = *pose;
+			/* Cache the prune bounds from the new best (only consulted under CS_FLAG_TRUST_PRIOR_ORIENT,
+			 * where matched_blobs >= 3 for any GOOD pose). */
+			mi->best_combined_cost = score.reprojection_error + prior_cost;
+			mi->best_cost_per_led =
+			    score.matched_blobs > 0 ? mi->best_combined_cost / score.matched_blobs : 0.0;
+			mi->best_orient_err_len = prior_orient_err_len(pose, &mi->pose_prior);
 #if DUMP_TIMING
 			mi->best_pose_found_time = os_monotonic_get_ns();
 #endif
@@ -783,10 +809,14 @@ search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi
 
 	/* clear the info for this model */
 	memset(&mi->best_score, 0, sizeof(struct pose_metrics));
+	mi->best_prior_cost = 0.0;
+	mi->best_combined_cost = 0.0;
+	mi->best_cost_per_led = 0.0;
+	mi->best_orient_err_len = 0.0;
 	mi->match_flags = 0;
 
 	/* Clear stats */
-	cs->num_trials = cs->num_pose_checks = 0;
+	cs->num_trials = cs->num_pose_checks = cs->num_pose_checks_pruned = 0;
 
 	/* Configure search params from the flags */
 	if (mi->search_flags & CS_FLAG_SHALLOW_SEARCH) {
@@ -871,8 +901,11 @@ correspondence_search_find_one_pose(struct correspondence_search *cs,
                                     struct xrt_pose *pose,
                                     struct xrt_vec3 *pos_error_thresh,
                                     struct xrt_vec3 *rot_error_thresh,
-                                    struct xrt_vec3 *gravity_vector,
-                                    float gravity_tolerance_rad,
+                                    struct xrt_vec3 *up_vector,
+                                    float sigma_tilt_rad,
+                                    float sigma_yaw_rad,
+                                    float huber_knee_sigma,
+                                    float cost_weight,
                                     struct pose_metrics *score)
 {
 	assert(pose != NULL);
@@ -898,26 +931,22 @@ correspondence_search_find_one_pose(struct correspondence_search *cs,
 		mi.rot_error_thresh = rot_error_thresh;
 	}
 
-	if (search_flags & CS_FLAG_MATCH_GRAVITY) {
-		struct xrt_quat pose_gravity_twist;
-
-		/* We need a pose prior to extract the gravity swing to match */
+	if (search_flags & CS_FLAG_TRUST_PRIOR_ORIENT) {
+		/* The anisotropic soft prior-orientation cost needs the prior + the camera-frame world-up. */
 		assert((search_flags & CS_FLAG_HAVE_POSE_PRIOR) != 0);
-		assert(gravity_vector != NULL);
-
-		mi.gravity_vector = *gravity_vector;
-		mi.gravity_tolerance_rad = gravity_tolerance_rad;
-
-		math_quat_decompose_swing_twist(&pose->orientation, gravity_vector, &mi.gravity_swing,
-		                                &pose_gravity_twist);
+		assert(up_vector != NULL);
+		mi.up_vector = *up_vector;
+		mi.sigma_tilt_rad = sigma_tilt_rad;
+		mi.sigma_yaw_rad = sigma_yaw_rad;
+		mi.huber_knee_sigma = huber_knee_sigma;
+		mi.cost_weight = cost_weight;
 	}
 
 	if (search_pose_for_model(cs, &mi) && (mi.match_flags & POSE_MATCH_GOOD)) {
 		*pose = mi.best_pose;
 		*score = mi.best_score;
 
-		DEBUG_TIMING("# Best %s match for model %d was %d points out of %d with error %f pixels^2\n",
-		             (search_flags & CS_FLAG_MATCH_GRAVITY) ? "aligned" : "unaligned", mi.id,
+		DEBUG_TIMING("# Best match for model %d was %d points out of %d with error %f pixels^2\n", mi.id,
 		             mi.best_score.matched_blobs, mi.best_score.visible_leds, mi.best_score.reprojection_error);
 		DEBUG_TIMING("# Found at LED depth %d blob depth %d after %f ms of %f ms\n", mi.best_pose_led_depth,
 		             mi.best_pose_blob_depth,

@@ -73,6 +73,10 @@ struct pose_metrics_visible_led_info
 	struct xrt_vec2 pos_px; /* Projected position of the LED (pixels) */
 	struct xrt_vec3 pos_m;  /* Projected physical position of the LED (metres) */
 	double facing_dot;      /* Dot product between LED and camera */
+	/* Anisotropic blob<->LED match gate (px half-axes) derived from the prior
+	 * covariance projected at this LED's depth. Floors at led_radius_px. */
+	double gate_ax_px;
+	double gate_ay_px;
 	struct blob *matched_blob;
 };
 
@@ -89,6 +93,48 @@ struct pose_metrics_blob_match_info
 	struct pose_rect bounds;
 };
 
+/* Anisotropic prior-consistency split for mirror-flip rejection. Decompose the candidate orientation's
+ * difference from the (gyro+gravity) prior, RELATIVE to the world-up axis @p up expressed in the SAME frame
+ * as both orientations (camera-frame up for the ab-initio prior cost, world-frame down for the front-end
+ * twin pick — either works, the split is frame-agnostic given a consistent up), into:
+ *   - out_tilt_rad: the SWING (off-axis) angle == how far the candidate mis-places gravity vs the prior.
+ *     DRIFTLESS (the accelerometer pins the prior's tilt even through an optical dropout) -> gate TIGHT.
+ *   - out_yaw_rad : the TWIST (about-axis) angle == the yaw difference. Drifts with the gyro bias ->
+ *     gate only by the covariance-sized bound, and only while the prior yaw is trusted-fresh.
+ * A tilt flip -> large tilt; a pure-yaw flip -> ~0 tilt + large yaw. @p up need not be unit length
+ * (normalised internally); a degenerate (zero-length) up yields tilt=0, deferring entirely to the yaw
+ * bound. */
+void
+pose_metrics_prior_orient_split(const struct xrt_quat *q_cand,
+                                const struct xrt_quat *q_prior,
+                                const struct xrt_vec3 *up,
+                                double *out_tilt_rad,
+                                double *out_yaw_rad);
+
+/* Soft prior-consistency penalty for ranking mirror-flip hypotheses: a robust M-estimator term to ADD to a
+ * candidate's per-LED reprojection error so the lowest-cost candidate is committed and a frame is never
+ * dropped for ambiguity. From the split:
+ *   d2 = (tilt/@p sigma_tilt_rad)^2 + (yaw/@p sigma_yaw_rad)^2   (anisotropic squared Mahalanobis distance
+ *        of the candidate orientation from the prior; tilt+yaw from pose_metrics_prior_orient_split)
+ * is Huber-robustified about @p huber_knee_sigma (the standardized-residual knee, in sigmas) so a gross
+ * outlier (a flip) bends to a LINEAR penalty and cannot dominate pathologically, then scaled by
+ * @p weight (in the caller's reprojection-error units, px^2 per unit robustified distance) to be
+ * commensurate with the reprojection error: return weight * huber(sqrt(d2)).
+ * sigma_tilt is the tight DRIFTLESS gravity-anchored bound; sigma_yaw is the live fusion yaw 1-sigma:
+ * confident yaw (small sigma) -> the prior term dominates and selects the prior-consistent twin (a 90 deg
+ * tilt flip has huge d2 -> never selected); uncertain/untracked yaw (large sigma) -> the yaw term vanishes
+ * and reprojection decides (cold-start/ab-initio bootstrap). @p up is the world-up in the same frame as both
+ * orientations (see pose_metrics_prior_orient_split). A non-positive sigma is treated as +inf for that axis
+ * (that axis contributes nothing). */
+double
+pose_metrics_prior_orient_cost(const struct xrt_quat *q_cand,
+                               const struct xrt_quat *q_prior,
+                               const struct xrt_vec3 *up,
+                               double sigma_tilt_rad,
+                               double sigma_yaw_rad,
+                               double huber_knee_sigma,
+                               double weight);
+
 void
 pose_metrics_get_device_bounds(struct xrt_pose *P_cam_obj,
                                struct t_constellation_led_model *led_model,
@@ -104,6 +150,31 @@ pose_metrics_match_pose_to_blobs(struct xrt_pose *pose,
                                  struct t_constellation_led_model *led_model,
                                  struct camera_model *calib,
                                  struct pose_metrics_blob_match_info *match_info);
+
+/* As above, but size each LED's blob-match gate from the prior's per-axis
+ * position/rotation uncertainty (anisotropic Mahalanobis ellipse) instead of a
+ * fixed radius. NULL thresholds => the fixed-radius (isotropic) behaviour. */
+void
+pose_metrics_match_pose_to_blobs_prior(struct xrt_pose *pose,
+                                       struct blob *blobs,
+                                       int num_blobs,
+                                       const struct xrt_vec3 *pos_error_thresh,
+                                       const struct xrt_vec3 *rot_error_thresh,
+                                       struct t_constellation_led_model *led_model,
+                                       struct camera_model *calib,
+                                       struct pose_metrics_blob_match_info *match_info);
+
+/* Pure gate math (exposed for unit testing): compute the anisotropic per-LED
+ * gate half-axes (px) from the prior covariance projected at the LED depth. */
+void
+pose_metrics_compute_led_gate(double focal_length_px,
+                              double led_depth_m,
+                              double led_lever_arm_m,
+                              double led_radius_px,
+                              const struct xrt_vec3 *pos_error_thresh,
+                              const struct xrt_vec3 *rot_error_thresh,
+                              double *out_gate_ax_px,
+                              double *out_gate_ay_px);
 
 void
 pose_metrics_evaluate_pose(struct pose_metrics *score,
@@ -129,6 +200,18 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 
 bool
 pose_metrics_score_is_better_pose(struct pose_metrics *old_score, struct pose_metrics *new_score);
+
+/* As pose_metrics_score_is_better_pose, but the soft mirror-flip prior penalty (pose_metrics_prior_orient_cost)
+ * is folded into the per-LED reprojection comparison: where two candidates have the same matched-blob count
+ * (the mirror-twin case — twins reproject near-identically), the one with the lower (reproj + prior_penalty)
+ * wins. This is the soft re-rank used in the ab-initio search: a flipped twin is out-ranked by its large
+ * prior penalty rather than dropped, and a candidate is never rejected outright. @p old_prior_cost /
+ * @p new_prior_cost are the summed prior penalties (px^2) for each candidate. */
+bool
+pose_metrics_score_is_better_pose_prior(struct pose_metrics *old_score,
+                                        double old_prior_cost,
+                                        struct pose_metrics *new_score,
+                                        double new_prior_cost);
 
 #ifdef __cplusplus
 }

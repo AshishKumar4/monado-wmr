@@ -11,10 +11,128 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
+#include "math/m_api.h"
 #include "math/m_vec3.h"
 #include "util/u_logging.h"
 
 #include "pose_metrics.h"
+
+#include <math.h>
+
+void
+pose_metrics_prior_orient_split(const struct xrt_quat *q_cand,
+                                const struct xrt_quat *q_prior,
+                                const struct xrt_vec3 *up,
+                                double *out_tilt_rad,
+                                double *out_yaw_rad)
+{
+	/* NaN guard: a non-finite-component input quat would propagate NaN through the cw>1?1:cw clamps below
+	 * (NaN>1 is false, so the clamp doesn't catch it). Unreachable from the live call sites (always
+	 * normalized finite PnP/filter quats); pure hardening so a garbage input yields tilt=yaw=0, not NaN. */
+	if (!isfinite(q_cand->x) || !isfinite(q_cand->y) || !isfinite(q_cand->z) || !isfinite(q_cand->w) ||
+	    !isfinite(q_prior->x) || !isfinite(q_prior->y) || !isfinite(q_prior->z) || !isfinite(q_prior->w)) {
+		if (out_tilt_rad)
+			*out_tilt_rad = 0.0;
+		if (out_yaw_rad)
+			*out_yaw_rad = 0.0;
+		return;
+	}
+
+	/* Camera-frame relative rotation from prior to candidate: q_rel = q_cand . q_prior^-1 (left-multiply).
+	 * It MUST be the camera-frame (left) relative, not the object-frame q_prior^-1 . q_cand, because the
+	 * swing/twist split below is about a CAMERA-frame axis (up): the rotation and the axis must live in the
+	 * same frame. The object-frame form leaks ~sin(tilt)*yaw of a pure world-yaw on a tilted prior into the
+	 * tilt term (e.g. 33 deg tilt + 90 deg yaw -> 45.3 deg false tilt), over-rejecting tilted+yaw-drifted
+	 * frames; the camera-frame form correctly attributes a pure world-yaw entirely to yaw (tilt = 0). */
+	struct xrt_quat q_prior_inv;
+	math_quat_invert(q_prior, &q_prior_inv);
+	struct xrt_quat q_rel;
+	math_quat_rotate(q_cand, &q_prior_inv, &q_rel); /* q_rel = q_cand . q_prior^-1 */
+	math_quat_normalize(&q_rel);
+
+	/* A near-zero up axis can't define a twist -> all difference is "yaw" (defer to the yaw bound). Report
+	 * the FULL geodesic angle (2*acos|w|), consistent with the swing/twist angles below. */
+	struct xrt_vec3 axis = *up;
+	const double up_len = sqrt((double)axis.x * axis.x + (double)axis.y * axis.y + (double)axis.z * axis.z);
+	if (!(up_len > 1e-6)) {
+		if (out_tilt_rad)
+			*out_tilt_rad = 0.0;
+		if (out_yaw_rad) {
+			double cw = fabs((double)q_rel.w);
+			*out_yaw_rad = 2.0 * acos(cw > 1.0 ? 1.0 : cw);
+		}
+		return;
+	}
+	axis.x /= (float)up_len;
+	axis.y /= (float)up_len;
+	axis.z /= (float)up_len;
+
+	/* Split into swing (off-axis tilt) and twist (about-axis yaw). swing.twist == q_rel. */
+	struct xrt_quat swing, twist;
+	math_quat_decompose_swing_twist(&q_rel, &axis, &swing, &twist);
+	if (out_tilt_rad) {
+		double cw = fabs((double)swing.w);
+		*out_tilt_rad = 2.0 * acos(cw > 1.0 ? 1.0 : cw); /* swing angle (tilt) */
+	}
+	if (out_yaw_rad) {
+		double cw = fabs((double)twist.w);
+		*out_yaw_rad = 2.0 * acos(cw > 1.0 ? 1.0 : cw); /* twist angle (yaw) */
+	}
+}
+
+double
+pose_metrics_prior_orient_cost(const struct xrt_quat *q_cand,
+                               const struct xrt_quat *q_prior,
+                               const struct xrt_vec3 *up,
+                               double sigma_tilt_rad,
+                               double sigma_yaw_rad,
+                               double huber_knee_sigma,
+                               double weight)
+{
+	double tilt_rad = 0.0, yaw_rad = 0.0;
+	pose_metrics_prior_orient_split(q_cand, q_prior, up, &tilt_rad, &yaw_rad);
+
+	/* Anisotropic squared Mahalanobis distance. A non-positive sigma drops that axis (treated as +inf). */
+	double d2 = 0.0;
+	if (sigma_tilt_rad > 0.0) {
+		const double s = tilt_rad / sigma_tilt_rad;
+		d2 += s * s;
+	}
+	if (sigma_yaw_rad > 0.0) {
+		const double s = yaw_rad / sigma_yaw_rad;
+		d2 += s * s;
+	}
+
+	/* Huber loss on the standardized residual s = sqrt(d2): quadratic within the knee, linear beyond, so a
+	 * gross outlier's penalty grows only linearly (bend, don't cut) and cannot dominate the cost. */
+	const double s = sqrt(d2);
+	const double k = huber_knee_sigma > 0.0 ? huber_knee_sigma : 0.0;
+	const double rho = (k <= 0.0 || s <= k) ? d2 : (k * (2.0 * s - k));
+
+	return weight * rho;
+}
+
+/* Blob<->LED gate half-axes: the isotropic fixed LED-radius circle. The mutual-exclusion win comes from the
+ * GLOBAL one-to-one assignment, not a wider gate, so the gate stays at led_radius_px. The prior-uncertainty
+ * params are accepted but unused; widening the gate from them stays a body-only change. */
+void
+pose_metrics_compute_led_gate(double focal_length_px,
+                              double led_depth_m,
+                              double led_lever_arm_m,
+                              double led_radius_px,
+                              const struct xrt_vec3 *pos_error_thresh,
+                              const struct xrt_vec3 *rot_error_thresh,
+                              double *out_gate_ax_px,
+                              double *out_gate_ay_px)
+{
+	(void)focal_length_px;
+	(void)led_depth_m;
+	(void)led_lever_arm_m;
+	(void)pos_error_thresh;
+	(void)rot_error_thresh;
+	*out_gate_ax_px = led_radius_px;
+	*out_gate_ay_px = led_radius_px;
+}
 
 static void
 expand_rect(struct pose_rect *bounds, double x, double y, double w, double h)
@@ -29,70 +147,62 @@ expand_rect(struct pose_rect *bounds, double x, double y, double w, double h)
 		bounds->bottom = y + h;
 }
 
-static int
-find_best_matching_led(struct pose_metrics_visible_led_info *led_points,
-                       int num_leds,
-                       struct blob *blob,
-                       double *out_sqerror)
+/* True if @p blob falls inside this LED's covariance-scaled gate ellipse (and isn't grossly oversized).
+ * Returns the raw reprojection cost (px^2) in @p out_sqerror — accumulated into reprojection_error and
+ * compared against the px^2-calibrated GOOD/STRONG thresholds — AND the per-blob measurement-noise-weighted
+ * (Mahalanobis) cost (dx^2+dy^2)/pos_var_px2 in @p out_rank_cost, which RANKS the global one-to-one
+ * assignment: a fat / clipped / edge / faint blob (large pos_var_px2, an uncertain LED centre) yields a
+ * larger weighted cost, so when blobs compete for an LED the tighter, more certain centre is preferred. The
+ * accept/reject error stays in raw px^2; only the assignment ordering is uncertainty-weighted. The
+ * gate half-axes gate_ax/ay come from get_visible_leds_and_bounds; they equal led_radius_px. */
+static bool
+led_blob_match_cost(const struct pose_metrics_visible_led_info *led_info,
+                    const struct blob *blob,
+                    double *out_sqerror,
+                    double *out_rank_cost)
 {
-	double best_z;
-	int best_led_index = -1;
-	double best_sqerror = 1e20;
-	int leds_within_range = 0;
+	if (blob->width > led_info->led_radius_px * 4 || blob->height > led_info->led_radius_px * 4)
+		return false; /* blob far larger than the LED -> not this LED */
+	const double dx = led_info->pos_px.x - blob->x;
+	const double dy = led_info->pos_px.y - blob->y;
+	const double ax = led_info->gate_ax_px, ay = led_info->gate_ay_px;
+	if ((dx * dx) / (ax * ax) + (dy * dy) / (ay * ay) > 1.0)
+		return false; /* outside the gate ellipse */
+	const double sqerror = dx * dx + dy * dy;
+	*out_sqerror = sqerror;
+	/* pos_var_px2 is floored >= 0.25 px^2 at the source (blobwatch), so this division is well-posed. */
+	*out_rank_cost = sqerror / (double)blob->pos_var_px2;
+	return true;
+}
 
-	for (int i = 0; i < num_leds; i++) {
-		struct pose_metrics_visible_led_info *led_info = led_points + i;
-		struct xrt_vec2 *pos_px = &led_info->pos_px;
-		double led_radius_px = led_info->led_radius_px;
-		double dx = fabs(pos_px->x - blob->x);
-		double dy = fabs(pos_px->y - blob->y);
-		double sqerror = dx * dx + dy * dy;
+/* Upper bound on admissible (blob,LED) pairings collected per pose check = blobs*visible_leds, so it can
+ * never truncate a valid pairing (derived from the array maxima, not a magic cap). ~50 KB on the stack. */
+#define MAX_GATE_CANDIDATES (MAX_BLOBS_PER_FRAME * MAX_OBJECT_LEDS)
 
-		/* If the blob is much larger than the LED in either dimension,
-		 * don't match */
-		if (blob->width > led_info->led_radius_px * 4 || blob->height > led_info->led_radius_px * 4) {
-			continue;
-		}
+/* One admissible blob<->LED pairing for the global assignment. Ranked by rank_cost (the per-blob
+ * measurement-noise-weighted reprojection cost); sqerror is the raw px^2 error folded into reprojection_error
+ * once the pairing is committed. */
+struct gate_candidate
+{
+	float rank_cost;
+	float sqerror;
+	uint16_t blob_idx;
+	uint16_t led_idx;
+};
 
-		/* Check if the LED falls within the bounding box
-		 * is closer to the camera (smaller Z), or is at least
-		 * led_radius closer to the blob center */
-		if (sqerror < (led_radius_px * led_radius_px)) {
-			leds_within_range++;
-
-			if (best_led_index < 0 || best_z > led_info->pos_m.z ||
-			    (sqerror + led_radius_px) < best_sqerror) {
-				best_z = led_info->pos_m.z;
-				best_led_index = i;
-				best_sqerror = sqerror;
-			}
-		}
-	}
-
-	if (leds_within_range > 1 && u_log_get_global_level() >= U_LOGGING_TRACE) {
-		U_LOG_T("Multiple LEDs match blob @ %f, %f. best_sqerror %f LED %d z %f", blob->x, blob->y,
-		        best_sqerror, best_led_index, led_points[best_led_index].pos_m.z);
-		for (int i = 0; i < num_leds; i++) {
-			struct pose_metrics_visible_led_info *led_info = led_points + i;
-			struct xrt_vec2 *pos_px = &led_info->pos_px;
-			struct xrt_vec3 *pos_m = &led_info->pos_m;
-			double led_radius_px = led_info->led_radius_px;
-			double dx = fabs(pos_px->x - blob->x);
-			double dy = fabs(pos_px->y - blob->y);
-			double sqerror = dx * dx + dy * dy;
-
-			/* Check if the LED falls within the bounding box
-			 * has smaller error distance, or is closer to the camera (smaller Z) */
-			if (sqerror < (led_radius_px * led_radius_px)) {
-				U_LOG_T("LED %d sqerror %f pos px %f %f radius %f metres %f %f %f", i, sqerror,
-				        pos_px->x, pos_px->y, led_radius_px, pos_m->x, pos_m->y, pos_m->z);
-			}
-		}
-	}
-
-	if (out_sqerror)
-		*out_sqerror = best_sqerror;
-	return best_led_index;
+static int
+gate_candidate_cmp(const void *a, const void *b)
+{
+	const struct gate_candidate *ga = a, *gb = b;
+	if (ga->rank_cost < gb->rank_cost)
+		return -1;
+	if (ga->rank_cost > gb->rank_cost)
+		return 1;
+	/* Deterministic tiebreak (qsort isn't stable) so an exact-cost tie resolves identically every run
+	 * -> reproducible offline replay. */
+	if (ga->blob_idx != gb->blob_idx)
+		return (ga->blob_idx < gb->blob_idx) ? -1 : 1;
+	return (ga->led_idx < gb->led_idx) ? -1 : (ga->led_idx > gb->led_idx) ? 1 : 0;
 }
 
 static void
@@ -154,6 +264,8 @@ static void
 get_visible_leds_and_bounds(struct xrt_pose *pose,
                             struct t_constellation_led_model *led_model,
                             struct camera_model *calib,
+                            const struct xrt_vec3 *pos_error_thresh,
+                            const struct xrt_vec3 *rot_error_thresh,
                             struct pose_metrics_visible_led_info *visible_led_points,
                             int *num_visible_leds,
                             struct pose_rect *bounds)
@@ -235,25 +347,36 @@ get_visible_leds_and_bounds(struct xrt_pose *pose,
 			continue;
 		}
 
+		/* Anisotropic gate half-axes from the prior covariance projected at
+		 * this LED's depth. The lever arm for the rotation term is the LED's
+		 * body-frame distance from the model origin (the rotation pivot). */
+		double lever_arm_m = m_vec3_len(led->pos);
+		double gate_ax_px, gate_ay_px;
+		pose_metrics_compute_led_gate(focal_length, led_pos_m->z, lever_arm_m, led_radius_px, pos_error_thresh,
+		                              rot_error_thresh, &gate_ax_px, &gate_ay_px);
+
 		struct pose_metrics_visible_led_info *led_info = visible_led_points + (*num_visible_leds);
 		led_info->led = leds + i;
 		led_info->pos_px = *led_pos_px;
 		led_info->pos_m = *led_pos_m;
 		led_info->led_radius_px = led_radius_px;
+		led_info->gate_ax_px = gate_ax_px;
+		led_info->gate_ay_px = gate_ay_px;
 		led_info->matched_blob = NULL;
 		led_info->facing_dot = facing_dot;
 		(*num_visible_leds)++;
 
-		/* Expand the bounding box */
+		/* Expand the bounding box by the gate so blobs in the gate aren't
+		 * dropped by the bbox pre-filter. Margins are asymmetric (-axis .. +2*axis). */
 		if (first_visible_led) {
-			bounds->left = led_pos_px->x - led_radius_px;
-			bounds->top = led_pos_px->y - led_radius_px;
-			bounds->right = led_pos_px->x + 2 * led_radius_px;
-			bounds->bottom = led_pos_px->y + 2 * led_radius_px;
+			bounds->left = led_pos_px->x - gate_ax_px;
+			bounds->top = led_pos_px->y - gate_ay_px;
+			bounds->right = led_pos_px->x + 2 * gate_ax_px;
+			bounds->bottom = led_pos_px->y + 2 * gate_ay_px;
 			first_visible_led = false;
 		} else {
-			expand_rect(bounds, led_pos_px->x - led_radius_px, led_pos_px->y - led_radius_px,
-			            2 * led_radius_px, 2 * led_radius_px);
+			expand_rect(bounds, led_pos_px->x - gate_ax_px, led_pos_px->y - gate_ay_px, 2 * gate_ax_px,
+			            2 * gate_ay_px);
 		}
 	}
 }
@@ -336,61 +459,89 @@ pose_metrics_match_pose_to_blobs(struct xrt_pose *pose,
                                  struct camera_model *calib,
                                  struct pose_metrics_blob_match_info *match_info)
 {
+	/* No prior covariance available here -> isotropic fixed-radius gate. */
+	pose_metrics_match_pose_to_blobs_prior(pose, blobs, num_blobs, NULL, NULL, led_model, calib, match_info);
+}
+
+void
+pose_metrics_match_pose_to_blobs_prior(struct xrt_pose *pose,
+                                       struct blob *blobs,
+                                       int num_blobs,
+                                       const struct xrt_vec3 *pos_error_thresh,
+                                       const struct xrt_vec3 *rot_error_thresh,
+                                       struct t_constellation_led_model *led_model,
+                                       struct camera_model *calib,
+                                       struct pose_metrics_blob_match_info *match_info)
+{
 	struct pose_rect *bounds = &match_info->bounds;
 
 	match_info->reprojection_error = 0.0;
 	match_info->matched_blobs = 0;
 	match_info->unmatched_blobs = 0;
 
-	get_visible_leds_and_bounds(pose, led_model, calib, match_info->visible_leds, &match_info->num_visible_leds,
-	                            &match_info->bounds);
+	get_visible_leds_and_bounds(pose, led_model, calib, pos_error_thresh, rot_error_thresh, match_info->visible_leds,
+	                            &match_info->num_visible_leds, &match_info->bounds);
 
 	// printf("Bounding box for pose is %f,%f -> %f,%f\n", bounds.left, bounds.top, bounds.right, bounds.bottom);
 
-	/* Iterate the blobs and see which ones are within the bounding box and have a matching LED */
+	/* Global ONE-TO-ONE assignment (Global Nearest Neighbour): collect every admissible (blob,LED) pair
+	 * within its gate ellipse, rank by reprojection cost, then assign greedily with mutual exclusivity —
+	 * each blob and each LED used at most once. Unlike per-blob nearest matching, this cannot mislabel
+	 * when the gate is wider than the inter-LED spacing (the case a covariance-adaptive gate creates): it
+	 * yields the lowest-total-reprojection consistent matching, so a wide prior widens the SEARCH without
+	 * corrupting the ASSIGNMENT. */
 	bool all_led_ids_matched = true;
+	const int nleds = match_info->num_visible_leds;
+
+	struct gate_candidate cands[MAX_GATE_CANDIDATES];
+	int ncand = 0;
+	int considered = 0; /* in-bounds blobs belonging to this device -> the matchable set */
 
 	for (int i = 0; i < num_blobs; i++) {
 		struct blob *b = blobs + i;
 		uint32_t led_object_id = LED_OBJECT_ID(b->led_id);
 
-		/* Skip blobs which already have an ID not belonging to this device */
+		/* Skip blobs already labelled for another device, or outside the pose bounding box. */
 		if (led_object_id != LED_INVALID_ID && led_object_id != led_model->id)
 			continue;
-
-		if (b->x < bounds->left || b->y < bounds->top || b->x > bounds->right || b->y > bounds->bottom) {
-			/* Ignore blobs that are outside the pose bounding box */
+		if (b->x < bounds->left || b->y < bounds->top || b->x > bounds->right || b->y > bounds->bottom)
 			continue;
-		}
 
-		double sqerror;
-
-		int match_led_index =
-		    find_best_matching_led(match_info->visible_leds, match_info->num_visible_leds, b, &sqerror);
-		if (match_led_index < 0) {
-			match_info->unmatched_blobs++;
-			continue;
-		}
-
-		match_info->reprojection_error += sqerror;
-		match_info->matched_blobs++;
-
-		struct pose_metrics_visible_led_info *led_info = match_info->visible_leds + match_led_index;
-		led_info->matched_blob = b;
-
-		if (b->led_id != LED_INVALID_ID) {
-			struct t_constellation_led *match_led = led_info->led;
-			uint8_t led_id = match_led->id;
-			if (b->led_id != LED_MAKE_ID(led_model->id, led_id)) {
-#if 0
-				printf("mismatched LED id %d/%d blob %d (@ %f,%f) has %d/%d\n", led_model->id, led_id,
-				       i, b->x, b->y, LED_OBJECT_ID(b->led_id), LED_LOCAL_ID(b->led_id));
-#endif
-				all_led_ids_matched = false;
+		considered++;
+		for (int j = 0; j < nleds && ncand < MAX_GATE_CANDIDATES; j++) {
+			double sqerror, rank_cost;
+			if (led_blob_match_cost(match_info->visible_leds + j, b, &sqerror, &rank_cost)) {
+				cands[ncand].sqerror = (float)sqerror;
+				cands[ncand].rank_cost = (float)rank_cost;
+				cands[ncand].blob_idx = (uint16_t)i;
+				cands[ncand].led_idx = (uint16_t)j;
+				ncand++;
 			}
 		}
 	}
 
+	qsort(cands, ncand, sizeof(cands[0]), gate_candidate_cmp);
+
+	bool blob_used[MAX_BLOBS_PER_FRAME] = {false};
+	bool led_used[MAX_OBJECT_LEDS] = {false};
+	for (int c = 0; c < ncand; c++) {
+		const int bi = cands[c].blob_idx, li = cands[c].led_idx;
+		if (blob_used[bi] || led_used[li])
+			continue; /* blob or LED already taken by a lower-cost pairing */
+		blob_used[bi] = led_used[li] = true;
+
+		struct blob *b = blobs + bi;
+		struct pose_metrics_visible_led_info *led_info = match_info->visible_leds + li;
+		led_info->matched_blob = b;
+		match_info->reprojection_error += cands[c].sqerror;
+		match_info->matched_blobs++;
+
+		if (b->led_id != LED_INVALID_ID && b->led_id != LED_MAKE_ID(led_model->id, led_info->led->id)) {
+			all_led_ids_matched = false; /* prior label disagrees with this assignment */
+		}
+	}
+
+	match_info->unmatched_blobs = considered - match_info->matched_blobs;
 	match_info->all_led_ids_matched = all_led_ids_matched;
 }
 
@@ -415,7 +566,11 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 	 */
 	struct pose_metrics_blob_match_info blob_match_info;
 
-	pose_metrics_match_pose_to_blobs(pose, blobs, num_blobs, led_model, calib, &blob_match_info);
+	/* When we have a prior with error bounds, size the blob<->LED gate from
+	 * its anisotropic per-axis uncertainty; otherwise the fixed-radius gate. */
+	pose_metrics_match_pose_to_blobs_prior(pose, blobs, num_blobs, pose_prior ? pos_error_thresh : NULL,
+	                                       pose_prior ? rot_error_thresh : NULL, led_model, calib,
+	                                       &blob_match_info);
 
 	assert(led_model->num_leds > 0);
 	assert(num_blobs > 0);
@@ -505,6 +660,15 @@ pose_metrics_evaluate_pose(struct pose_metrics *score,
 bool
 pose_metrics_score_is_better_pose(struct pose_metrics *old_score, struct pose_metrics *new_score)
 {
+	return pose_metrics_score_is_better_pose_prior(old_score, 0.0, new_score, 0.0);
+}
+
+bool
+pose_metrics_score_is_better_pose_prior(struct pose_metrics *old_score,
+                                        double old_prior_cost,
+                                        struct pose_metrics *new_score,
+                                        double new_prior_cost)
+{
 	/* if our previous best pose was "strong", only take better "strong" poses */
 	if (POSE_HAS_FLAGS(old_score, POSE_MATCH_STRONG) && !POSE_HAS_FLAGS(new_score, POSE_MATCH_STRONG))
 		return false;
@@ -513,23 +677,29 @@ pose_metrics_score_is_better_pose(struct pose_metrics *old_score, struct pose_me
 	if (!POSE_HAS_FLAGS(old_score, POSE_MATCH_GOOD) && POSE_HAS_FLAGS(new_score, POSE_MATCH_GOOD))
 		return true;
 
-	double new_error_per_led = new_score->reprojection_error / new_score->matched_blobs;
-	double best_error_per_led = 10.0;
+	/* Fold the soft prior penalty into the reprojection cost (both summed px^2): the lowest combined
+	 * cost = reprojection_error + prior penalty wins. With zero prior costs this is the plain
+	 * reprojection ordering. */
+	const double new_cost = new_score->reprojection_error + new_prior_cost;
+	const double old_cost = old_score->reprojection_error + old_prior_cost;
+	double new_cost_per_led = new_cost / new_score->matched_blobs;
+	double best_cost_per_led = 10.0;
 
 	if (old_score->matched_blobs > 0)
-		best_error_per_led = old_score->reprojection_error / old_score->matched_blobs;
+		best_cost_per_led = old_cost / old_score->matched_blobs;
 
-	if (old_score->matched_blobs < new_score->matched_blobs && (new_error_per_led < best_error_per_led))
-		return true; /* prefer more matched blobs with tighter error/LED */
+	if (old_score->matched_blobs < new_score->matched_blobs && (new_cost_per_led < best_cost_per_led))
+		return true; /* prefer more matched blobs with tighter cost/LED */
 
-	if (old_score->matched_blobs + 1 < new_score->matched_blobs && (new_error_per_led < best_error_per_led * 1.1))
-		return true; /* prefer at least 2 more matched blobs with slightly worse error/LED */
+	if (old_score->matched_blobs + 1 < new_score->matched_blobs && (new_cost_per_led < best_cost_per_led * 1.1))
+		return true; /* prefer at least 2 more matched blobs with slightly worse cost/LED */
 
-	if (old_score->matched_blobs == new_score->matched_blobs &&
-	    new_score->reprojection_error < old_score->reprojection_error)
-		return true; /* else, prefer closer reprojection with at least as many matches*/
+	if (old_score->matched_blobs == new_score->matched_blobs && new_cost < old_cost)
+		return true; /* equal matches: prefer the lower combined cost (resolves the mirror-twin tie) */
 
-	/* If both scores have pose priors, prefer the one where the orientation better matches the prior */
+	/* Final tiebreak when the combined costs don't decide (e.g. no prior penalty supplied): prefer the
+	 * pose whose orientation better matches the prior. The anisotropic prior penalty above subsumes this
+	 * when supplied; this is the ordering for the zero-prior-cost callers. */
 	if (POSE_HAS_FLAGS(old_score, POSE_HAD_PRIOR) && POSE_HAS_FLAGS(new_score, POSE_HAD_PRIOR)) {
 		if (m_vec3_len(new_score->orient_error) < m_vec3_len(old_score->orient_error)) {
 			return true;

@@ -122,6 +122,17 @@ struct t_constellation_tracked_device_callbacks
 	//! fixed tolerance. Optional — may be NULL, or return false until the fusion is tracking; the
 	//! matcher then falls back to its fixed default bounds.
 	bool (*get_pose_uncertainty)(struct xrt_device *xdev, double *position_std, double *orientation_std);
+	//! Predict one LED's image point @p out_zhat (px) and 2x2 innovation covariance @p out_S (row-major
+	//! S00,S01,S10,S11 = H·P·Hᵀ + R) — the per-LED ANISOTROPIC gate ellipse from the fusion's live
+	//! covariance, using the SAME projection/Jacobian as the per-LED fold (one source of truth). @p
+	//! P_xrworld_cam + @p cam_calib + @p led_obj match @ref push_observed_leds exactly. Lets the
+	//! front-end gate a candidate blob<->LED pairing by its Mahalanobis distance under the filter's
+	//! real covariance (tight tilt / loose yaw after a dropout) instead of a fixed radius — the
+	//! covariance-driven associator. Optional — may be NULL, or return false until the fusion is
+	//! tracking (no usable prior, e.g. cold start); the caller then does NOT gate-fold.
+	bool (*predict_led_gate)(struct xrt_device *xdev, const struct xrt_pose *P_xrworld_cam,
+	                         const struct t_constellation_cam_calib *cam_calib, const struct xrt_vec3 *led_obj,
+	                         float out_zhat[2], float out_S[4]);
 };
 
 struct t_constellation_tracked_device_connection *
@@ -130,6 +141,14 @@ t_constellation_tracker_add_device(struct t_constellation_tracker *ct,
                                    struct t_constellation_tracked_device_callbacks *cb);
 void
 t_constellation_tracked_device_connection_disconnect(struct t_constellation_tracked_device_connection *ctdc);
+
+/*!
+ * Debug/test only: count of frames fully processed through the pipeline (incremented exactly once per
+ * frame at every pipeline exit). Lets an offline driver barrier on per-frame completion instead of
+ * racing a fixed sleep. Thread-safe (locks the tracker's analysis lock).
+ */
+uint64_t
+t_constellation_tracker_debug_frames_completed(struct t_constellation_tracker *ct);
 
 #ifdef __cplusplus
 }
