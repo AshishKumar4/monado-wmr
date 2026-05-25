@@ -1,3 +1,28 @@
+# Monado — HP Reverb G2 on Linux / NVIDIA (WMR fork)
+
+This is a fork of [Monado](https://monado.freedesktop.org/) (via
+[thaytan/monado](https://gitlab.freedesktop.org/thaytan/monado)) that makes the **HP Reverb G2** work
+as a full 6-DoF headset on Linux + NVIDIA, driving SteamVR through Monado's OpenVR driver. The work
+lives on the **`g2-linux-integration`** branch.
+
+It's the runtime half of a larger project — the NVIDIA / mutter / setup side lives in
+[Project-VR](https://github.com/AshishKumar4/Project-VR).
+
+What this fork adds on top of upstream:
+
+| Area | Change |
+|---|---|
+| Bring-up | HP-Inc. device allowlist; the G2's native mode selected as RandR-preferred; Wayland-aware DRM-lease wait; 90 Hz frame-interval fix; controller input bindings |
+| Present | Root-caused the Wayland `VK_ERROR_UNKNOWN` to display ISO-bandwidth contention (the userspace auto-negotiator that fixes it lives in Project-VR) |
+| Controller optical front-end | Soft anisotropic prior-cost mirror-flip disambiguation; joint multi-camera (non-central) PnP; pose-predicted LED label propagation; saturation-aware blob detection |
+| Controller fusion | A 15-error-state ESKF: out-of-view body-lock, IMU intrinsics + cross-session calibration, out-of-sequence IMU handling, render-time acceleration de-noising, camera-gain / LED-brightness fixes |
+| Validation | An offline VIO replay harness + a standing regression benchmark over captured frames |
+
+The SteamVR tracking driver (`driver_monado.so`) is the cmake build; see Project-VR for the full
+build/deploy and the patched NVIDIA/mutter side. Everything below is upstream Monado's original README.
+
+---
+
 # Monado - XR Runtime (XRT)
 
 <!--
