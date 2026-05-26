@@ -1500,11 +1500,12 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		    (xf->data != NULL && xf->size > 7) ? (uint16_t)((xf->data[6] << 8) | xf->data[7]) : 0;
 
 		os_mutex_lock(&cam->bw_lock);
-		/* Predictive-ROI: project every LED of every tracked device through its ESKF state to this
-		 * camera's image, build a bounding box, restrict blob search to it. Falls back to full-frame
-		 * when fewer than ROI_FALLBACK_MIN_PREDICTIONS LEDs project (cold start / not tracked). The
-		 * scan pad is per-LED-adaptive (max of the base pad floor and k * sqrt(max-diag(S))); base
-		 * pad and sigma multiplier are env-tunable for in-headset re-tuning across lighting/motion. */
+			/* Predictive-ROI: project every LED of every tracked device through its ESKF state to this
+			 * camera's image, build a bounding box, restrict blob search to it. Falls back to full-frame
+			 * when any connected device lacks enough in-frame predictions (so one tracked controller cannot
+			 * crop out a controller that needs full-frame acquisition/re-acquisition). The scan pad is
+			 * per-LED-adaptive (max of the base pad floor and k * sqrt(max-diag(S))); base pad and sigma
+			 * multiplier are env-tunable for in-headset re-tuning across lighting/motion. */
 		static int predictive_roi_base_pad = ROI_BASE_PAD_PX;
 		static float predictive_roi_sigma_k = ROI_SIGMA_K;
 		static int predictive_roi_env_init = 0;
@@ -1529,30 +1530,34 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 			const struct t_constellation_cam_calib cam_calib_pred = {
 			    cam->camera_model.calib.fx, cam->camera_model.calib.fy,
 			    cam->camera_model.calib.cx, cam->camera_model.calib.cy};
-			float xmin = 1e9f, ymin = 1e9f, xmax = -1e9f, ymax = -1e9f;
-			int n_in_frame = 0;
-			for (int d = 0; d < ct->num_devices; d++) {
-				struct constellation_tracker_device *device = &ct->devices[d];
-				const struct t_constellation_led_model *lm = &device->led_model;
-				if (device->connection == NULL || lm->leds == NULL || lm->num_leds == 0) {
-					continue; /* not connected / model not loaded yet */
-				}
-				for (int li = 0; li < lm->num_leds; li++) {
-					struct xrt_vec3 led_flip = {lm->leds[li].pos.x, -lm->leds[li].pos.y,
-					                            -lm->leds[li].pos.z};
+				float xmin = 1e9f, ymin = 1e9f, xmax = -1e9f, ymax = -1e9f;
+				int n_in_frame = 0;
+				int n_roi_ready_devices = 0;
+				int n_connected_devices = 0;
+				for (int d = 0; d < ct->num_devices; d++) {
+					struct constellation_tracker_device *device = &ct->devices[d];
+					const struct t_constellation_led_model *lm = &device->led_model;
+					if (device->connection == NULL || lm->leds == NULL || lm->num_leds == 0) {
+						continue; /* not connected / model not loaded yet */
+					}
+					n_connected_devices++;
+					int device_in_frame = 0;
+					for (int li = 0; li < lm->num_leds; li++) {
+						struct xrt_vec3 led_flip = {lm->leds[li].pos.x, -lm->leds[li].pos.y,
+						                            -lm->leds[li].pos.z};
 					struct xrt_vec3 led_obj;
 					math_pose_transform_point(&lm->P_device_model, &led_flip, &led_obj);
 					float zhat[2], S[4];
-					if (!constellation_tracked_device_connection_predict_led_gate(
-					        device->connection, &P_xrworld_cam_pred, &cam_calib_pred, &led_obj,
-					        zhat, S)) {
-						continue; /* device untracked: no usable prior */
-					}
-					if (!isfinite(zhat[0]) || !isfinite(zhat[1]) || !isfinite(S[0]) || !isfinite(S[3])) {
-						continue; /* non-finite projection or covariance: skip */
-					}
-					/* zhat is in FULL-camera pixel coords (cam_calib's principal point);
-					 * translate to view->vframe coords by subtracting the ROI offset. */
+						if (!constellation_tracked_device_connection_predict_led_gate(
+						        device->connection, &P_xrworld_cam_pred, &cam_calib_pred, &led_obj,
+						        zhat, S)) {
+							continue; /* device untracked: no usable prior */
+						}
+						if (!isfinite(zhat[0]) || !isfinite(zhat[1]) || !isfinite(S[0]) || !isfinite(S[3])) {
+							continue; /* non-finite projection or covariance: skip */
+						}
+						/* zhat is in FULL-camera pixel coords (cam_calib's principal point);
+						 * translate to view->vframe coords by subtracting the ROI offset. */
 					const float vx = zhat[0] - (float)cam->roi.offset.w;
 					const float vy = zhat[1] - (float)cam->roi.offset.h;
 					if (vx >= 0.f && vx < (float)view->vframe->width && vy >= 0.f &&
@@ -1574,13 +1579,18 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 						const float hy = vy + per_led_pad;
 						if (lx < xmin) xmin = lx;
 						if (ly < ymin) ymin = ly;
-						if (hx > xmax) xmax = hx;
-						if (hy > ymax) ymax = hy;
-						n_in_frame++;
+							if (hx > xmax) xmax = hx;
+							if (hy > ymax) ymax = hy;
+							n_in_frame++;
+							device_in_frame++;
+						}
+					}
+					if (device_in_frame >= ROI_FALLBACK_MIN_PREDICTIONS) {
+						n_roi_ready_devices++;
 					}
 				}
-			}
-			if (n_in_frame >= ROI_FALLBACK_MIN_PREDICTIONS) {
+				if (n_connected_devices > 0 && n_roi_ready_devices == n_connected_devices &&
+				    n_in_frame >= ROI_FALLBACK_MIN_PREDICTIONS) {
 				/* xmin/ymin/xmax/ymax already carry per-LED pad; no extra global pad needed. */
 				int rx = (int)floorf(xmin);
 				int ry = (int)floorf(ymin);
