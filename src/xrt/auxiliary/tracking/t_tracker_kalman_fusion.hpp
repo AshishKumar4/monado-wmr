@@ -114,6 +114,15 @@ public:
 	               const struct xrt_pose *hmd_world_pose) = 0;
 
 	/*!
+	 * Raw predicted pose for a CONSUMER OF THE ESTIMATE (the constellation matcher's prior), as opposed to
+	 * get_prediction's compositor REPORT: the honest filter belief with no body-lock / reach / re-entry
+	 * transforms, so feeding it back as the matcher prior never lets the visual ride mislead the front-end.
+	 * Identity / untracked flags until the filter is tracking.
+	 */
+	virtual void
+	get_predicted_pose(const timepoint_ns when_ns, struct xrt_space_relation *out_relation) = 0;
+
+	/*!
 	 * Predict one LED's image point and its 2x2 innovation covariance S = H P H^T + R for the
 	 * covariance-driven associator (the per-LED gate ellipse). Uses the EXACT same H/projection as the
 	 * tightly-coupled fold (single source of truth), so the gate the front-end sizes matches the filter's
@@ -162,19 +171,21 @@ public:
 	}
 
 	/*!
-	 * Current 1-sigma uncertainty of the predicted pose: a scalar position std (m) and orientation
-	 * std (rad) from the filter covariance (the worst-direction / largest-eigenvalue std, applied
-	 * isotropically — frame-conservative, since the covariance is world-frame while a consumer's gate
-	 * may be in another frame, and variance in any direction is bounded by the largest eigenvalue).
-	 * Lets the constellation matcher size its prior-consistency gate by the filter's ACTUAL confidence
-	 * instead of a fixed tolerance: tight when well-tracked, wide right after an optical dropout (when
-	 * the filter inflates P). Wait-free (reads the published snapshot). Returns false if not tracking.
+	 * Current 1-sigma uncertainty of the predicted pose. position_std (m) and orientation_std (rad) are
+	 * the worst-direction / largest-eigenvalue stds, applied isotropically — frame-conservative, since the
+	 * covariance is world-frame while a consumer's gate may be in another frame, and variance in any
+	 * direction is bounded by the largest eigenvalue; used to size the prior-consistency gate (tight when
+	 * well-tracked, wide right after an optical dropout). yaw_std (rad), when non-null, is the orientation
+	 * std about world-up ALONE — the uncertain yaw DoF, separated from the gravity-anchored (observable)
+	 * tilt — for the mirror-flip cost's yaw scale, which must be sharp when yaw is confident. Any out
+	 * pointer may be null. Wait-free (reads the published snapshot). Returns false if not tracking.
 	 */
 	virtual bool
-	get_pose_uncertainty(double *position_std, double *orientation_std)
+	get_pose_uncertainty(double *position_std, double *orientation_std, double *yaw_std)
 	{
 		(void)position_std;
 		(void)orientation_std;
+		(void)yaw_std;
 		return false;
 	}
 
@@ -268,6 +279,32 @@ public:
 		(void)gyro_correction;
 		(void)accel_correction;
 		return false;
+	}
+
+	/*!
+	 * Out-of-view body-plausibility update against the live head pose @p hmd_pose. Out of view, the fusion
+	 * softly anchors the controller position to its last body-relative (rigid HMD-relative) point so the
+	 * dead-reckon drift stays bounded. The driver calls this per controller IMU sample; a no-op while the
+	 * controller is in view.
+	 */
+	virtual void
+	update_body_anchor(const struct xrt_pose *hmd_pose)
+	{
+		(void)hmd_pose;
+	}
+
+	/*!
+	 * Diagnostics / tests: the named regime of the last get_prediction report, as a stable integer code so a
+	 * test can assert FSM<->flags parity without the implementation enum. Codes:
+	 * 0 Invalid, 1 VisualAccuracy, 2 InertialFastMotion, 3 WorldLocked, 4 BodyLocked, 5 ConfusedPosition.
+	 * Optionally also writes the name to @p name_out (capacity @p name_cap). Off the hot path.
+	 */
+	virtual int
+	debug_get_fusion_state(char *name_out, size_t name_cap)
+	{
+		(void)name_out;
+		(void)name_cap;
+		return 0;
 	}
 };
 } // namespace xrt::auxiliary::tracking

@@ -115,13 +115,26 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 	set_tests_properties(regression_benchmark PROPERTIES ENVIRONMENT "PYTHONNOUSERSITE=1" LABELS
 															 g2_regression)
 
-	# Inertial coast-drift experiment: real ESKF on recorded IMU + optical, with withheld-optical
-	# windows, to measure out-of-view dead-reckon drift (a tool, not a ctest).
+	# Inertial coast-drift experiment + GATE: real ESKF on recorded IMU + optical (also with withheld-
+	# optical windows) to measure out-of-view dead-reckon drift, the frozen fraction, and the re-entry
+	# snap. As a tool it prints the per-gap table; with --check it compares the per-bin metrics against
+	# tests/coast_baseline.json and exits nonzero on regression. Registered as the coast_regression
+	# ctest below.
 	add_executable(eskf_coast_experiment eskf_coast_experiment.cpp)
 	target_link_libraries(
-		eskf_coast_experiment PRIVATE aux_math aux_tracking xrt-interfaces Threads::Threads
-									  ${OpenCV_LIBRARIES})
+		eskf_coast_experiment PRIVATE aux_math aux_tracking xrt-interfaces xrt-external-cjson
+									  Threads::Threads ${OpenCV_LIBRARIES})
 	set_target_properties(eskf_coast_experiment PROPERTIES FOLDER monado_tests)
+
+	# Standing controller out-of-view / coast regression gate: drives the real ESKF over the committed
+	# head-pose coast fixture and fails if pos drift / flip% / frozen% / the re-entry snap regress past
+	# tolerance vs tests/coast_baseline.json. The binary exits 77 (LOUD ctest SKIP) when the fixture or
+	# baseline is absent, so a fixture-less checkout reports "not run", never a silent pass.
+	add_test(
+		NAME coast_regression
+		COMMAND eskf_coast_experiment ${CMAKE_CURRENT_SOURCE_DIR}/data/headpose_left.replay --check
+				${CMAKE_CURRENT_SOURCE_DIR}/coast_baseline.json)
+	set_tests_properties(coast_regression PROPERTIES SKIP_RETURN_CODE 77 LABELS g2_regression)
 
 	# Decoupled unit tests for the constellation PnP mirror-twin enumeration (synthetic geometry,
 	# known truth). A real ctest.

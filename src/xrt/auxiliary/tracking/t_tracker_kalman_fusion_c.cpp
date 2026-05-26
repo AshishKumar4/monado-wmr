@@ -110,6 +110,17 @@ kalman_fusion_get_prediction(struct KalmanFusionInterfaceWrapper *wrapper,
 	wrapper->fusion->get_prediction(timestamp_ns, out_relation, hmd_world_pose);
 }
 
+void
+kalman_fusion_get_predicted_pose(struct KalmanFusionInterfaceWrapper *wrapper,
+                                 const timepoint_ns timestamp_ns,
+                                 struct xrt_space_relation *out_relation)
+{
+	if (wrapper == nullptr) {
+		return;
+	}
+	wrapper->fusion->get_predicted_pose(timestamp_ns, out_relation);
+}
+
 bool
 kalman_fusion_predict_led_gate(struct KalmanFusionInterfaceWrapper *wrapper,
                                const struct kalman_led_observation *obs,
@@ -126,12 +137,13 @@ kalman_fusion_predict_led_gate(struct KalmanFusionInterfaceWrapper *wrapper,
 bool
 kalman_fusion_get_pose_uncertainty(struct KalmanFusionInterfaceWrapper *wrapper,
                                    double *position_std,
-                                   double *orientation_std)
+                                   double *orientation_std,
+                                   double *yaw_std)
 {
 	if (wrapper == nullptr) {
 		return false;
 	}
-	return wrapper->fusion->get_pose_uncertainty(position_std, orientation_std);
+	return wrapper->fusion->get_pose_uncertainty(position_std, orientation_std, yaw_std);
 }
 
 void
@@ -178,5 +190,14 @@ kalman_fusion_get_imu_intrinsics(struct KalmanFusionInterfaceWrapper *wrapper,
 		return false;
 	}
 	return wrapper->fusion->get_imu_intrinsics(gyro_correction, accel_correction);
+}
+
+void
+kalman_fusion_update_body_anchor(struct KalmanFusionInterfaceWrapper *wrapper, const struct xrt_pose *hmd_pose)
+{
+	if (wrapper == nullptr) {
+		return;
+	}
+	wrapper->fusion->update_body_anchor(hmd_pose);
 }
 }

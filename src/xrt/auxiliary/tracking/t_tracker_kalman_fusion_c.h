@@ -93,6 +93,14 @@ kalman_fusion_get_prediction(struct KalmanFusionInterfaceWrapper *wrapper,
                              struct xrt_space_relation *out_relation,
                              const struct xrt_pose *hmd_world_pose);
 
+//! Raw predicted pose (the filter's honest belief, NO body-lock/reach/re-entry) for the constellation
+//! matcher's PRIOR — distinct from kalman_fusion_get_prediction's compositor report, so the visual ride
+//! never feeds back to mislead the front-end. Identity / untracked flags until the filter is tracking.
+void
+kalman_fusion_get_predicted_pose(struct KalmanFusionInterfaceWrapper *wrapper,
+                                 const timepoint_ns timestamp_ns,
+                                 struct xrt_space_relation *out_relation);
+
 //! Predict one LED's image point @p out_zhat and 2x2 innovation covariance @p out_S (row-major:
 //! S00,S01,S10,S11) = H P H^T + R, the per-LED gate ellipse for the covariance-driven associator. Uses
 //! the SAME H/projection as the tightly-coupled fold (one source of truth). Returns false (writes
@@ -104,13 +112,16 @@ kalman_fusion_predict_led_gate(struct KalmanFusionInterfaceWrapper *wrapper,
                                float out_zhat[2],
                                float out_S[4]);
 
-//! Current 1-sigma uncertainty of the predicted pose (scalar position std in m, orientation std in
-//! rad) from the filter covariance — lets a consumer size a prior-consistency gate by the filter's
-//! live confidence (tight when tracked, wide after a dropout). Returns false until tracking.
+//! Current 1-sigma uncertainty of the predicted pose from the filter covariance: position_std (m) and
+//! orientation_std (rad) are the worst-direction stds for sizing a prior-consistency gate; yaw_std (rad),
+//! when non-null, is the orientation std about world-up ALONE — the uncertain yaw DoF (tilt is
+//! gravity-anchored/observable) — for the mirror-flip cost's yaw scale. Any out may be null. Returns
+//! false until tracking.
 bool
 kalman_fusion_get_pose_uncertainty(struct KalmanFusionInterfaceWrapper *wrapper,
                                    double *position_std,
-                                   double *orientation_std);
+                                   double *orientation_std,
+                                   double *yaw_std);
 
 //! Cross-session IMU calibration cache (persisted per controller by the driver). set_* seeds a prior
 //! before tracking; get_* reads the current converged gyro/accel bias + accel scale and returns true
@@ -140,6 +151,12 @@ bool
 kalman_fusion_get_imu_intrinsics(struct KalmanFusionInterfaceWrapper *wrapper,
                                  double gyro_correction[9],
                                  double accel_correction[9]);
+
+//! Out-of-view body-plausibility update against the live head pose @p hmd_pose. Out of view the fusion softly
+//! anchors the controller to its last body-relative (rigid HMD-relative) point so the dead-reckon drift stays
+//! bounded. Call per controller IMU sample; a no-op while in view.
+void
+kalman_fusion_update_body_anchor(struct KalmanFusionInterfaceWrapper *wrapper, const struct xrt_pose *hmd_pose);
 
 #ifdef __cplusplus
 }

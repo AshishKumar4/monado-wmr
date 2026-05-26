@@ -149,7 +149,7 @@ pose_at(const xrt_vec3 &pos, const xrt_quat &orient = {0.0f, 0.0f, 0.0f, 1.0f})
 }
 
 //! Feed an optical pose with a live HMD world pose (body-lock reference), so the filter captures the
-//! controller-to-HMD offset that out-of-view body-lock then rides.
+//! shoulder-pivot arm geometry that out-of-view body-lock then rides.
 void
 feed_pose_hmd(KalmanFusionInterface *kf,
               int64_t ts,
@@ -162,6 +162,31 @@ feed_pose_hmd(KalmanFusionInterface *kf,
 	s.pose.position = pos;
 	s.pose.orientation = orient;
 	kf->process_pose(&s, nullptr, nullptr, 15.0f, &hmd);
+}
+
+xrt_vec3
+operator+(const xrt_vec3 &a, const xrt_vec3 &b)
+{
+	return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+xrt_vec3
+operator-(const xrt_vec3 &a, const xrt_vec3 &b)
+{
+	return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+float
+norm(const xrt_vec3 &v)
+{
+	return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+}
+
+//! The rigid-HMD-relative body-anchor target the out-of-view fold pulls the position toward:
+//! z = hmd_pos + R_hmd·offset_head, where offset_head = R_hmd_capᵀ·(ctrl − hmd_cap) is the controller's
+//! head-frame offset captured at the last optical fold. At an identity-head capture this is the lock position.
+xrt_vec3
+body_anchor_pos(const xrt_pose &hmd, const xrt_vec3 &offset_head)
+{
+	return hmd.position + rotate(hmd.orientation, offset_head);
 }
 
 //! Feed a pose + a matching IMU sample for a device at orientation @p q,
@@ -976,81 +1001,64 @@ TEST_CASE("kalman: re-acquisition after a long dropout never spikes")
 	CHECK(max_dev < 1.0f); // a stationary controller cannot be flung a metre on re-lock
 }
 
-TEST_CASE("kalman: out-of-view controller body-locks to the moving HMD (no world fly-away, no world freeze)")
+TEST_CASE("kalman: the body-anchor fold keeps an out-of-view controller TRACKED + body-plausible")
 {
-	// The #1 felt bug: a controller leaving camera view dead-reckons in WORLD frame to metres. The fix
-	// body-locks it — out of view it rides the LIVE HMD pose at its last controller-to-HMD offset. This
-	// test establishes a position-observable lock at a known head-relative offset, then runs a long
-	// no-optical stretch WHILE the (fake) HMD translates several metres AND rotates, feeding the live HMD
-	// pose to each prediction. The reported controller must (a) stay within arm's reach of the head (never
-	// fly to metres in world frame) and (b) RIDE with the head (its world position must follow the head,
-	// NOT stay frozen at the old world point as the head walks away).
-	auto kf = KalmanFusionInterface::create();
-	REQUIRE(kf != nullptr);
-
-	int64_t t = 1000000;
+	// A controller leaving camera view must stay a TRUSTED, body-plausible estimate, not be dropped to untracked
+	// or dead-reckon away. The fix folds a soft, rigid-HMD-relative body anchor into the ESKF while out of view:
+	// the Kalman blend keeps the STATE bounded near the body-plausible point (within an arm of the head) and the
+	// pose is reported TRACKED. (The fold is a soft drift-BOUND, not a hard head-follow ride: a resting controller
+	// stays put — its IMU senses no motion — and a real in-hand controller's IMU dead-reckons the motion which the
+	// anchor then bounds; that drift-bounding is validated end-to-end on the offline replay, not here.) This locks,
+	// then coasts ~3 s (no optical, IMU rest, head fixed) driving the fold each sample as the WMR driver does, and
+	// asserts the report is body-plausible + TRACKED WITH the fold — and is reported UNTRACKED WITHOUT it (TEETH:
+	// an out-of-view dead-reckon is not a trusted pose unless the body anchor holds it).
 	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
-	const xrt_pose hmd0 = pose_at(ZERO_VEC); // head at world origin while observed
-	const xrt_vec3 ctrl_pos = {0.3f, -0.2f, -0.5f}; // ~0.62 m from the head: a real arm's-reach pose
-	for (int i = 0; i < 200; i++) { // establish a position-observable lock + capture the body-lock offset
-		feed_pose_hmd(kf.get(), t, ctrl_pos, IDENTITY_QUAT, hmd0);
-		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
-		t += DT_NS;
-	}
-	// The captured offset (controller-minus-head while observed).
-	const xrt_vec3 offset = {ctrl_pos.x - hmd0.position.x, ctrl_pos.y - hmd0.position.y,
-	                         ctrl_pos.z - hmd0.position.z};
-	const double offset_norm = std::sqrt(offset.x * offset.x + offset.y * offset.y + offset.z * offset.z);
+	const xrt_pose hmd = pose_at(ZERO_VEC);          // head fixed at origin (the in-reach physical case)
+	const xrt_vec3 ctrl_pos = {0.3f, -0.2f, -0.5f};  // ~0.62 m: a real arm's-reach pose
 
-	// 3 s no-optical, IMU rest only — the controller is out of camera view. The head meanwhile walks +X and
-	// yaws (a user turning while roaming). Each prediction sees the LIVE head pose.
-	float max_dist_to_hmd = 0.0f; // controller-to-head distance (post body-lock), must stay ~arm reach
-	float max_ride_err = 0.0f;    // |reported - (live_head + captured_offset)| (post body-lock), must be tiny
-	float max_world_pos = 0.0f;   // worst |reported world pos|, must never fly to metres in world frame
-	// Body-lock engages only once optical is STALE (past OPTICAL_FREEZE_NS, 0.5 s = 250 samples @ 2 ms); the
-	// first window is legitimate dead-reckoning (the controller may still be moving in-hand). Assert the
-	// strict ride properties past i=400 (comfortably stale), and the no-fly-away bound over the whole run.
-	for (int i = 0; i < 1500; i++) {
-		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
-		t += DT_NS;
-		const float head_x = 3.0f * (i / 1500.0f); // head walks 0 -> +3 m over the stretch
-		const xrt_quat head_q = quat_axis_angle({0.f, 1.f, 0.f}, 0.6f * (i / 1500.0f)); // + yaw
-		const xrt_pose hmd = pose_at({head_x, 0.f, 0.f}, head_q);
-
-		xrt_space_relation rel{};
-		kf->get_prediction(t, &rel, &hmd);
-		REQUIRE(std::isfinite(rel.pose.position.x));
-
-		const xrt_vec3 p = rel.pose.position;
-		max_world_pos =
-		    std::max(max_world_pos, std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z)); // fly-away probe
-
-		if (i < 400) {
-			continue; // pre-freeze: still dead-reckoning, body-lock not yet engaged
+	// Lock (capturing the head-frame body offset) then coast with no optical; @p fold drives the body-anchor
+	// fold each coast sample (the driver path) or not. Returns the worst stale-window dist-to-head, world pos,
+	// and whether ANY stale frame was reported untracked.
+	auto lock_then_coast = [&](bool fold) {
+		auto kf = KalmanFusionInterface::create();
+		REQUIRE(kf != nullptr);
+		int64_t t = 1000000;
+		for (int i = 0; i < 200; i++) {
+			feed_pose_hmd(kf.get(), t, ctrl_pos, IDENTITY_QUAT, hmd);
+			feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+			t += DT_NS;
 		}
-		const float d_hmd = std::sqrt((p.x - hmd.position.x) * (p.x - hmd.position.x) +
-		                              (p.y - hmd.position.y) * (p.y - hmd.position.y) +
-		                              (p.z - hmd.position.z) * (p.z - hmd.position.z));
-		max_dist_to_hmd = std::max(max_dist_to_hmd, d_hmd);
+		float max_dist_to_head = 0.f, max_world = 0.f;
+		bool untracked_while_stale = false;
+		for (int i = 0; i < 1500; i++) { // ~3 s coast (within the abandon horizon), no optical
+			feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+			if (fold) {
+				kf->update_body_anchor(&hmd);
+			}
+			t += DT_NS;
+			xrt_space_relation rel{};
+			kf->get_prediction(t, &rel, &hmd);
+			REQUIRE(std::isfinite(rel.pose.position.x));
+			if (i > 400) { // comfortably past OPTICAL_FREEZE_NS (out of view)
+				max_dist_to_head = std::max(max_dist_to_head, norm(rel.pose.position - hmd.position));
+				max_world = std::max(max_world, norm(rel.pose.position));
+				untracked_while_stale |= (rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0;
+			}
+		}
+		return std::make_tuple(max_dist_to_head, max_world, untracked_while_stale);
+	};
 
-		const xrt_vec3 ride = {hmd.position.x + offset.x, hmd.position.y + offset.y, hmd.position.z + offset.z};
-		max_ride_err = std::max(max_ride_err, std::sqrt((p.x - ride.x) * (p.x - ride.x) +
-		                                                (p.y - ride.y) * (p.y - ride.y) +
-		                                                (p.z - ride.z) * (p.z - ride.z)));
-	}
+	const auto [dist_fold, world_fold, untracked_fold] = lock_then_coast(true);
+	const auto [dist_nofold, world_nofold, untracked_nofold] = lock_then_coast(false);
+	(void)world_nofold;
+	(void)dist_nofold;
 
-	// (a) stays at arm's reach of the head — NOT flung to metres in world frame.
-	CHECK(max_dist_to_hmd < (float)offset_norm + 0.05f);
-	// (b) rides rigidly with the head (the head-relative offset is preserved through the body-locked stretch).
-	CHECK(max_ride_err < 0.02f);
-	// (c) the reported world position followed the head's 3 m walk (would be ~0.6 m if frozen at the start, or
-	// metres if it flew away). At the end (head at +3 m, fully stale) the controller rides to ~head + offset.
-	xrt_space_relation last{};
-	const xrt_pose hmd_end = pose_at({3.0f, 0.f, 0.f}, quat_axis_angle({0.f, 1.f, 0.f}, 0.6f));
-	kf->get_prediction(t, &last, &hmd_end);
-	CHECK(last.pose.position.x == Approx(hmd_end.position.x + offset.x).margin(0.05)); // rode, did NOT freeze
-	CHECK(max_world_pos < 3.6f);                                                       // never flew past head+reach
-	CHECK((last.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0);       // a trusted estimate
+	// WITH the fold: stays within ~an arm of the head, never flies to metres, and is TRACKED the whole coast.
+	CHECK(dist_fold < 0.85f);
+	CHECK(world_fold < 1.5f);
+	CHECK_FALSE(untracked_fold);
+	// TEETH: WITHOUT the fold the same out-of-view coast is reported UNTRACKED (not a trusted pose).
+	CHECK(untracked_nofold);
 }
 
 TEST_CASE("kalman: an abandoned (set-down) controller drops to UNTRACKED after a sustained body-lock hold")
@@ -1088,6 +1096,7 @@ TEST_CASE("kalman: an abandoned (set-down) controller drops to UNTRACKED after a
 	// optical. The controller is at arm's reach in view of the head — the hold rides it, still TRACKED.
 	for (int i = 0; i < 1500; i++) { // 3.0 s, optical dropped
 		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		kf->update_body_anchor(&hmd); // driver path: hold the position body-plausible out of view
 		t += DT_NS;
 	}
 	const xrt_space_relation held = predict_now(t);
@@ -1098,6 +1107,7 @@ TEST_CASE("kalman: an abandoned (set-down) controller drops to UNTRACKED after a
 	// 6 s). The controller is now genuinely set down — it must report UNTRACKED, not be dragged at the head.
 	for (int i = 0; i < 2500; i++) { // another 5 s (total ~8 s of no optical, > 6 s abandon horizon)
 		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		kf->update_body_anchor(&hmd); // still body-anchoring, but past the abandon horizon it reports UNTRACKED
 		t += DT_NS;
 	}
 	const xrt_space_relation abandoned = predict_now(t);
@@ -1112,6 +1122,235 @@ TEST_CASE("kalman: an abandoned (set-down) controller drops to UNTRACKED after a
 	}
 	const xrt_space_relation reacquired = predict_now(t);
 	CHECK(is_tracked(reacquired)); // re-acquire after a drop restores tracking
+}
+
+namespace {
+//! Establish a position-observable body-lock at @p ctrl with a fixed identity head at the origin, then drop
+//! optical for @p stale_samples (out of camera view, IMU-rest only) so the shoulder ride engages. Leaves the
+//! clock at @p t. Returns the head pose used (origin, identity).
+xrt_pose
+reentry_establish_and_go_stale(KalmanFusionInterface *kf, int64_t &t, const xrt_vec3 &ctrl, int stale_samples)
+{
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	const xrt_pose hmd = pose_at(ZERO_VEC);
+	for (int i = 0; i < 200; i++) { // solid lock + capture the arm geometry
+		feed_pose_hmd(kf, t, ctrl, IDENTITY_QUAT, hmd);
+		feed_imu(kf, t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+	for (int i = 0; i < stale_samples; i++) { // out of view: optical dropped, IMU rest
+		feed_imu(kf, t, accel_rest, ZERO_VEC);
+		kf->update_body_anchor(&hmd); // driver path: body-anchor fold holds the position out of view
+		t += DT_NS;
+	}
+	return hmd;
+}
+} // namespace
+
+TEST_CASE("kalman: re-entry blend eases a body-lock->fresh discontinuity (capped, monotone; sub-threshold passes)")
+{
+	// When a body-locked (out-of-view) controller re-acquires optical at a pose that differs from the ridden
+	// arm pose, the report must not teleport: it eases from the ride pose toward the fresh fold with a per-render-
+	// frame position step <= REENTRY_MAX_STEP_M, monotonically converging within the window. A SUB-threshold
+	// discontinuity (below REENTRY_MIN_SNAP_M) must pass straight through with no easing lag. Head is fixed
+	// identity at the origin throughout, so the ride pose equals the lock position and the snap is purely the
+	// re-acquired offset — isolating the blend from head motion.
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	const xrt_pose hmd = pose_at(ZERO_VEC);
+	const xrt_vec3 ctrl_lock = {0.3f, -0.2f, -0.5f};
+	const int64_t freeze_samples = 400; // > OPTICAL_FREEZE_NS (0.5 s = 250 @ 2 ms): comfortably stale
+
+	SECTION("a 20 cm report jump is blended: per-frame step capped, monotone, converges")
+	{
+		// Build a genuine INSTANT report jump (the kind only the blend can smooth — the EKF folds GRADUAL
+		// corrections on its own): the controller stays put at ctrl_lock; while it is out of view the HEAD walks
+		// +0.20 m in X, so the ride pose (which follows the head) drifts +0.20 m from the true controller spot.
+		// On re-acquisition the report switches from the head-displaced ride pose back to the true (unchanged)
+		// fold — a 20 cm instant jump. The blend must ease it: per-frame step <= cap, monotone, converged.
+		auto kf = KalmanFusionInterface::create();
+		REQUIRE(kf != nullptr);
+		int64_t t = 1000000;
+		reentry_establish_and_go_stale(kf.get(), t, ctrl_lock, freeze_samples); // lock + coast (head at origin)
+
+		// Out of view the body-anchor fold held the report at the last-seen spot (ctrl_lock). The controller
+		// actually moved ~20 cm while occluded (below what the resting IMU captured), so on re-acquisition the
+		// fresh optical fold is 20 cm away — an INSTANT report jump only the re-entry ease can smooth (the EKF
+		// folds gradual corrections on its own). Head stays fixed at the origin throughout, isolating the ease.
+		xrt_space_relation pre{};
+		kf->get_prediction(t, &pre, &hmd);
+		const xrt_vec3 ride_pose = pre.pose.position;                  // body-anchored at ~ ctrl_lock
+		const xrt_vec3 target = ctrl_lock + xrt_vec3{0.20f, 0.f, 0.f}; // re-acquired 20 cm away (moved while occluded)
+		REQUIRE(norm(ride_pose - target) > 0.15f);                    // a real ~20 cm jump to smooth
+
+		// Re-acquire optical at the new spot. The first fold arms the ease; optical keeps coming at the new
+		// spot so the live target is stable for the moving-target glide.
+		const int64_t frame_ns = (int64_t)(1e9 / 90.0);
+		feed_pose_hmd(kf.get(), t, target, IDENTITY_QUAT, hmd);
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+
+		xrt_vec3 prev = ride_pose;
+		float max_step = 0.0f;
+		float prev_dist = norm(ride_pose - target);
+		bool monotone = true;
+		float end_err = prev_dist;
+		for (int i = 0; i < 16; i++) { // 16 frames @ 90 Hz ~ 178 ms
+			t += frame_ns;
+			feed_pose_hmd(kf.get(), t, target, IDENTITY_QUAT, hmd); // optical stays live at the new spot
+			feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+			xrt_space_relation rel{};
+			kf->get_prediction(t, &rel, &hmd);
+			REQUIRE(std::isfinite(rel.pose.position.x));
+			const xrt_vec3 p = rel.pose.position;
+			const float step = norm(p - prev);
+			max_step = std::max(max_step, step);
+			const float dist = norm(p - target);
+			if (dist > prev_dist + 1e-3f) {
+				monotone = false; // moved AWAY from the target -> overshoot / non-monotone
+			}
+			prev_dist = dist;
+			prev = p;
+			end_err = dist;
+		}
+		INFO("max per-frame step = " << max_step << " (cap 0.05), end err to target = " << end_err);
+		CHECK(max_step <= 0.05f + 1e-3f); // never jumps more than the per-frame cap
+		CHECK(monotone);                  // first-order: converges without overshoot
+		CHECK(end_err < 0.02f);           // reaches the fresh fold by the end of the window
+	}
+
+	SECTION("a sub-threshold (2 cm) discontinuity passes through un-blended")
+	{
+		auto kf = KalmanFusionInterface::create();
+		REQUIRE(kf != nullptr);
+		int64_t t = 1000000;
+		reentry_establish_and_go_stale(kf.get(), t, ctrl_lock, freeze_samples);
+
+		// Confirm the pre-re-entry body-anchored pose (~ the lock position) — what an (incorrect) easing would lag toward.
+		xrt_space_relation pre{};
+		kf->get_prediction(t, &pre, &hmd);
+		const xrt_vec3 ride_pose = pre.pose.position;
+
+		// Re-acquire only 2 cm away (< REENTRY_MIN_SNAP_M = 5 cm): no blend arms. A handful of folds converge
+		// the filter onto ctrl_new; the report must sit on the fold (NOT eased back toward the ride pose).
+		const xrt_vec3 ctrl_new = ctrl_lock + xrt_vec3{0.02f, 0.0f, 0.0f};
+		const int64_t frame_ns = (int64_t)(1e9 / 90.0);
+		for (int i = 0; i < 5; i++) {
+			feed_pose_hmd(kf.get(), t, ctrl_new, IDENTITY_QUAT, hmd);
+			feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+			t += frame_ns;
+		}
+		xrt_space_relation rel{};
+		kf->get_prediction(t, &rel, &hmd);
+		const float err_to_new = norm(rel.pose.position - ctrl_new);
+		const float err_to_ride = norm(rel.pose.position - ride_pose);
+		INFO("sub-threshold: err to fold=" << err_to_new << "  err to ride=" << err_to_ride
+		                                    << " (must sit on the fold, not eased toward the ride)");
+		CHECK(err_to_new < 0.01f);   // landed on the fresh fold (no easing lag)
+		CHECK(err_to_ride > 0.015f); // and clearly NOT held near the ride pose (a 2 cm move did happen at once)
+	}
+}
+
+TEST_CASE("kalman: FSM report-regime is consistent with the reported relation flags (transition parity)")
+{
+	// The named FSM (debug_get_fusion_state) must agree with the relation flags get_prediction emits, across
+	// the regimes it transitions through: a fresh-optical tracked pose (Visual/Inertial), a stale out-of-view
+	// ride (BodyLocked, still tracked with a live head), and a long-abandoned hold (ConfusedPosition/world hold,
+	// no longer tracked). This couples the enum to observable behaviour rather than to internals.
+	using xrt::auxiliary::tracking::KalmanFusionInterface;
+	enum { FS_INVALID = 0, FS_VISUAL = 1, FS_INERTIAL = 2, FS_WORLD = 3, FS_BODY = 4, FS_CONFUSED = 5 };
+	// The name<->code mapping the interface documents, mirrored here so the test asserts both agree.
+	const char *fs_names[] = {"Invalid",    "VisualAccuracy",   "InertialFastMotion",
+	                          "WorldLocked", "BodyLocked",       "ConfusedPosition"};
+	auto fusion_state_str = [&](int code) -> std::string {
+		return (code >= 0 && code < 6) ? fs_names[code] : "Invalid";
+	};
+
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	const xrt_pose hmd = pose_at(ZERO_VEC);
+	const xrt_vec3 ctrl = {0.3f, -0.2f, -0.5f};
+
+	auto is_pos_tracked = [](const xrt_space_relation &r) {
+		return (r.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
+	};
+	auto state_of = [&]() {
+		char name[32] = {0};
+		const int code = kf->debug_get_fusion_state(name, sizeof(name)); // fill name BEFORE reading it
+		return std::make_pair(code, std::string(name));
+	};
+
+	// Before any data: Invalid, and a query reports nothing tracked.
+	{
+		xrt_space_relation rel{};
+		kf->get_prediction(2000000, &rel, &hmd);
+		auto s = state_of();
+		CHECK(s.first == FS_INVALID);
+		CHECK(s.second == "Invalid");
+		CHECK_FALSE(is_pos_tracked(rel));
+	}
+
+	int64_t t = 1000000;
+	for (int i = 0; i < 200; i++) { // solid fresh lock
+		feed_pose_hmd(kf.get(), t, ctrl, IDENTITY_QUAT, hmd);
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+	{
+		xrt_space_relation rel{};
+		kf->get_prediction(t, &rel, &hmd);
+		auto s = state_of();
+		// Fresh + in-reach -> a TRACKED visual/inertial regime (the device is at rest -> VisualAccuracy).
+		CHECK((s.first == FS_VISUAL || s.first == FS_INERTIAL));
+		CHECK(s.second == fusion_state_str(s.first));
+		CHECK(is_pos_tracked(rel)); // a fresh pose is tracked
+	}
+
+	// Out of view past the freeze horizon but with NO body anchor folded yet (the driver hasn't supplied a live
+	// head) -> WorldLocked: reported at the last good world position but NOT tracked (a stale dead-reckon is not a
+	// trusted pose). The body anchor is a STATE property set by update_body_anchor, so this regime is reached by
+	// coasting WITHOUT it — not by withholding the head from get_prediction (which only sizes the reach clamp).
+	for (int i = 0; i < 400; i++) {
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC); // coast WITHOUT update_body_anchor: nothing holds the position
+		t += DT_NS;
+	}
+	{
+		xrt_space_relation rel{};
+		kf->get_prediction(t, &rel, &hmd);
+		auto s = state_of();
+		CHECK(s.first == FS_WORLD);
+		CHECK(s.second == fusion_state_str(s.first));
+		CHECK_FALSE(is_pos_tracked(rel)); // out of view, unanchored: reported but not tracked
+	}
+
+	// Now the driver folds the body anchor each sample -> BodyLocked: held body-plausible and TRACKED again.
+	for (int i = 0; i < 400; i++) {
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		kf->update_body_anchor(&hmd);
+		t += DT_NS;
+	}
+	{
+		xrt_space_relation rel{};
+		kf->get_prediction(t, &rel, &hmd);
+		auto s = state_of();
+		CHECK(s.first == FS_BODY);
+		CHECK(s.second == fusion_state_str(s.first));
+		CHECK(is_pos_tracked(rel)); // body-anchored -> a trusted pose
+	}
+
+	// Long abandon (well past BODY_LOCK_ABANDON_NS) -> still body-anchored but reports NOT tracked.
+	for (int i = 0; i < 4000; i++) { // ~8 s total of no optical > 6 s abandon horizon
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		kf->update_body_anchor(&hmd);
+		t += DT_NS;
+	}
+	{
+		xrt_space_relation rel{};
+		kf->get_prediction(t, &rel, &hmd);
+		auto s = state_of();
+		// Abandoned: not a trusted pose, regardless of which named bucket it lands in.
+		CHECK((s.first == FS_BODY || s.first == FS_CONFUSED || s.first == FS_WORLD));
+		CHECK_FALSE(is_pos_tracked(rel));
+	}
 }
 
 TEST_CASE("kalman: a lagged optical consistent with the trajectory leaves the pose intact (OOSM)")
@@ -2589,6 +2828,12 @@ TEST_CASE("kalman: ESKF filter consistency (NEES within bounds)")
 	INFO("avg position NEES over " << nees_n << " runs = " << avg_nees << " (ideal ~3)");
 	CHECK(avg_nees > 0.3);  // not absurdly under-confident
 	CHECK(avg_nees < 12.0); // not over-confident / diverged (death-spiral would be >>100)
+	// NO-REGRESSION on the GLOBAL-error consistency (deterministic seeds): the healthy filter sits at
+	// ~0.80 here. The H_theta convention test pins the per-LED orientation Jacobian directly; this is the
+	// end-to-end guard — a wrong global-vs-local Jacobian (or a covariance-honesty regression) would shift
+	// NEES well outside this band. Tight enough to catch that, with margin for the Monte-Carlo spread.
+	CHECK(avg_nees > 0.45);
+	CHECK(avg_nees < 1.6);
 }
 
 // ===========================================================================
@@ -3010,27 +3255,32 @@ TEST_CASE("kalman: reported pose uncertainty falls with tracking and rises when 
 	int64_t t = 1000000;
 	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
 
-	double p = -1.0, r = -1.0;
-	CHECK(kf->get_pose_uncertainty(&p, &r) == false); // not tracking yet -> unavailable
+	double p = -1.0, r = -1.0, y = -1.0;
+	CHECK(kf->get_pose_uncertainty(&p, &r, &y) == false); // not tracking yet -> unavailable
 
 	// Bootstrap, then read the (large) initial uncertainty before optical has refined it.
 	feed_pose(kf.get(), t, ZERO_VEC, IDENTITY_QUAT);
 	feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
 	t += DT_NS;
-	double pos_boot = 0.0, rot_boot = 0.0;
-	REQUIRE(kf->get_pose_uncertainty(&pos_boot, &rot_boot) == true);
+	double pos_boot = 0.0, rot_boot = 0.0, yaw_boot = 0.0;
+	REQUIRE(kf->get_pose_uncertainty(&pos_boot, &rot_boot, &yaw_boot) == true);
 	CHECK(pos_boot > 0.0);
 	CHECK(std::isfinite(pos_boot));
 	CHECK(std::isfinite(rot_boot));
+	CHECK(std::isfinite(yaw_boot));
+	CHECK(yaw_boot > 0.0);
+	// Yaw is a single DoF of the orientation error; its std can never exceed the worst-direction one.
+	CHECK(yaw_boot <= rot_boot + 1e-9);
 
 	for (int i = 0; i < 200; i++) { // solid optical tracking refines the estimate
 		feed_pose(kf.get(), t, ZERO_VEC, IDENTITY_QUAT);
 		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
 		t += DT_NS;
 	}
-	double pos_tracked = 0.0, rot_tracked = 0.0;
-	REQUIRE(kf->get_pose_uncertainty(&pos_tracked, &rot_tracked) == true);
+	double pos_tracked = 0.0, rot_tracked = 0.0, yaw_tracked = 0.0;
+	REQUIRE(kf->get_pose_uncertainty(&pos_tracked, &rot_tracked, &yaw_tracked) == true);
 	CHECK(pos_tracked < pos_boot); // measurements increase confidence -> tighter gate
+	CHECK(yaw_tracked <= rot_tracked + 1e-9);
 
 	// Optical lost WHILE rotating (gyro != 0 disables ZUPT), so velocity and then position drift.
 	const xrt_vec3 spin = {0.0f, 0.8f, 0.0f};
@@ -3038,9 +3288,13 @@ TEST_CASE("kalman: reported pose uncertainty falls with tracking and rises when 
 		feed_imu(kf.get(), t, accel_rest, spin);
 		t += DT_NS;
 	}
-	double pos_drop = 0.0, rot_drop = 0.0;
-	REQUIRE(kf->get_pose_uncertainty(&pos_drop, &rot_drop) == true);
+	double pos_drop = 0.0, rot_drop = 0.0, yaw_drop = 0.0;
+	REQUIRE(kf->get_pose_uncertainty(&pos_drop, &rot_drop, &yaw_drop) == true);
 	CHECK(pos_drop > pos_tracked); // unobserved motion -> wider gate (the dropout-recovery win)
+	// Yaw is unobservable without optical, so a moving optical dropout must widen the yaw std too -- the
+	// flip cost relaxes only after a REAL yaw dropout, not while well-tracked.
+	CHECK(yaw_drop > yaw_tracked);
+	CHECK(yaw_drop <= rot_drop + 1e-9);
 }
 
 TEST_CASE("kalman: get_pose_uncertainty is null-safe and unavailable before tracking and after a reset")
@@ -3051,10 +3305,11 @@ TEST_CASE("kalman: get_pose_uncertainty is null-safe and unavailable before trac
 	REQUIRE(kf != nullptr);
 	int64_t t = 1000000;
 
-	CHECK(kf->get_pose_uncertainty(nullptr, nullptr) == false); // untracked + NULLs: no crash, false
-	double p = -1.0, r = -1.0;
-	CHECK(kf->get_pose_uncertainty(&p, nullptr) == false);
-	CHECK(kf->get_pose_uncertainty(nullptr, &r) == false);
+	CHECK(kf->get_pose_uncertainty(nullptr, nullptr, nullptr) == false); // untracked + NULLs: no crash, false
+	double p = -1.0, r = -1.0, y = -1.0;
+	CHECK(kf->get_pose_uncertainty(&p, nullptr, nullptr) == false);
+	CHECK(kf->get_pose_uncertainty(nullptr, &r, nullptr) == false);
+	CHECK(kf->get_pose_uncertainty(nullptr, nullptr, &y) == false);
 
 	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
 	for (int i = 0; i < 50; i++) {
@@ -3062,11 +3317,13 @@ TEST_CASE("kalman: get_pose_uncertainty is null-safe and unavailable before trac
 		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
 		t += DT_NS;
 	}
-	CHECK(kf->get_pose_uncertainty(nullptr, nullptr) == true); // tracking + NULLs: still no crash
-	double pos = -1.0, rot = -1.0;
-	REQUIRE(kf->get_pose_uncertainty(&pos, &rot) == true);
+	CHECK(kf->get_pose_uncertainty(nullptr, nullptr, nullptr) == true); // tracking + NULLs: still no crash
+	double pos = -1.0, rot = -1.0, yaw = -1.0;
+	REQUIRE(kf->get_pose_uncertainty(&pos, &rot, &yaw) == true);
 	CHECK(std::isfinite(pos));
 	CHECK(std::isfinite(rot));
+	CHECK(std::isfinite(yaw));
+	CHECK(yaw <= rot + 1e-9);
 
 	// A sustained run of corrupt IMU samples forces a reset; uncertainty becomes unavailable again.
 	const xrt_vec3 garbage = {1.0e9f, 1.0e9f, 1.0e9f};
@@ -3074,7 +3331,7 @@ TEST_CASE("kalman: get_pose_uncertainty is null-safe and unavailable before trac
 		feed_imu(kf.get(), t, garbage, garbage);
 		t += DT_NS;
 	}
-	CHECK(kf->get_pose_uncertainty(&pos, &rot) == false);
+	CHECK(kf->get_pose_uncertainty(&pos, &rot, &yaw) == false);
 }
 
 TEST_CASE("kalman: get_pose_uncertainty stays finite and positive through extended unobserved motion")
@@ -3096,12 +3353,15 @@ TEST_CASE("kalman: get_pose_uncertainty stays finite and positive through extend
 		                     (float)(1.5 * std::cos(i * 0.03))};
 		feed_imu(kf.get(), t, am, spin);
 		t += DT_NS;
-		double pos = -1.0, rot = -1.0;
-		if (kf->get_pose_uncertainty(&pos, &rot)) {
+		double pos = -1.0, rot = -1.0, yaw = -1.0;
+		if (kf->get_pose_uncertainty(&pos, &rot, &yaw)) {
 			REQUIRE(std::isfinite(pos));
 			REQUIRE(std::isfinite(rot));
+			REQUIRE(std::isfinite(yaw));
 			REQUIRE(pos > 0.0);
 			REQUIRE(rot > 0.0);
+			REQUIRE(yaw > 0.0);
+			REQUIRE(yaw <= rot + 1e-9);
 		}
 	}
 }
@@ -4254,6 +4514,12 @@ TEST_CASE("kalman: NIS consistency on synthetic data sits within the chi-square 
 	// Chi-square 95% per-DOF band is roughly [0.2, 2.5] for the mean of many folds; assert well inside.
 	CHECK(avg > 0.2);
 	CHECK(avg < 2.5);
+	// NO-REGRESSION on the per-LED measurement-model consistency (deterministic seeds): the healthy filter
+	// sits at ~0.94 here. The per-LED innovation covariance S = H P H^T + R is built from the SAME global-error
+	// H the fold uses; a Jacobian/convention regression pushes the NIS off ~1. Tighter than the loose band
+	// above, with margin for the Monte-Carlo spread.
+	CHECK(avg > 0.7);
+	CHECK(avg < 1.25);
 }
 
 TEST_CASE("kalman: weak-DOF covariance floor keeps depth uncertainty from collapsing")

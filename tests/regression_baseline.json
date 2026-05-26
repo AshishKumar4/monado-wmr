@@ -1,23 +1,56 @@
 {
   "capture": "20260524-200416-headpose",
-  "column": "opt",
+  "columns": [
+    "opt",
+    "pred"
+  ],
   "_note": "edited & maintained by Claude, presented as-is. Regenerate: regression_check.py --update",
   "metrics": {
     "1": {
-      "yield_pct": 65.29680365296804,
-      "wrong_branch_pct": 24.828263002944063,
-      "flip_rate_pct": 10.0,
-      "fly_frac_beyond_reach": 4.662004662004662,
-      "anchor_tilt_flip_pct": 11.159650516282763,
-      "anchor_yaw_flip_pct": 1.0325655281969817
+      "opt": {
+        "yield_pct": 65.29680365296804,
+        "pos_med_cm": 0.606582701498081,
+        "wrong_branch_pct": 24.828263002944063,
+        "flip_rate_pct": 10.0,
+        "fly_max_jump_m": 1.092651323433052,
+        "fly_frac_beyond_reach": 4.662004662004662,
+        "anchor_tilt_flip_pct": 11.159650516282763,
+        "anchor_yaw_flip_pct": 1.0325655281969817
+      },
+      "pred": {
+        "yield_pct": 93.39975093399751,
+        "pos_med_cm": 2.8343373491913977,
+        "wrong_branch_pct": 24.118129614438065,
+        "flip_rate_pct": 0.059268039709586606,
+        "fly_max_jump_m": 1.9347189815836303,
+        "fly_frac_beyond_reach": 8.074074074074074,
+        "reentry_snap_m": 0.0,
+        "anchor_tilt_flip_pct": 0.9776536312849162,
+        "anchor_yaw_flip_pct": 0.44227188081936686
+      }
     },
     "2": {
-      "yield_pct": 73.74200722824575,
-      "wrong_branch_pct": 13.644088370963825,
-      "flip_rate_pct": 7.546093898498384,
-      "fly_frac_beyond_reach": 2.6767200754005653,
-      "anchor_tilt_flip_pct": 5.617283950617284,
-      "anchor_yaw_flip_pct": 1.4197530864197532
+      "opt": {
+        "yield_pct": 73.74200722824575,
+        "pos_med_cm": 0.9207419533635559,
+        "wrong_branch_pct": 13.644088370963825,
+        "flip_rate_pct": 7.546093898498384,
+        "fly_max_jump_m": 3.501841206765378,
+        "fly_frac_beyond_reach": 2.6767200754005653,
+        "anchor_tilt_flip_pct": 5.617283950617284,
+        "anchor_yaw_flip_pct": 1.4197530864197532
+      },
+      "pred": {
+        "yield_pct": 98.69335557408952,
+        "pos_med_cm": 1.1033355829890645,
+        "wrong_branch_pct": 11.268875366238449,
+        "flip_rate_pct": 0.02817298211015636,
+        "fly_max_jump_m": 1.680665937091604,
+        "fly_frac_beyond_reach": 7.154929577464789,
+        "reentry_snap_m": 0.0,
+        "anchor_tilt_flip_pct": 0.3857457751653196,
+        "anchor_yaw_flip_pct": 0.31227038941954444
+      }
     }
   }
 }

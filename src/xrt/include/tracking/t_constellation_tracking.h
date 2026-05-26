@@ -116,12 +116,20 @@ struct t_constellation_tracked_device_callbacks
 	                           const struct xrt_pose *P_xrworld_cam,
 	                           const struct t_constellation_cam_calib *cam_calib,
 	                           const struct t_constellation_led_obs *leds, size_t led_count);
-	//! Current 1-sigma uncertainty of the device's predicted (prior) pose: scalar position std (m) and
-	//! orientation std (rad) from the fusion covariance. Lets the matcher size its prior-consistency
-	//! gate by the filter's live confidence (tight when tracked, wide after a dropout) instead of a
-	//! fixed tolerance. Optional — may be NULL, or return false until the fusion is tracking; the
-	//! matcher then falls back to its fixed default bounds.
-	bool (*get_pose_uncertainty)(struct xrt_device *xdev, double *position_std, double *orientation_std);
+	//! Current 1-sigma uncertainty of the device's predicted (prior) pose from the fusion covariance:
+	//! position_std (m) and orientation_std (rad) are the worst-direction stds the matcher uses to size
+	//! its prior-consistency gate (tight when tracked, wide after a dropout); yaw_std (rad), when
+	//! non-null, is the orientation std about world-up ALONE — the uncertain yaw DoF, separated from the
+	//! gravity-anchored (observable) tilt — for the mirror-flip cost's yaw scale. Any out pointer may be
+	//! NULL. Optional callback — may be NULL, or return false until the fusion is tracking; the matcher
+	//! then falls back to its fixed default bounds.
+	bool (*get_pose_uncertainty)(struct xrt_device *xdev, double *position_std, double *orientation_std,
+	                             double *yaw_std);
+	//! Raw predicted (prior) pose for the matcher — the fusion's HONEST estimate, with NO body-lock / reach /
+	//! re-entry reporting transforms, so the out-of-view visual ride never feeds back to mislead the matcher's
+	//! gate + flip cost. @p out receives the pose (identity / untracked flags until the fusion is tracking).
+	//! Optional — if NULL or it returns false, the caller falls back to the device's reported pose.
+	bool (*get_predicted_pose)(struct xrt_device *xdev, timepoint_ns when_ns, struct xrt_space_relation *out);
 	//! Predict one LED's image point @p out_zhat (px) and 2x2 innovation covariance @p out_S (row-major
 	//! S00,S01,S10,S11 = H·P·Hᵀ + R) — the per-LED ANISOTROPIC gate ellipse from the fusion's live
 	//! covariance, using the SAME projection/Jacobian as the per-LED fold (one source of truth). @p

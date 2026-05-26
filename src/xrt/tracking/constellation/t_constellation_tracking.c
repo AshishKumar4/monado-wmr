@@ -73,6 +73,19 @@ DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
 #define FLIP_COST_WEIGHT 1.0
 #define FLIP_COST_HUBER_KNEE_SIGMA PRIOR_GATE_SIGMA
 #define FLIP_COST_YAW_SIGMA_MAX DEG_TO_RAD(180)
+/* The yaw-scale FLOOR for the soft flip cost: the minimum yaw 1-sigma the cost will use, regardless of how
+ * confident the ESKF reports it is. This is a separate concept from the GRAVITY_TILT_TOL tilt scale (they are
+ * different DoFs and must not share one constant), but the VALUE here is governed by a real effect the ESKF
+ * yaw covariance cannot see: the optical front-end occasionally folds a wrong-yaw pose, after which the filter
+ * is legitimately CONFIDENT (small reported yaw sigma) in a yaw that is actually off — an over-confident prior.
+ * Measured on G2 controller captures, ~11-19% of accepted optical poses disagree with the gyro/fusion prior by
+ * >45deg, so a yaw scale tighter than this floor makes the cost over-trust that stale prior and SELECT the
+ * candidate that matches the wrong yaw (offline A/B: dropping the floor to 3deg raised Left wrong-branch
+ * 24.8->37.0% and flip 10.0->11.3%, while 30-60deg are statistically flat). The floor caps that over-trust;
+ * the live sigma still WIDENS the scale above it after a real dropout (the cost relaxes and reprojection
+ * decides). Equal to MIN_ROT_ERROR, the prior gate's per-axis rotation floor: the yaw scale never claims more
+ * yaw confidence than the gate's tightest accepted rotation tolerance, the empirically validated knee. */
+#define FLIP_COST_YAW_SIGMA_MIN MIN_ROT_ERROR
 
 /* Covariance-gated partial-fold. When the fast paths cannot solve a PnP (<4 cleanly-labelled LEDs for the
  * device in any single camera — the dominant fall-through, a visibility limit not a bug) but the fusion HAS
@@ -397,13 +410,14 @@ constellation_tracked_device_connection_get_led_model(struct t_constellation_tra
 static bool
 constellation_tracked_device_connection_get_pose_uncertainty(struct t_constellation_tracked_device_connection *ctdc,
                                                              double *position_std,
-                                                             double *orientation_std)
+                                                             double *orientation_std,
+                                                             double *yaw_std)
 {
 	bool ret = false;
 
 	os_mutex_lock(&ctdc->lock);
 	if (!ctdc->disconnected && ctdc->cb->get_pose_uncertainty) {
-		ret = ctdc->cb->get_pose_uncertainty(ctdc->xdev, position_std, orientation_std);
+		ret = ctdc->cb->get_pose_uncertainty(ctdc->xdev, position_std, orientation_std, yaw_std);
 	}
 	os_mutex_unlock(&ctdc->lock);
 
@@ -422,6 +436,25 @@ constellation_tracked_device_connection_get_tracked_pose(struct t_constellation_
 		struct xrt_device *xdev = ctdc->xdev;
 		xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_TRACKER_POSE, timestamp_ns, xsr);
 		ret = true;
+	}
+	os_mutex_unlock(&ctdc->lock);
+
+	return ret;
+}
+
+//! The fusion's RAW predicted prior (no body-lock/reach/re-entry), the honest estimate to gate + flip-cost
+//! against. Optional callback; returns false if the device doesn't expose it (caller falls back to the
+//! reported pose).
+static bool
+constellation_tracked_device_connection_get_predicted_pose(struct t_constellation_tracked_device_connection *ctdc,
+                                                            uint64_t when_ns,
+                                                            struct xrt_space_relation *xsr)
+{
+	bool ret = false;
+
+	os_mutex_lock(&ctdc->lock);
+	if (!ctdc->disconnected && ctdc->cb->get_predicted_pose) {
+		ret = ctdc->cb->get_predicted_pose(ctdc->xdev, when_ns, xsr);
 	}
 	os_mutex_unlock(&ctdc->lock);
 
@@ -1481,11 +1514,15 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 
 		struct tracking_sample_device_state *dev_state = sample->devices + sample->n_devices;
 
-		// Collect the controller prior pose
+		// Prior pose for matching: the fusion's RAW estimate (no body-lock ride — the visual out-of-view
+		// ride must never feed back as the matcher's prior), falling back to the device's reported pose for
+		// a device that doesn't expose the raw estimate.
 		struct xrt_space_relation xsr;
-		if (!constellation_tracked_device_connection_get_tracked_pose(device->connection, xf->timestamp,
+		if (!constellation_tracked_device_connection_get_predicted_pose(device->connection, xf->timestamp,
+		                                                                &xsr) &&
+		    !constellation_tracked_device_connection_get_tracked_pose(device->connection, xf->timestamp,
 		                                                              &xsr)) {
-			CT_DEBUG(ct, "Failed to retrieve tracked pose for device %u", device->led_model.id);
+			CT_DEBUG(ct, "Failed to retrieve prior pose for device %u", device->led_model.id);
 			continue; // Can't retrieve the pose: means the device was disconnected
 		}
 
@@ -1504,17 +1541,20 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		 * prior-refine accepts frames it would otherwise drop to the slow search) and keeps it tight
 		 * when confident. */
 		float pos_bound = MIN_POS_ERROR, rot_bound = MIN_ROT_ERROR;
-		double pos_std = 0.0, rot_std = 0.0;
+		double pos_std = 0.0, rot_std = 0.0, yaw_std = 0.0;
 		bool tilt_trusted = false;
-		/* Soft mirror-flip cost's yaw scale: the live fusion yaw 1-sigma when tracking, else half a turn
-		 * (untracked -> the yaw term vanishes). Floored at the tilt bound so a falsely-tiny reported sigma
-		 * can't make the yaw term explode and over-penalise a real drifted yaw. */
+		/* Soft mirror-flip cost's yaw scale: the live fusion YAW-AXIS 1-sigma (the orientation error about
+		 * world-up alone) when tracking, else half a turn (untracked -> the yaw term vanishes). Keyed off the
+		 * yaw DoF specifically, NOT the worst-direction orientation sigma — the gravity-anchored tilt is
+		 * observable and tight, so folding it into the yaw scale would inflate it and conflate two DoFs.
+		 * Floored at FLIP_COST_YAW_SIGMA_MIN (see its definition) so the cost cannot over-trust an
+		 * over-confident prior yaw; the live sigma widens the scale above the floor after a real dropout. */
 		float yaw_sigma = (float)FLIP_COST_YAW_SIGMA_MAX;
 		if (constellation_tracked_device_connection_get_pose_uncertainty(device->connection, &pos_std,
-		                                                                 &rot_std)) {
+		                                                                 &rot_std, &yaw_std)) {
 			pos_bound = (float)fmin(fmax(PRIOR_GATE_SIGMA * pos_std, MIN_POS_ERROR), MAX_POS_ERROR);
 			rot_bound = (float)fmin(fmax(PRIOR_GATE_SIGMA * rot_std, MIN_ROT_ERROR), MAX_ROT_ERROR);
-			yaw_sigma = (float)fmin(fmax(rot_std, GRAVITY_TILT_TOL), FLIP_COST_YAW_SIGMA_MAX);
+			yaw_sigma = (float)fmin(fmax(yaw_std, FLIP_COST_YAW_SIGMA_MIN), FLIP_COST_YAW_SIGMA_MAX);
 			/* TILT is driftless (gravity-anchored): trusted whenever the fusion is tracking, even through a
 			 * dropout. The soft cost's yaw scale (yaw_sigma) widens with the live yaw uncertainty, so a
 			 * stale yaw self-deweights rather than needing a binary trust flag. */

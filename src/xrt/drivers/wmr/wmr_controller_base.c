@@ -148,6 +148,17 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 	// internal defaults — keeping the real driver's behaviour identical to
 	// what the t_tracker_kalman_fusion test suite verifies.
 	kalman_fusion_process_imu_data(wcb->kalman_fusion, &k_imu_sample, NULL, NULL);
+
+	// Out-of-view body anchor: feed the live head pose so the fusion bounds the off-camera dead-reckon drift
+	// (no-op while in view; throttled internally).
+	if (wcb->hmd_xdev != NULL) {
+		struct xrt_space_relation hmd_rel;
+		if (xrt_device_get_tracked_pose(wcb->hmd_xdev, XRT_INPUT_GENERIC_TRACKER_POSE, mono_time_ns,
+		                                &hmd_rel) == XRT_SUCCESS &&
+		    (hmd_rel.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
+			kalman_fusion_update_body_anchor(wcb->kalman_fusion, &hmd_rel.pose);
+		}
+	}
 }
 
 static void
@@ -1289,14 +1300,31 @@ wmr_controller_base_get_led_model(struct xrt_device *xdev, struct t_constellatio
 }
 
 static bool
-wmr_controller_base_get_pose_uncertainty(struct xrt_device *xdev, double *position_std, double *orientation_std)
+wmr_controller_base_get_pose_uncertainty(struct xrt_device *xdev,
+                                         double *position_std,
+                                         double *orientation_std,
+                                         double *yaw_std)
 {
 	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
 	if (wcb->kalman_fusion == NULL) {
 		return false;
 	}
 	// The fusion reads its published snapshot wait-free, so no data_lock is needed here.
-	return kalman_fusion_get_pose_uncertainty(wcb->kalman_fusion, position_std, orientation_std);
+	return kalman_fusion_get_pose_uncertainty(wcb->kalman_fusion, position_std, orientation_std, yaw_std);
+}
+
+static bool
+wmr_controller_base_get_predicted_pose(struct xrt_device *xdev,
+                                       timepoint_ns when_ns,
+                                       struct xrt_space_relation *out_relation)
+{
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
+	if (wcb->kalman_fusion == NULL) {
+		return false;
+	}
+	// The matcher's PRIOR uses the raw estimate (no body-lock ride), wait-free from the published snapshot.
+	kalman_fusion_get_predicted_pose(wcb->kalman_fusion, when_ns, out_relation);
+	return true;
 }
 
 /* Observed LED peak-brightness band (0-255 image counts) the LED-drive control loop rides toward.
@@ -1542,6 +1570,7 @@ static struct t_constellation_tracked_device_callbacks tracking_callbacks = {
     .push_observed_leds = wmr_controller_base_push_observed_leds,
     .push_brightness_update = wmr_controller_base_push_brightness_update,
     .get_pose_uncertainty = wmr_controller_base_get_pose_uncertainty,
+    .get_predicted_pose = wmr_controller_base_get_predicted_pose,
     .predict_led_gate = wmr_controller_base_predict_led_gate,
 };
 

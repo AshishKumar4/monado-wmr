@@ -30,6 +30,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <vector>
 #include <iomanip>
 
@@ -107,6 +108,12 @@ namespace {
 		m << 0, -v.z(), v.y(), v.z(), 0, -v.x(), -v.y(), v.x(), 0;
 		return m;
 	}
+
+	//! Re-entry ease: on re-acquisition, slide the reported position to the fresh fold over this window; only
+	//! a jump >= REENTRY_MIN_SNAP_M is eased (smaller ones pass through).
+	constexpr int64_t REENTRY_WINDOW_NS = ms_to_ns(120);
+	constexpr double REENTRY_MAX_STEP_M = 0.05; //!< per-frame position cap during the ease
+	constexpr double REENTRY_MIN_SNAP_M = 0.05; //!< only ease jumps at/above this
 
 	//! Precomputed per-view geometry+intrinsics for the per-LED reprojection (built once per frame).
 	struct LedViewCache
@@ -258,6 +265,39 @@ namespace {
 		}
 		const double angle = 2.0 * std::atan2(n, q.w());
 		return angle * (v / n);
+	}
+
+	//! Named regime of the out-of-view reporting path, lifted from the get_prediction booleans so the report
+	//! source is one explicit state instead of a scatter of flags. Exposed read-only for live debugging; the
+	//! reporting behaviour is unchanged (this only NAMES it).
+	//!  - VisualAccuracy:    fresh optical, the live extrapolation is reported (the good case).
+	//!  - InertialFastMotion: fresh optical, in-reach, but extrapolating on velocity/accel (still TRACKED).
+	//!  - WorldLocked:       optical stale, no usable head reference -> the world-frame hold at last good pos.
+	//!  - BodyLocked:        optical stale (or an out-of-reach excursion), ridden rigidly with the live head.
+	//!  - ConfusedPosition:  beyond arm reach with no valid body-lock offset -> clamped, position UNtracked.
+	//!  - Invalid:           not tracking / no snapshot yet.
+	enum class FusionState
+	{
+		Invalid,
+		VisualAccuracy,
+		InertialFastMotion,
+		WorldLocked,
+		BodyLocked,
+		ConfusedPosition,
+	};
+
+	inline const char *
+	fusion_state_name(FusionState s)
+	{
+		switch (s) {
+		case FusionState::VisualAccuracy: return "VisualAccuracy";
+		case FusionState::InertialFastMotion: return "InertialFastMotion";
+		case FusionState::WorldLocked: return "WorldLocked";
+		case FusionState::BodyLocked: return "BodyLocked";
+		case FusionState::ConfusedPosition: return "ConfusedPosition";
+		case FusionState::Invalid: return "Invalid";
+		}
+		return "Invalid";
 	}
 
 	class ImuPoseRecorder
@@ -417,11 +457,11 @@ namespace {
 		double angular_velocity[3]; //!< world-frame, last sample
 		double acceleration[3];     //!< world-frame incl. gravity, last sample
 		double last_good_position[3];
-		double body_lock_offset[3]; //!< controller-minus-HMD (world) at the last position-observable fold
-		double position_var_max;    //!< largest eigenvalue of P[EP,EP] (m^2): worst-direction variance
-		double orientation_var_max; //!< largest eigenvalue of P[ET,ET] (rad^2): worst-direction variance
-		double acceleration_var_max; //!< largest eigenvalue of P[EBA,EBA] ((m/s^2)^2): worst-direction accel-bias
-		                             //!< variance, the dominant uncertainty of the world accel used to render-extrapolate
+		double position_var_max;     //!< largest eigenvalue of P[EP,EP] (m^2): worst-direction position variance
+		double orientation_var_max;  //!< largest eigenvalue of P[ET,ET] (rad^2): worst-direction orientation variance
+		double orientation_yaw_var;  //!< up'·P[ET,ET]·up: the world-up (yaw) DoF variance alone (rad^2)
+		double acceleration_var_max; //!< largest eigenvalue of P[EBA,EBA] ((m/s^2)^2): dominant render-accel uncertainty
+		timepoint_ns reentry_start_ns;
 		timepoint_ns filter_time_ns;
 		timepoint_ns last_optical_ns;
 		bool tracked;
@@ -429,8 +469,13 @@ namespace {
 		bool position_tracked;
 		bool orientation_valid;
 		bool orientation_tracked;
-		bool body_lock_valid; //!< body_lock_offset is meaningful (a fold supplied a live HMD pose)
+		bool body_anchored;  //!< the body-anchor fold is holding the position out of view (coast bounded + trusted)
+		bool reentry_active; //!< a recent re-acquisition edge (get_prediction eases the report jump)
 	};
+	//! The seqlock copies the snapshot as a flat block (a torn read is detected + retried), so it MUST stay a
+	//! trivially-copyable POD — any new field has to be too. Guard it at compile time.
+	static_assert(std::is_trivially_copyable<FilterSnapshot>::value,
+	              "FilterSnapshot must stay trivially copyable for the lock-free seqlock read");
 
 	//! A complete copy of the mutable filter state, to rewind for out-of-sequence
 	//! (lagged) optical measurements. The ESKF carries a full covariance, so the
@@ -442,22 +487,37 @@ namespace {
 		Vector3d accel_world{0, 0, 0};
 		Vector3d angvel_world{0, 0, 0};
 		Vector3d last_good_position{0, 0, 0};
-		Vector3d body_lock_offset{0, 0, 0};
+		Vector3d body_offset_world{0, 0, 0}; //!< controller-minus-head WORLD offset at the last fold
 		timepoint_ns filter_time_ns{0};
 		timepoint_ns last_imu_ns{0};
 		timepoint_ns last_optical_ns{0};
 		timepoint_ns last_led_fold_ns{0};
+		timepoint_ns prev_capture_optical_ns{0};
+		timepoint_ns last_body_anchor_ns{0};
 		TrackingInfo orientation_state;
 		TrackingInfo position_state;
 		int imu_anomaly_count{0};
 		bool tracked{false};
 		bool body_lock_valid{false};
+		bool body_anchored{false};
 	};
 
 	//! One buffered IMU sample retained for out-of-sequence replay.
 	struct ImuLogEntry
 	{
 		xrt_imu_sample sample;
+	};
+
+	//! Raw extrapolation of the published snapshot to a render time — the filter's honest belief, with NO
+	//! body-lock / reach / re-entry transforms (those are the reporting layer get_prediction adds on top).
+	//! Shared by get_prediction (the compositor report) and get_predicted_pose (the matcher's estimation
+	//! prior) so the front-end gates against the estimate, never the visual ride, from ONE snapshot read.
+	struct PredictedEstimate
+	{
+		Vector3d position;       //!< dead-reckon-frozen at last_good once optical is stale, else extrapolated
+		Quaterniond orientation; //!< gyro-advanced
+		Vector3d velocity;       //!< Wiener-damped linear velocity
+		bool optical_stale;
 	};
 
 	class EskfFusion : public KalmanFusionInterface
@@ -505,6 +565,9 @@ namespace {
 		               struct xrt_space_relation *out_relation,
 		               const struct xrt_pose *hmd_world_pose) override;
 
+		void
+		get_predicted_pose(const timepoint_ns when_ns, struct xrt_space_relation *out_relation) override;
+
 		bool
 		predict_led_gate(const LEDObservation &obs,
 		                 const LEDCameraView &view,
@@ -521,20 +584,28 @@ namespace {
 		debug_get_nis_stats(double *mean_per_dof, double *last_per_dof) override;
 
 		bool
-		get_pose_uncertainty(double *position_std, double *orientation_std) override
+		get_pose_uncertainty(double *position_std, double *orientation_std, double *yaw_std) override
 		{
 			const FilterSnapshot snap = read_snapshot();
 			if (!snap.tracked) {
 				return false;
 			}
-			// Worst-direction (largest-eigenvalue) 1-sigma, applied isotropically by the caller. This is
-			// frame-conservative: the covariance is world-frame and the caller's gate is in another frame,
-			// and uncertainty in any direction u is u'Pu <= lambda_max, so this never wrongly tightens.
+			// position_std / orientation_std: worst-direction (largest-eigenvalue) 1-sigma, applied
+			// isotropically by the caller. Frame-conservative: the covariance is world-frame and the
+			// caller's gate is in another frame, and uncertainty in any direction u is u'Pu <= lambda_max,
+			// so this never wrongly tightens the prior-consistency gate.
 			if (position_std != nullptr) {
 				*position_std = std::sqrt(std::max(0.0, snap.position_var_max));
 			}
 			if (orientation_std != nullptr) {
 				*orientation_std = std::sqrt(std::max(0.0, snap.orientation_var_max));
+			}
+			// yaw_std: the 1-sigma of the orientation error about world-up ALONE (the uncertain DoF). The
+			// flip cost's yaw scale must use this, not the worst-direction orientation_std, so a flipped
+			// candidate is sharply penalised when yaw is well-tracked and only relaxes after a real yaw
+			// dropout — tilt (gravity-anchored, observable) never widens the yaw scale.
+			if (yaw_std != nullptr) {
+				*yaw_std = std::sqrt(std::max(0.0, snap.orientation_yaw_var));
 			}
 			return true;
 		}
@@ -636,6 +707,27 @@ namespace {
 			return m_gyro_M_valid || m_accel_T_valid;
 		}
 
+		//! Out-of-view body-plausibility update against the live head pose (see fold_body_anchor). The driver
+		//! calls this per controller IMU sample; no-op (publishes nothing) unless out of view and due.
+		void
+		update_body_anchor(const struct xrt_pose *hmd_pose) override
+		{
+			std::lock_guard<std::mutex> lock(m_filter_lock);
+			if (fold_body_anchor(hmd_pose)) {
+				publish_snapshot();
+			}
+		}
+
+		int
+		debug_get_fusion_state(char *name_out, size_t name_cap) override
+		{
+			const FusionState s = m_fusion_state.load(std::memory_order_relaxed);
+			if (name_out != nullptr && name_cap > 0) {
+				(void)snprintf(name_out, name_cap, "%s", fusion_state_name(s));
+			}
+			return (int)s; // matches the enum order documented on the interface
+		}
+
 		void
 		add_ui(void *root, const char *device_name) override;
 
@@ -681,6 +773,13 @@ namespace {
 		//! drives orientation drift during motion -> gravity leaks into horizontal accel -> position
 		//! runaway, so nailing bg at every stance is the single biggest lever for unaided-motion accuracy.
 		static constexpr double ZARU_VAR = sq(0.01);           //!< (rad/s)^2 gyro-rate measurement var
+		//! Body-anchor: out of view, softly pull position toward the rigid HMD-relative point from the last fold
+		//! Out of view a throttled POSITION fold pulls the state toward the body-plausible point head +
+		//! body_offset_world (the controller hangs off the body). The Kalman gain blends it with the IMU
+		//! dead-reckon (negligible fresh, dominant on long coast); BODY_ANCHOR_VAR stays loose (arm-reach) so the
+		//! matcher's covariance-sized prior gate stays wide for re-acquisition.
+		static constexpr double BODY_ANCHOR_VAR = sq(0.5);     //!< m^2; body-plausibility position var
+		static constexpr int64_t BODY_ANCHOR_PERIOD_NS = ms_to_ns(33); //!< position-fold cadence (~30 Hz)
 		//! Online accel-scale: the per-unit absolute scale is ~2-3% off, and a constant body bias CANNOT
 		//! absorb a SCALE error across orientations (it re-projects with the device -> a velocity kick on
 		//! every rotation). At rest the true |specific force| is g, so k = g/|a_m| is the ML gain estimate.
@@ -801,9 +900,11 @@ namespace {
 		//! away. Bounding the HEAD-RELATIVE distance (not the world-origin distance) is room-roam-invariant:
 		//! roaming carries head + controller together, so a legitimate room-scale pose far from the world
 		//! origin is never wrongly rejected. Generous (full extension + slack) so it only catches artifacts.
-		//! Reused as the body-lock trust bound (an out-of-view controller is only ridden with the head while
-		//! its last offset is within reach).
+		//! Also the report runaway-safety bound: a report beyond it is a degenerate solve, clamped + untracked.
 		static constexpr double MAX_CONTROLLER_REACH_M = 1.5;
+		//! Out-of-view REPORT bound: a body-anchored controller is within an arm of the head, so the reported
+		//! (dead-reckon-drifting) position is held to this. Report-only — the matcher reads the raw state.
+		static constexpr double BODY_REACH_M = 0.9;
 		//! World-origin fallback bound used ONLY when no live HMD pose is available (standalone use; head
 		//! pose not yet valid). Without a head reference the head-relative distance cannot be measured, so the
 		//! gate degrades to the world-origin distance — kept generous (room excursion + reach) so it never
@@ -848,19 +949,38 @@ namespace {
 		//! Time of the last successful per-LED fold; gates process_pose's measurement mode (see above).
 		timepoint_ns m_last_led_fold_ns{0};
 
-		//! BODY-LOCK out-of-view reporting. When position stops being optically observable the controller
-		//! is reported riding the LIVE HMD pose at its last controller-to-HMD offset (NOT a world dead-reckon,
-		//! NOT a world-frame freeze): report = hmd_world(live) + m_body_lock_offset. The offset is the
-		//! controller-minus-HMD vector captured at the last POSITION-OBSERVABLE fold; while observable it is
-		//! refreshed every fold, so out-of-view we ride the most recent good geometry. Valid only once such a
-		//! fold has supplied an HMD pose; falls back to the world-frame hold when invalid or no live HMD pose.
-		bool m_body_lock_valid{false};
-		Vector3d m_body_lock_offset{0, 0, 0};
-		//! Per-optical-op HMD world position, set under m_filter_lock by process_pose / process_led_observations
-		//! before the fold/integrate so the offset capture + the controller-to-HMD adoption gate read it
-		//! without threading it through every helper signature. Cleared (invalid) when no HMD pose is supplied.
+		//! Body-anchor out-of-view tracking: fold_body_anchor softly pulls the position toward a body-plausible
+		//! point — the controller's WORLD offset from the head captured at the last fold, carried with the live
+		//! head POSITION. It follows the head's body translation but deliberately NOT the head's gaze rotation: a
+		//! controller is held by the body, so merely turning the head to look around must not swing it (a
+		//! head-orientation-coupled anchor swings the out-of-view controller by ~offset·yaw — metres under a wide
+		//! look-around). The STATE stays body-plausible out of view so the report + matcher prior just read it (no
+		//! reporting-layer ride); orientation stays the gyro estimate.
+		bool m_body_lock_valid{false};         //!< a fold with a live HMD pose has captured the body offset
+		Vector3d m_body_offset_world{0, 0, 0}; //!< controller-minus-head WORLD offset at the last fold (translation-rigid)
+		bool m_body_anchored{false};          //!< the body-anchor fold is holding the position out of view this coast
+		timepoint_ns m_last_body_anchor_ns{0}; //!< last position-fold time (the throttle); velocity damp is every sample
+		//! Live HMD pose at the last optical op, set under m_filter_lock by set_op_hmd_pose for the reach gate.
+		//! Cleared (invalid) when no HMD pose is supplied.
 		bool m_hmd_pos_valid{false};
 		Vector3d m_hmd_pos{0, 0, 0};
+		Quaterniond m_hmd_quat{1, 0, 0, 0};
+		//! Re-entry ease (render-side, not estimator state): on a re-acquisition edge get_prediction eases the
+		//! reported position from its last value toward the live fold, capped per frame. NOT checkpointed.
+		bool m_reentry_active{false};
+		timepoint_ns m_reentry_start_ns{0};
+		//! Eased position carried ACROSS render frames (a rate-capped step needs the previous frame's pose) — true
+		//! cross-frame state the render path read-modify-writes, which the publish-only seqlock can't model. A
+		//! dedicated LEAF mutex guards it: get_prediction takes it after read_snapshot returns its copy and never
+		//! while m_filter_lock is held, so it can't nest with either lock. Taken only during an active blend (rare).
+		std::mutex m_reentry_render_lock;
+		timepoint_ns m_reentry_render_epoch_ns{0}; //!< which blend (its start time) m_reentry_cur_pos belongs to
+		timepoint_ns m_reentry_last_render_ns{0};
+		bool m_reentry_epoch_blends{false}; //!< this epoch's initial gap >= REENTRY_MIN_SNAP_M (else pass-through)
+		Vector3d m_reentry_cur_pos{0, 0, 0};
+		//! last_optical_ns at the PREVIOUS position-constraining fold, so capture_body_lock can measure the
+		//! out-of-view gap and detect the re-entry edge (last_optical_ns is already advanced by the caller).
+		timepoint_ns m_prev_capture_optical_ns{0};
 
 		//! NIS consistency telemetry: a small ring of the last folds' mean per-DOF NIS (d^2 / dof). For a
 		//! correctly-tuned filter this averages ~1; persistently >>1 means over-confident (P too small),
@@ -965,6 +1085,10 @@ namespace {
 		//! gyro directly observes the gyro bias (all three axes incl. yaw). Caller holds m_filter_lock.
 		void
 		fold_zaru(const Vector3d &gyro_measured);
+		//! Soft body-anchor position fold while out of view (see BODY_ANCHOR_VAR): pulls the dead-reckon toward
+		//! the rigid HMD-relative point. @p hmd_pose is the live head pose. Returns true if it folded (throttled).
+		bool
+		fold_body_anchor(const struct xrt_pose *hmd_pose);
 		void
 		propagate_to(int64_t target_ns);
 		bool
@@ -1019,24 +1143,35 @@ namespace {
 			return m_hmd_pos_valid ? (world_pos - m_hmd_pos).norm() < MAX_CONTROLLER_REACH_M
 			                       : world_pos.norm() < MAX_WORLD_POS_M;
 		}
-		//! Capture the body-lock offset (controller-minus-HMD, world) from the current state + the op's HMD
-		//! pose. Called on a position-observable fold; no-op (leaves the prior offset) without a live HMD pose.
+		//! On a position-observable fold, capture the controller's head-frame offset (the body-anchor target)
+		//! and signal a re-entry edge if we just re-acquired after a coast. No-op without a live HMD pose.
 		void
 		capture_body_lock()
 		{
-			if (m_hmd_pos_valid) {
-				m_body_lock_offset = m_x.p - m_hmd_pos;
-				m_body_lock_valid = true;
+			if (!m_hmd_pos_valid) {
+				return;
 			}
+			if (m_body_lock_valid && m_prev_capture_optical_ns != 0 &&
+			    (filter_time_ns - m_prev_capture_optical_ns) > OPTICAL_FREEZE_NS) {
+				m_reentry_active = true; // re-acquired: get_prediction eases the report jump from its last value
+				m_reentry_start_ns = filter_time_ns;
+			}
+			m_prev_capture_optical_ns = filter_time_ns;
+			m_body_offset_world = m_x.p - m_hmd_pos; // controller-minus-head, WORLD frame (carried with head position)
+			m_last_body_anchor_ns = filter_time_ns;  // reset the position-fold throttle for the next coast
+			m_body_anchored = false; // fresh optical: coast anchor inactive until the next coast
+			m_body_lock_valid = true;
 		}
-		//! Stash this optical op's live HMD world position for the arm-reach gate + body-lock capture. Caller
-		//! holds m_filter_lock. A null pose degrades the gate to the world-origin distance.
+		//! Stash this optical op's live HMD world pose (position + orientation) for the arm-reach gate + the
+		//! shoulder-pivot ride capture. Caller holds m_filter_lock. A null pose degrades the gate to the
+		//! world-origin distance and disables the head-relative ride.
 		void
 		set_op_hmd_pose(const struct xrt_pose *hmd_world_pose)
 		{
 			m_hmd_pos_valid = hmd_world_pose != nullptr;
 			if (m_hmd_pos_valid) {
 				m_hmd_pos = map_vec3(hmd_world_pose->position).cast<double>();
+				m_hmd_quat = map_quat(hmd_world_pose->orientation).cast<double>().normalized();
 			}
 		}
 		bool
@@ -1057,6 +1192,16 @@ namespace {
 		publish_snapshot();
 		FilterSnapshot
 		read_snapshot() const;
+		//! Shared raw extrapolation (see PredictedEstimate); both report + matcher-prior paths use it.
+		PredictedEstimate
+		predicted_estimate(const FilterSnapshot &snap, const timepoint_ns when_ns) const;
+
+		//! Named regime of the last get_prediction report (the report source as one explicit state instead of a
+		//! scatter of flags). Set by get_prediction (lock-free, possibly multi-reader) and surfaced read-only via
+		//! a u_var text readout. Atomic so the UI thread reads a coherent value; informational only — the report
+		//! behaviour is decided by the same booleans, this just NAMES the resolved regime.
+		std::atomic<FusionState> m_fusion_state{FusionState::Invalid};
+		char m_fusion_state_text[32] = "Invalid";
 
 		//! Recording
 		std::string m_device_name;
@@ -1230,6 +1375,31 @@ namespace {
 		(void)ekf_update(H, r, Rm);
 	}
 
+	bool
+	EskfFusion::fold_body_anchor(const struct xrt_pose *hmd_pose)
+	{
+		if (!m_body_lock_valid || hmd_pose == nullptr || !tracked) {
+			return false;
+		}
+		// Out of view only — with optical live this would fight the observed position.
+		if (last_optical_ns != 0 && (filter_time_ns - last_optical_ns) <= OPTICAL_FREEZE_NS) {
+			return false;
+		}
+		m_body_anchored = true;
+		// Throttled position fold toward the body-plausible point (head + offset); the report and the matcher
+		// prior both read the resulting state. Position-only on purpose: a velocity fold perturbs the matcher
+		// prior even in the normal case (measured), so the velocity is left to the divergence watchdog.
+		if ((filter_time_ns - m_last_body_anchor_ns) >= BODY_ANCHOR_PERIOD_NS) {
+			m_last_body_anchor_ns = filter_time_ns;
+			MatX H = MatX::Zero(3, 15);
+			H.block<3, 3>(0, EP) = Mat3::Identity();
+			const VecX r = (map_vec3(hmd_pose->position).cast<double>() + m_body_offset_world) - m_x.p;
+			const MatX Rp = Mat3::Identity() * BODY_ANCHOR_VAR;
+			(void)ekf_update(H, r, Rp);
+		}
+		return true;
+	}
+
 	FilterCheckpoint
 	EskfFusion::capture_checkpoint() const
 	{
@@ -1239,16 +1409,19 @@ namespace {
 		c.accel_world = m_accel_world;
 		c.angvel_world = m_angvel_world;
 		c.last_good_position = last_good_position;
-		c.body_lock_offset = m_body_lock_offset;
+		c.body_offset_world = m_body_offset_world;
 		c.filter_time_ns = filter_time_ns;
 		c.last_imu_ns = m_last_imu_ns;
 		c.last_optical_ns = last_optical_ns;
 		c.last_led_fold_ns = m_last_led_fold_ns;
+		c.prev_capture_optical_ns = m_prev_capture_optical_ns;
+		c.last_body_anchor_ns = m_last_body_anchor_ns;
 		c.orientation_state = orientation_state;
 		c.position_state = position_state;
 		c.imu_anomaly_count = m_imu_anomaly_count;
 		c.tracked = tracked;
 		c.body_lock_valid = m_body_lock_valid;
+		c.body_anchored = m_body_anchored;
 		return c;
 	}
 
@@ -1260,16 +1433,19 @@ namespace {
 		m_accel_world = c.accel_world;
 		m_angvel_world = c.angvel_world;
 		last_good_position = c.last_good_position;
-		m_body_lock_offset = c.body_lock_offset;
+		m_body_offset_world = c.body_offset_world;
 		filter_time_ns = c.filter_time_ns;
 		m_last_imu_ns = c.last_imu_ns;
 		last_optical_ns = c.last_optical_ns;
 		m_last_led_fold_ns = c.last_led_fold_ns;
+		m_prev_capture_optical_ns = c.prev_capture_optical_ns;
+		m_last_body_anchor_ns = c.last_body_anchor_ns;
 		orientation_state = c.orientation_state;
 		position_state = c.position_state;
 		m_imu_anomaly_count = c.imu_anomaly_count;
 		tracked = c.tracked;
 		m_body_lock_valid = c.body_lock_valid;
+		m_body_anchored = c.body_anchored;
 	}
 
 	void
@@ -1282,15 +1458,25 @@ namespace {
 		Eigen::Map<Vector3d>{s.angular_velocity} = m_angvel_world;
 		Eigen::Map<Vector3d>{s.acceleration} = m_accel_world;
 		Eigen::Map<Vector3d>{s.last_good_position} = last_good_position;
-		Eigen::Map<Vector3d>{s.body_lock_offset} = m_body_lock_offset;
-		s.body_lock_valid = m_body_lock_valid;
+		s.body_anchored = m_body_anchored;
+		s.reentry_start_ns = m_reentry_start_ns;
+		s.reentry_active = m_reentry_active;
 		// Worst-direction (largest-eigenvalue) variance, so a consumer's isotropic n-sigma bound is
 		// conservative in EVERY frame (rotating P can move variance up to its max eigenvalue).
 		s.position_var_max = position_var_max();
+		const Mat3 P_theta = m_P.block<3, 3>(ET, ET);
 		s.orientation_var_max =
-		    Eigen::SelfAdjointEigenSolver<Mat3>(m_P.block<3, 3>(ET, ET), Eigen::EigenvaluesOnly)
-		        .eigenvalues()
-		        .maxCoeff();
+		    Eigen::SelfAdjointEigenSolver<Mat3>(P_theta, Eigen::EigenvaluesOnly).eigenvalues().maxCoeff();
+		// Yaw-only variance: the world-frame orientation error δθ is GLOBAL (R_true = exp(δθ)R), so the
+		// component about world-up (0,+g,0 direction; same up as fold_gravity_tilt) IS the yaw DoF, and the
+		// horizontal components are tilt — gravity-anchored, hence observable and tight. The flip cost's yaw
+		// scale must reflect ONLY this DoF: up'·P[ET,ET]·up. Using the worst-direction eigenvalue instead
+		// would inflate the yaw scale whenever the largest orientation eigenvalue is not the yaw axis,
+		// under-penalising a flipped candidate exactly when tilt is well-tracked.
+		{
+			const Vector3d up_w(0.0, 1.0, 0.0);
+			s.orientation_yaw_var = up_w.dot(P_theta * up_w);
+		}
 		// Worst-direction accel-bias variance: the world acceleration a_world = R·T_a·(a_m−ba)+G depends on
 		// the accel bias with ∂a_world/∂ba = −R·T_a (orthonormal·scaling ≈ unit), so P[EBA] is the dominant
 		// uncertainty of the acceleration the render-time extrapolation leans on. Published so get_prediction
@@ -2360,6 +2546,79 @@ namespace {
 		return (float)folded;
 	}
 
+	PredictedEstimate
+	EskfFusion::predicted_estimate(const FilterSnapshot &snap, const timepoint_ns when_ns) const
+	{
+		const Eigen::Map<const Vector3d> s_pos{snap.position};
+		const Eigen::Map<const Vector3d> s_lvel{snap.linear_velocity};
+		const Eigen::Map<const Vector3d> s_acc{snap.acceleration};
+		const Eigen::Map<const Quaterniond> s_orient{snap.orientation};
+
+		// Position leans on the directly-estimated VELOCITY; the noisy world ACCELERATION (power-limited IMU,
+		// amplified by the ½·a·dt² lever) is Wiener-damped by w=‖a‖²/(‖a‖²+σ_a²(dt)) — strong confident accel
+		// keeps w≈1 (no lag), noise/far-extrapolated accel attenuates toward velocity-only. σ_a²(dt) = accel-bias
+		// variance + the filter's own accel process growth PROC_ACCEL_CV²·dt (no new knob). Gravity is already
+		// cancelled in m_accel_world, so only linear accel is damped.
+		double dt = time_ns_to_s(when_ns - snap.filter_time_ns);
+		dt = std::min(std::max(dt, 0.0), MAX_PREDICT_AHEAD_S);
+		const double sigma_a2 = std::max(0.0, snap.acceleration_var_max) + PROC_ACCEL_CV * PROC_ACCEL_CV * dt;
+		const double a2 = s_acc.squaredNorm();
+		const Vector3d a_eff = ((a2 + sigma_a2 > 0.0) ? a2 / (a2 + sigma_a2) : 0.0) * s_acc;
+
+		// Orientation advances by the world-frame rotation vector omega·dt (global error: left-multiply).
+		const Vector3d rotvec = Eigen::Map<const Vector3d>{snap.angular_velocity} * dt;
+		const double angle = rotvec.norm();
+		Quaterniond orient = (angle > 1e-9) ? Quaterniond{AngleAxisd{angle, rotvec / angle}} * s_orient : s_orient;
+		orient.normalize();
+
+		// IMU position dead-reckon is good only briefly; past OPTICAL_FREEZE_NS with no position-constraining
+		// fold, freeze position at last_good (gyro orientation lasts longer). G2_IMU_ONLY reports the dead-reckon
+		// so the pure-inertial drift is visible.
+		const bool optical_stale =
+		    !m_imu_only &&
+		    (snap.last_optical_ns == 0 || (when_ns - snap.last_optical_ns) > OPTICAL_FREEZE_NS);
+
+		PredictedEstimate est;
+		// When the body anchor is holding the position bounded, report it; otherwise (no anchor) freeze at the
+		// last good position rather than dead-reckon away.
+		est.position = (optical_stale && !snap.body_anchored)
+		                   ? Eigen::Map<const Vector3d>{snap.last_good_position}
+		                   : Vector3d(s_pos + s_lvel * dt + 0.5 * a_eff * dt * dt);
+		est.orientation = orient;
+		est.velocity = s_lvel + a_eff * dt;
+		est.optical_stale = optical_stale;
+		return est;
+	}
+
+	void
+	EskfFusion::get_predicted_pose(const timepoint_ns when_ns, struct xrt_space_relation *out_relation)
+	{
+		// The matcher's ESTIMATION prior: the filter's honest belief (raw extrapolation), NOT the compositor's
+		// body-lock report — feeding the visual ride back as a prior misleads the front-end's gate/flip cost.
+		if (out_relation == NULL) {
+			return;
+		}
+		U_ZERO(out_relation);
+		out_relation->pose.orientation.w = 1;
+		const FilterSnapshot snap = read_snapshot();
+		if (!snap.tracked || snap.filter_time_ns == 0) {
+			return; // identity / untracked: the matcher falls back to reprojection (cold start)
+		}
+		const PredictedEstimate est = predicted_estimate(snap, when_ns);
+		map_vec3(out_relation->pose.position) = est.position.cast<float>();
+		map_quat(out_relation->pose.orientation) = est.orientation.cast<float>();
+		uint64_t flags = 0;
+		if (snap.position_valid) {
+			flags |= XRT_SPACE_RELATION_POSITION_VALID_BIT;
+			flags |= snap.position_tracked ? XRT_SPACE_RELATION_POSITION_TRACKED_BIT : 0;
+		}
+		if (snap.orientation_valid) {
+			flags |= XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
+			flags |= snap.orientation_tracked ? XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT : 0;
+		}
+		out_relation->relation_flags = (xrt_space_relation_flags)flags;
+	}
+
 	void
 	EskfFusion::get_prediction(timepoint_ns when_ns,
 	                           struct xrt_space_relation *out_relation,
@@ -2373,58 +2632,18 @@ namespace {
 
 		const FilterSnapshot snap = read_snapshot();
 		if (!snap.tracked || snap.filter_time_ns == 0) {
+			m_fusion_state.store(FusionState::Invalid, std::memory_order_relaxed);
 			return;
 		}
-		const Eigen::Map<const Vector3d> s_pos{snap.position};
-		const Eigen::Map<const Vector3d> s_lvel{snap.linear_velocity};
+		// Raw estimate (shared with the matcher's get_predicted_pose); this path layers the body-lock /
+		// reach / re-entry reporting transforms on top. s_avel feeds the reported angular velocity; s_lvel
+		// the fast-motion FSM split.
+		const PredictedEstimate est = predicted_estimate(snap, when_ns);
+		const bool optical_stale = est.optical_stale;
 		const Eigen::Map<const Vector3d> s_avel{snap.angular_velocity};
-		const Eigen::Map<const Vector3d> s_acc{snap.acceleration};
-		const Eigen::Map<const Vector3d> s_lgp{snap.last_good_position};
-		const Eigen::Map<const Vector3d> s_bloff{snap.body_lock_offset};
-		const Eigen::Map<const Quaterniond> s_orient{snap.orientation};
-
-		// Uncertainty-aware extrapolation of the snapshot, horizon-bounded. The ESKF VELOCITY is a directly
-		// estimated state, trustworthy over a render frame, so position leans primarily on it. The estimated
-		// world ACCELERATION, by contrast, is noisy (a power-limited controller IMU) and its 1/2·a·dt² lever
-		// amplifies that noise quadratically in dt — visible render-time jitter. Damp the accel contribution
-		// by a Wiener (MMSE) shrinkage gain w = ||a||² / (||a||² + σ_a²(dt)): a confident strong acceleration
-		// (||a||² ≫ σ_a²) keeps w≈1 (no lag on real motion), while a noise-dominated or far-extrapolated accel
-		// is attenuated toward velocity-only. σ_a²(dt) is the world-accel uncertainty propagated over the
-		// horizon from the filter's OWN quantities — the current accel-bias variance plus the filter's declared
-		// accel process growth PROC_ACCEL_CV²·dt — so the damping strengthens with both accel covariance and dt
-		// with no new free knob. At dt→0 the gain is the current accel confidence; gravity is already cancelled
-		// in m_accel_world (zero at rest), so this damps only the linear acceleration.
-		double dt = time_ns_to_s(when_ns - snap.filter_time_ns);
-		if (dt > MAX_PREDICT_AHEAD_S) {
-			dt = MAX_PREDICT_AHEAD_S;
-		} else if (dt < 0.0) {
-			dt = 0.0;
-		}
-		const double accel_var = std::max(0.0, snap.acceleration_var_max);
-		const double sigma_a2 = accel_var + PROC_ACCEL_CV * PROC_ACCEL_CV * dt;
-		const double a2 = s_acc.squaredNorm();
-		const double w_accel = (a2 + sigma_a2 > 0.0) ? a2 / (a2 + sigma_a2) : 0.0;
-		const Vector3d a_eff = w_accel * s_acc;
-		const Vector3d vel = s_lvel + a_eff * dt;
-		const Vector3d pos = s_pos + s_lvel * dt + 0.5 * a_eff * dt * dt;
-
-		// Orientation advances by the world-frame rotation vector omega*dt (global error: left-multiply).
-		const Vector3d rotvec = s_avel * dt;
-		const double angle = rotvec.norm();
-		Quaterniond orient = s_orient;
-		if (angle > 1e-9) {
-			orient = Quaterniond{AngleAxisd{angle, rotvec / angle}} * s_orient;
-		}
-		orient.normalize();
-
-		// IMU position dead-reckoning is only good for a fraction of a second; past OPTICAL_FREEZE_NS with
-		// no POSITION-CONSTRAINING optical fold, the dead-reckoned position has drifted and must not be
-		// reported. Gyro orientation lasts longer (kept live below). (G2_IMU_ONLY diagnostic deliberately
-		// reports the dead-reckoned position so we can SEE the pure-inertial drift — m_imu_only is set once
-		// at construction, so this lock-free read is safe.)
-		const bool optical_stale =
-		    !m_imu_only &&
-		    (snap.last_optical_ns == 0 || (when_ns - snap.last_optical_ns) > OPTICAL_FREEZE_NS);
+		const Eigen::Map<const Vector3d> s_lvel{snap.linear_velocity};
+		Quaterniond orient = est.orientation;
+		const Vector3d vel = est.velocity;
 		// Abandoned (set-down) controller: optical lost for longer than the body-lock hold is meant to ride.
 		// The hold covers brief occlusion (a controller momentarily out of view at arm's reach during fast
 		// play); held this long with no re-acquire the controller is genuinely set down, so reporting it
@@ -2433,58 +2652,68 @@ namespace {
 		    !m_imu_only && snap.last_optical_ns != 0 &&
 		    (when_ns - snap.last_optical_ns) > BODY_LOCK_ABANDON_NS;
 
-		// BODY-LOCK out-of-view: ride the controller with the LIVE HMD at its last controller-to-HMD offset
-		// (always within arm reach by construction — the offset is gated <= MAX_CONTROLLER_REACH_M at capture).
 		const bool have_hmd = hmd_world_pose != nullptr;
-		Vector3d hmd_pos = Vector3d::Zero();
-		if (have_hmd) {
-			hmd_pos = map_vec3(hmd_world_pose->position).cast<double>();
-		}
-		const bool offset_ok = snap.body_lock_valid && s_bloff.norm() <= MAX_CONTROLLER_REACH_M;
+		const Vector3d hmd_pos =
+		    have_hmd ? Vector3d(map_vec3(hmd_world_pose->position).cast<double>()) : Vector3d::Zero();
 
-		map_quat(out_relation->pose.orientation) = orient.cast<float>();
 		map_vec3(out_relation->angular_velocity) = s_avel.cast<float>();
 
-		// Primary report: the live extrapolation while position is fresh, else the world-frame hold once stale.
-		// Velocity is reported only for the live extrapolation (a held/body-locked controller is static in its
-		// reference frame).
+		// Report the (body-anchored) state directly: out of view the body-anchor fold keeps the position
+		// body-plausible (fold_body_anchor), so there is no reporting-layer ride. Orientation is always the gyro
+		// estimate; velocity only while fresh. Position is TRACKED only when fresh or body-anchored.
 		bool moving = !optical_stale;
-		bool body_locked = false; // riding the live head at a trusted in-reach offset
-		Vector3d report = optical_stale ? Vector3d(s_lgp) : pos;
-		bool position_trackable = snap.position_tracked;
+		Vector3d report = est.position;
+		bool position_trackable = snap.position_tracked && (!optical_stale || snap.body_anchored);
+		if (optical_stale) {
+			moving = false; // a coasting controller reports no velocity
+		}
 
-		// ARM-REACH SAFETY (room-roam-invariant): an LED-tracked controller is physically within arm's reach
-		// of the head. Whenever a live HMD pose is available, the reported controller must never exceed that —
-		// this catches BOTH a stale fly-away AND a depth-along-ray slide / velocity runaway that drifts the
-		// dead-reckoned state past reach while still inside the freeze window. If the primary report is beyond
-		// reach, replace it with the body-lock ride (head + last offset, inherently within reach); if no valid
-		// in-reach offset exists, clamp to the reach sphere toward the head and drop POSITION_TRACKED (the
-		// controller can no longer be trusted as a confident head-relative estimate). Real motion (optical is
-		// always well within reach) is never clipped — only the math-artefact excursions are.
+		// Reach safety: a report beyond MAX_CONTROLLER_REACH_M of the head is a runaway artefact (fresh optical
+		// never reaches it) — clamp + drop tracked. Out of view, a tighter arm-reach clamp first holds the
+		// dead-reckon drift body-plausible (kept tracked; report-only, so the matcher's raw prior is untouched).
 		if (have_hmd) {
-			const Vector3d rel_v = report - hmd_pos;
-			if (rel_v.norm() > MAX_CONTROLLER_REACH_M) {
+			const Vector3d rel = report - hmd_pos;
+			const double n = rel.norm();
+			if (n > MAX_CONTROLLER_REACH_M) {
+				report = hmd_pos + rel * (MAX_CONTROLLER_REACH_M / n);
 				moving = false;
-				if (offset_ok) {
-					report = hmd_pos + s_bloff; // body-lock ride: rigid, within reach
-					body_locked = true;
-				} else {
-					const double n = rel_v.norm();
-					report = hmd_pos + rel_v * (MAX_CONTROLLER_REACH_M / n); // clamp to reach sphere
-					position_trackable = false;
-				}
-			} else if (optical_stale && offset_ok) {
-				// Stale but the dead-reckon is still within reach: prefer the rigid body-lock ride over the
-				// stale world hold so the controller tracks the head cleanly the moment it stops being observed.
-				report = hmd_pos + s_bloff;
-				body_locked = true;
+				position_trackable = false;
+			} else if (optical_stale && snap.body_anchored && n > BODY_REACH_M) {
+				report = hmd_pos + rel * (BODY_REACH_M / n);
 			}
 		}
-
 		if (body_lock_abandoned) {
-			position_trackable = false; // abandoned hold reports lost (still rides the head visually)
+			position_trackable = false; // set down too long: reported but not tracked
 		}
 
+		// Re-entry ease: on re-acquisition after a coast the state jumps to the fresh fold; ease the reported
+		// position toward it over ~REENTRY_WINDOW_NS (time-based, call-rate-independent) so it slides, not
+		// teleports. m_reentry_cur_pos tracks the live report under a leaf lock (never the filter lock), so an
+		// edge eases from the last coast report; orientation isn't eased (it's the gyro estimate throughout).
+		{
+			std::lock_guard<std::mutex> lk(m_reentry_render_lock);
+			const bool edge = snap.reentry_active && snap.reentry_start_ns != 0 &&
+			                  time_ns_to_s(when_ns - snap.reentry_start_ns) < 4.0 * time_ns_to_s(REENTRY_WINDOW_NS);
+			if (edge && m_reentry_render_epoch_ns != snap.reentry_start_ns) {
+				m_reentry_render_epoch_ns = snap.reentry_start_ns; // new edge: ease only a meaningful jump
+				m_reentry_epoch_blends = (report - m_reentry_cur_pos).norm() >= REENTRY_MIN_SNAP_M;
+			}
+			if (edge && m_reentry_epoch_blends) {
+				const double dt = std::max(0.0, time_ns_to_s(when_ns - m_reentry_last_render_ns));
+				const double tau = time_ns_to_s(REENTRY_WINDOW_NS) / 3.0;
+				Vector3d step = std::min(1.0, tau > 0.0 ? dt / tau : 1.0) * (report - m_reentry_cur_pos);
+				if (step.norm() > REENTRY_MAX_STEP_M) {
+					step *= REENTRY_MAX_STEP_M / step.norm();
+				}
+				m_reentry_cur_pos += step;
+				report = m_reentry_cur_pos;
+			} else {
+				m_reentry_cur_pos = report; // not easing: track the live report so the next edge eases from it
+			}
+			m_reentry_last_render_ns = when_ns;
+		}
+
+		map_quat(out_relation->pose.orientation) = orient.cast<float>();
 		map_vec3(out_relation->pose.position) = report.cast<float>();
 		if (moving) {
 			map_vec3(out_relation->linear_velocity) = vel.cast<float>();
@@ -2498,10 +2727,9 @@ namespace {
 			if (moving) {
 				flags |= XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT;
 			}
-			// TRACKED is a CONFIDENT pose: a fresh in-reach estimate, or a body-locked head-relative one. A
-			// stale world-frame hold (no live head reference) or an out-of-reach clamp is reported but NOT
-			// tracked — the consumer treats it as a stale/uncertain pose.
-			if (position_trackable && (!optical_stale || body_locked)) {
+			// TRACKED = a confident pose (fresh, or body-anchored out of view). position_trackable already
+			// encodes that; a runaway clamp / set-down / unanchored coast clears it.
+			if (position_trackable) {
 				flags |= XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
 			}
 		}
@@ -2513,6 +2741,22 @@ namespace {
 			}
 		}
 		out_relation->relation_flags = (xrt_space_relation_flags)flags;
+
+		// Name the resolved report regime (informational): out of view = BodyLocked (body-anchor holding) or
+		// WorldLocked (no anchor); a runaway clamp = ConfusedPosition; else fresh, split fast/visual.
+		FusionState fstate;
+		if (optical_stale) {
+			fstate = snap.body_anchored ? FusionState::BodyLocked : FusionState::WorldLocked;
+		} else if (!position_trackable) {
+			fstate = FusionState::ConfusedPosition;
+		} else {
+			fstate = s_lvel.norm() > GRAV_MAX_VEL ? FusionState::InertialFastMotion
+			                                      : FusionState::VisualAccuracy;
+		}
+		if (m_fusion_state.exchange(fstate, std::memory_order_relaxed) != fstate) {
+			// Refresh the read-only UI text only on a transition (cheap; the buffer is a debug readout).
+			(void)snprintf(m_fusion_state_text, sizeof(m_fusion_state_text), "%s", fusion_state_name(fstate));
+		}
 
 		if (m_recorder) {
 			m_recorder->process_fused(when_ns, out_relation);
@@ -2549,6 +2793,9 @@ namespace {
 	void
 	EskfFusion::add_ui(void *root, const char *device_name)
 	{
+		// Read-only readout of the named report regime (the resolved get_prediction state).
+		u_var_add_ro_text(root, m_fusion_state_text, "Fusion state");
+
 		const char *record_path = debug_get_option_kalman_record_path();
 		if (record_path != NULL) {
 			m_recorder = new ImuPoseRecorder(record_path, device_name);

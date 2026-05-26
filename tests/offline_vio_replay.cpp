@@ -582,9 +582,16 @@ cb_push_leds(struct xrt_device *xdev, timepoint_ns t, const struct xrt_pose *P_x
 	                                       ctrl_head_pose(c, t, &hp));
 }
 bool
-cb_get_unc(struct xrt_device *xdev, double *ps, double *os)
+cb_get_unc(struct xrt_device *xdev, double *ps, double *os, double *ys)
 {
-	return kalman_fusion_get_pose_uncertainty(reinterpret_cast<FakeController *>(xdev)->kf, ps, os);
+	return kalman_fusion_get_pose_uncertainty(reinterpret_cast<FakeController *>(xdev)->kf, ps, os, ys);
+}
+bool
+cb_get_predicted_pose(struct xrt_device *xdev, timepoint_ns when_ns, struct xrt_space_relation *out)
+{
+	// The matcher's raw prior — the filter's honest estimate, NOT the body-lock report (== production driver).
+	kalman_fusion_get_predicted_pose(reinterpret_cast<FakeController *>(xdev)->kf, when_ns, out);
+	return true;
 }
 bool
 cb_predict_gate(struct xrt_device *xdev, const struct xrt_pose *P_xrworld_cam,
@@ -754,6 +761,7 @@ main(int argc, char **argv)
 	cbs.push_brightness_update = cb_noop_bright;
 	cbs.push_observed_leds = cb_push_leds;
 	cbs.get_pose_uncertainty = cb_get_unc;
+	cbs.get_predicted_pose = cb_get_predicted_pose;
 	cbs.predict_led_gate = cb_predict_gate;
 	t_constellation_tracker_add_device(tracker, &ctrl.base, &cbs);
 
@@ -775,6 +783,8 @@ main(int argc, char **argv)
 			s.accel_m_s2 = {imu[ii].ax, imu[ii].ay, imu[ii].az};
 			s.gyro_rad_secs = {imu[ii].gx, imu[ii].gy, imu[ii].gz};
 			kalman_fusion_process_imu_data(ctrl.kf, &s, nullptr, nullptr);
+			struct xrt_pose hp_anchor; // live head pose for the out-of-view body anchor (== production driver)
+			kalman_fusion_update_body_anchor(ctrl.kf, ctrl_head_pose(&ctrl, s.timestamp_ns, &hp_anchor));
 			ii++;
 		}
 		{
