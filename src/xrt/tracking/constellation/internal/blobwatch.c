@@ -593,10 +593,12 @@ process_scanline(uint8_t *line,
                  struct extent_line *el,
                  struct extent_line *prev_el,
                  struct xrt_frame *frame,
-                 blobservation *ob)
+                 blobservation *ob,
+                 uint32_t x_min,
+                 uint32_t x_max)
 {
-	struct extent *le_end = prev_el->extents;
-	struct extent *le = prev_el->extents;
+	struct extent *le_end = prev_el ? prev_el->extents : NULL;
+	struct extent *le = prev_el ? prev_el->extents : NULL;
 	struct extent *extent = el->extents;
 	int num_extents = MAX_EXTENTS_PER_LINE;
 	float center;
@@ -606,7 +608,7 @@ process_scanline(uint8_t *line,
 	if (prev_el)
 		le_end += prev_el->num;
 
-	for (x = 0; x < frame->width; x++) {
+	for (x = x_min; x < x_max; x++) {
 		int start, end;
 		bool is_new_extent = true;
 		uint8_t max_pixel = 0;
@@ -628,8 +630,8 @@ process_scanline(uint8_t *line,
 			sat_count++;
 		x++;
 
-		/* Loop until pixel value falls below threshold */
-		while (x < frame->width && line[x] > bw->pixel_threshold &&
+		/* Loop until pixel value falls below threshold (bounded by the ROI's x_max). */
+		while (x < x_max && line[x] > bw->pixel_threshold &&
 		       line[x] >= local_bg_mean(bw, x, y, frame->width, frame->height) + ADAPT_MARGIN) {
 			if (line[x] > max_pixel)
 				max_pixel = line[x];
@@ -718,48 +720,6 @@ process_scanline(uint8_t *line,
  * Processes extents from all scanlines in a frame and stores the
  * resulting blobs in ob->blobs.
  */
-static void
-process_frame(blobwatch *bw, blobservation *ob, struct xrt_frame *frame)
-{
-	struct extent_line el1;
-	struct extent_line el2;
-
-	ob->num_blobs = 0;
-	ob->dropped_dark_blobs = 0;
-	ob->dropped_shape_blobs = 0;
-
-	/* Integral image for the per-pixel local-background lookup (adaptive threshold) */
-	build_integral(bw, frame);
-
-	uint8_t *line = frame->data;
-	process_scanline(line, bw, 0, &el1, NULL, frame, ob);
-
-	for (uint32_t y = 1; y < frame->height; y++) {
-		process_scanline(line, bw, y, y & 1 ? &el2 : &el1, y & 1 ? &el1 : &el2, frame, ob);
-		line += frame->stride;
-	}
-
-	/* Relative-dimness R inflation (within-frame intensity rank): the brightest blob is the strongest LED
-	 * candidate; a much dimmer blob is more likely a faint reflection, so its centroid R is scaled up
-	 * toward DIM_R_INFLATE_MAX as its peak falls from the frame max toward the detect floor. Uncertainty-
-	 * aware (no cull) and self-referenced (no absolute brightness constant). Single blob -> no rank, no-op. */
-	if (ob->num_blobs >= 2) {
-		uint8_t bmax = 0;
-		for (int i = 0; i < ob->num_blobs; i++)
-			bmax = max(bmax, ob->blobs[i].brightness);
-		const float span = (float)bmax - (float)bw->blob_required_threshold;
-		if (span > 0.0f) {
-			for (int i = 0; i < ob->num_blobs; i++) {
-				struct blob *b = &ob->blobs[i];
-				float dim = ((float)bmax - (float)b->brightness) / span; /* 0 at peak, 1 at floor */
-				if (dim < 0.0f)
-					dim = 0.0f;
-				b->pos_var_px2 *= 1.0f + dim * (DIM_R_INFLATE_MAX - 1.0f);
-			}
-		}
-	}
-}
-
 /*
  * Finds the first free tracking slot.
  */
@@ -788,17 +748,122 @@ copy_matching_blob(struct blob *to, struct blob *from)
 }
 
 /*
+ * Predictive-ROI variant of process_frame: scans only rows in [roi_y, roi_y_end) and clips each row
+ * scan to columns [roi_x, roi_x_end). Convergent with Oasis driver's PredictiveROI: blob search is
+ * restricted to a bounding box around the ESKF-predicted LED positions (PredictivePatchSize/2 = 8 px
+ * per side per LED, expanded here to a single bounding rect over all predictions).
+ *
+ * The integral image for the adaptive threshold is built over the full frame (the local-background
+ * lookup is correct for any pixel inside the ROI); the cost saving is from not scanning rows or
+ * columns outside the ROI. The dimness-rank inflation is computed only over the blobs found.
+ */
+static void
+process_frame_roi(blobwatch *bw,
+                  blobservation *ob,
+                  struct xrt_frame *frame,
+                  uint32_t roi_x,
+                  uint32_t roi_y,
+                  uint32_t roi_x_end,
+                  uint32_t roi_y_end)
+{
+	struct extent_line el1;
+	struct extent_line el2;
+
+	ob->num_blobs = 0;
+	ob->dropped_dark_blobs = 0;
+	ob->dropped_shape_blobs = 0;
+
+	build_integral(bw, frame);
+
+	/* Stride pattern matches the original process_frame: `line` is advanced at the END of each
+	 * loop iteration, so the established gate baseline (which depended on that ordering) is preserved.
+	 *
+	 * Buffer alternation: the original `y & 1 ? &el2 : &el1` pattern works only when roi_y=0 (so the
+	 * first loop iter at y=1 reads from el1 which the prologue just filled). For arbitrary roi_y the
+	 * parity flips and the loop reads UNINITIALIZED stack memory -> segfault. Explicit prev/cur swap
+	 * is correct regardless of roi_y. */
+	uint8_t *line = frame->data + (size_t)roi_y * frame->stride;
+	struct extent_line *prev = &el1, *cur = &el2;
+	process_scanline(line, bw, roi_y, prev, NULL, frame, ob, roi_x, roi_x_end);
+
+	for (uint32_t y = roi_y + 1; y < roi_y_end; y++) {
+		process_scanline(line, bw, y, cur, prev, frame, ob, roi_x, roi_x_end);
+		line += frame->stride;
+		struct extent_line *tmp = prev;
+		prev = cur;
+		cur = tmp;
+	}
+
+	/* Finalize extents at the last ROI row. process_scanline's internal "if (y == frame->height-1)"
+	 * fires only when ROI covers to the bottom of the frame; for a partial ROI the last row's extents
+	 * would otherwise be lost. Skip when ROI extends to frame->height (the internal check did fire). */
+	if (roi_y_end < frame->height) {
+		const uint32_t last_y = roi_y_end - 1;
+		for (struct extent *e_iter = prev->extents; e_iter < prev->extents + prev->num; e_iter++) {
+			extent_to_blobs(bw, ob, e_iter, (int)last_y, frame);
+		}
+	}
+
+	/* Dimness-rank R inflation: identical to process_frame, scoped to the ROI blobs found. */
+	if (ob->num_blobs >= 2) {
+		uint8_t bmax = 0;
+		for (int i = 0; i < ob->num_blobs; i++)
+			bmax = max(bmax, ob->blobs[i].brightness);
+		const float span = (float)bmax - (float)bw->blob_required_threshold;
+		if (span > 0.0f) {
+			for (int i = 0; i < ob->num_blobs; i++) {
+				struct blob *b = &ob->blobs[i];
+				float dim = ((float)bmax - (float)b->brightness) / span;
+				if (dim < 0.0f)
+					dim = 0.0f;
+				b->pos_var_px2 *= 1.0f + dim * (DIM_R_INFLATE_MAX - 1.0f);
+			}
+		}
+	}
+}
+
+/*
  * Detects blobs in the current frame and compares them with the observation
  * history. The returned blobservation in the `output` variable must be returned
- * to the blobwatch via blobwatch_release_observation()
+ * to the blobwatch via blobwatch_release_observation().
+ *
+ * The full-frame variant is implemented as a 0-area-clamped delegation to
+ * blobwatch_process_roi, so the dump / telemetry / history-match post-processing
+ * lives in one place and the predictive-ROI path goes through the same pipeline.
  */
 void
 blobwatch_process(blobwatch *bw, struct xrt_frame *frame, uint16_t exposure, uint16_t gain, blobservation **output)
 {
+	blobwatch_process_roi(bw, frame, exposure, gain, 0, 0, (int)frame->width, (int)frame->height, output);
+}
+
+void
+blobwatch_process_roi(blobwatch *bw,
+                      struct xrt_frame *frame,
+                      uint16_t exposure,
+                      uint16_t gain,
+                      int roi_x,
+                      int roi_y,
+                      int roi_w,
+                      int roi_h,
+                      blobservation **output)
+{
 	blobservation *ob = POP_QUEUE(&bw->observation_q);
 	assert(ob != NULL);
 
-	process_frame(bw, ob, frame);
+	/* Clamp the ROI to the frame; a 0-area or fully-covering rect degrades to the full-frame path. */
+	uint32_t rx = roi_x < 0 ? 0 : (uint32_t)roi_x;
+	uint32_t ry = roi_y < 0 ? 0 : (uint32_t)roi_y;
+	uint32_t rx_end = (uint32_t)(roi_x + roi_w);
+	uint32_t ry_end = (uint32_t)(roi_y + roi_h);
+	if (rx_end > frame->width) rx_end = frame->width;
+	if (ry_end > frame->height) ry_end = frame->height;
+	if (rx >= rx_end || ry >= ry_end) {
+		/* Caller passed a degenerate ROI -- fall back to full frame so the search isn't silently empty. */
+		rx = 0; ry = 0; rx_end = frame->width; ry_end = frame->height;
+	}
+
+	process_frame_roi(bw, ob, frame, rx, ry, rx_end, ry_end);
 
 	/* Optional: dump the actual controller-tracking frame (what the constellation tracker sees) as
 	 * PGM — the real short-exposure LED images, which the EuRoC recorder does NOT capture (it taps the

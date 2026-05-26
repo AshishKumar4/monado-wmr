@@ -107,6 +107,41 @@ DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
 /* Maximum number of frames to permit waiting in the fast-processing queue */
 #define MAX_FAST_QUEUE_SIZE 2
 
+/* Predictive-ROI blob detection (Oasis driver convergent design, RE'd from MS's
+ * ConnectedComponent::Locate -> ILedLocationPredictor::Predict path): for each tracked device, project
+ * every LED in its constellation through the device's current ESKF state to its predicted image-pixel
+ * position in the camera; the union of per-LED patches (each sized to that LED's actual prediction
+ * uncertainty from predict_led_gate's S) gives a tight region the blob detector restricts its
+ * flood-fill to. Eliminates ambient-noise blobs from the correspondence search (the matcher's
+ * dominant "52% idle" defect on our side) and pre-localizes blobs around specific LED candidates.
+ *
+ * Per-LED adaptive sizing (NOT MS's fixed 16-px patch): each LED's pad = max(ROI_BASE_PAD_PX,
+ * ROI_SIGMA_K * pixel_sigma), where pixel_sigma = sqrt(max diag of S). The S matrix returned by
+ * predict_led_gate captures both the ESKF posterior position uncertainty AND the LED's geometric
+ * sensitivity at this camera+pose. A precise prediction (small S) gets a near-minimum pad; an
+ * uncertain prediction (large S, e.g. post-coast or low-confidence pose) gets a wider pad
+ * proportionally. This per-LED scaling naturally handles asymmetric controllers (left vs right) and
+ * coast-vs-fresh frames without a single global pad that must be conservative enough for the worst
+ * case while also tight enough for the best.
+ *
+ * Fallback: when fewer than ROI_FALLBACK_MIN_PREDICTIONS LEDs project into the frame across all
+ * tracked devices (cold start, lost tracking), the helper returns false and the caller uses the
+ * full-frame path -- matching MS's PatchSearchFallbackMinPoints = 6.
+ *
+ * Always-on; the cold-start path falls through to full-frame via the predict_led_gate untracked
+ * return. Env G2_PREDICTIVE_ROI_BASE_PAD_PX + G2_PREDICTIVE_ROI_SIGMA_K override the defaults for
+ * in-headset re-tuning across lighting/motion. */
+/* MS uses PredictivePatchSize/2 = 8 as their per-LED floor, but their predictor extrapolates the ESKF
+ * state with IMU at the frame's EXPOSURE time, so their predictions are tight. Our predict_led_gate
+ * uses the most-recent ESKF state which can lag the actual exposure by up to ~11ms (one frame at 90Hz);
+ * empirically the temporal drift floor is much larger than 8px. Bisection on the headpose capture
+ * (commit b8cc1fab2) found bp=32 with sigma_k=3.0 is the genuine sweet spot — 5pp wrongBr wins on
+ * both controllers without crossing the threshold where larger pads admit ambient noise. The S matrix
+ * scaling (per-LED) handles uncertainty growth above this floor. */
+#define ROI_BASE_PAD_PX 32      /* floor: temporal-drift-aware; MS's 8 is too tight for our timing */
+#define ROI_SIGMA_K 3.0f        /* per-LED pad = k * sqrt(max-diag(S)); 3σ ~ 99.7% coverage */
+#define ROI_FALLBACK_MIN_PREDICTIONS 6
+
 //! The OpenCV(+Y down, +Z away) <-> OpenXR(+Y up, +Z toward) camera-basis flip: a 180-deg rotation about
 //! X (i.e. negate Y and Z). Single source for the convention so every CV<->XR conversion agrees.
 static const struct xrt_pose P_YZ_FLIP = {{1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}};
@@ -1465,7 +1500,100 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		    (xf->data != NULL && xf->size > 7) ? (uint16_t)((xf->data[6] << 8) | xf->data[7]) : 0;
 
 		os_mutex_lock(&cam->bw_lock);
-		blobwatch_process(cam->bw, view->vframe, frame_exposure, 0, &view->bwobs);
+		/* Predictive-ROI: project every LED of every tracked device through its ESKF state to this
+		 * camera's image, build a bounding box, restrict blob search to it. Falls back to full-frame
+		 * when fewer than ROI_FALLBACK_MIN_PREDICTIONS LEDs project (cold start / not tracked). The
+		 * scan pad is per-LED-adaptive (max of the base pad floor and k * sqrt(max-diag(S))); base
+		 * pad and sigma multiplier are env-tunable for in-headset re-tuning across lighting/motion. */
+		static int predictive_roi_base_pad = ROI_BASE_PAD_PX;
+		static float predictive_roi_sigma_k = ROI_SIGMA_K;
+		static int predictive_roi_env_init = 0;
+		if (!predictive_roi_env_init) {
+			predictive_roi_env_init = 1;
+			const char *p = getenv("G2_PREDICTIVE_ROI_BASE_PAD_PX");
+			if (p != NULL && p[0] != '\0' && atoi(p) > 0) {
+				predictive_roi_base_pad = atoi(p);
+			}
+			const char *k = getenv("G2_PREDICTIVE_ROI_SIGMA_K");
+			if (k != NULL && k[0] != '\0' && atof(k) > 0.0) {
+				predictive_roi_sigma_k = (float)atof(k);
+			}
+		}
+		bool used_roi = false;
+		{
+			/* Build the cam_calib + the OpenXR-camera-frame pose this camera uses for projection, the
+			 * same way emit_view_led_observations does so the predicted pixels live in the same coords
+			 * as the LED gate uses elsewhere in the tracker. */
+			struct xrt_pose P_xrworld_cam_pred;
+			math_pose_transform(&view->P_cam_world, &P_YZ_FLIP, &P_xrworld_cam_pred);
+			const struct t_constellation_cam_calib cam_calib_pred = {
+			    cam->camera_model.calib.fx, cam->camera_model.calib.fy,
+			    cam->camera_model.calib.cx, cam->camera_model.calib.cy};
+			float xmin = 1e9f, ymin = 1e9f, xmax = -1e9f, ymax = -1e9f;
+			int n_in_frame = 0;
+			for (int d = 0; d < ct->num_devices; d++) {
+				struct constellation_tracker_device *device = &ct->devices[d];
+				const struct t_constellation_led_model *lm = &device->led_model;
+				if (device->connection == NULL || lm->leds == NULL || lm->num_leds == 0) {
+					continue; /* not connected / model not loaded yet */
+				}
+				for (int li = 0; li < lm->num_leds; li++) {
+					struct xrt_vec3 led_flip = {lm->leds[li].pos.x, -lm->leds[li].pos.y,
+					                            -lm->leds[li].pos.z};
+					struct xrt_vec3 led_obj;
+					math_pose_transform_point(&lm->P_device_model, &led_flip, &led_obj);
+					float zhat[2], S[4];
+					if (!constellation_tracked_device_connection_predict_led_gate(
+					        device->connection, &P_xrworld_cam_pred, &cam_calib_pred, &led_obj,
+					        zhat, S)) {
+						continue; /* device untracked: no usable prior */
+					}
+					if (!isfinite(zhat[0]) || !isfinite(zhat[1]) || !isfinite(S[0]) || !isfinite(S[3])) {
+						continue; /* non-finite projection or covariance: skip */
+					}
+					/* zhat is in FULL-camera pixel coords (cam_calib's principal point);
+					 * translate to view->vframe coords by subtracting the ROI offset. */
+					const float vx = zhat[0] - (float)cam->roi.offset.w;
+					const float vy = zhat[1] - (float)cam->roi.offset.h;
+					if (vx >= 0.f && vx < (float)view->vframe->width && vy >= 0.f &&
+					    vy < (float)view->vframe->height) {
+						/* Per-LED adaptive pad: sqrt of the max-diagonal of S is an upper bound on
+						 * the 1-sigma pixel-space prediction noise (max eigenvalue ≤ trace ≤ 2*max
+						 * diag). k·σ gives the half-width of the LED's plausibility patch; floored
+						 * at the base pad so a near-zero S can't shrink it below the centroid noise. */
+						const float sx = S[0] > 0.0f ? sqrtf(S[0]) : 0.0f;
+						const float sy = S[3] > 0.0f ? sqrtf(S[3]) : 0.0f;
+						const float pix_sigma = sx > sy ? sx : sy;
+						float per_led_pad = predictive_roi_sigma_k * pix_sigma;
+						if (per_led_pad < (float)predictive_roi_base_pad) {
+							per_led_pad = (float)predictive_roi_base_pad;
+						}
+						const float lx = vx - per_led_pad;
+						const float ly = vy - per_led_pad;
+						const float hx = vx + per_led_pad;
+						const float hy = vy + per_led_pad;
+						if (lx < xmin) xmin = lx;
+						if (ly < ymin) ymin = ly;
+						if (hx > xmax) xmax = hx;
+						if (hy > ymax) ymax = hy;
+						n_in_frame++;
+					}
+				}
+			}
+			if (n_in_frame >= ROI_FALLBACK_MIN_PREDICTIONS) {
+				/* xmin/ymin/xmax/ymax already carry per-LED pad; no extra global pad needed. */
+				int rx = (int)floorf(xmin);
+				int ry = (int)floorf(ymin);
+				int rw = (int)ceilf(xmax - xmin) + 1;
+				int rh = (int)ceilf(ymax - ymin) + 1;
+				blobwatch_process_roi(cam->bw, view->vframe, frame_exposure, 0, rx, ry, rw, rh,
+				                      &view->bwobs);
+				used_roi = true;
+			}
+		}
+		if (!used_roi) {
+			blobwatch_process(cam->bw, view->vframe, frame_exposure, 0, &view->bwobs);
+		}
 		os_mutex_unlock(&cam->bw_lock);
 
 		if (view->bwobs == NULL) {

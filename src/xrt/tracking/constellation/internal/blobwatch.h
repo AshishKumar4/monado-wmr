@@ -100,6 +100,23 @@ void
 blobwatch_free(blobwatch *bw);
 void
 blobwatch_process(blobwatch *bw, struct xrt_frame *frame, uint16_t exposure, uint16_t gain, blobservation **output);
+//! Predictive-ROI variant: scans only the rectangle [roi_x, roi_x+roi_w) x [roi_y, roi_y+roi_h) of the
+//! frame, instead of the full image. Convergent with the Oasis driver's `ConnectedComponent::Locate`
+//! which restricts blob search to a bounding box around the ESKF-predicted LED positions padded by
+//! PredictivePatchSize/2 = 8 px per side. A 0-area or fully-covering ROI degrades cleanly to the
+//! full-frame `blobwatch_process` behaviour, so the caller can pass a generous ROI without harm.
+//! ROI is clamped to the frame bounds internally; the integral image for the adaptive threshold is
+//! computed over the ROI only (the local-background lookup needs the same window the scanner uses).
+void
+blobwatch_process_roi(blobwatch *bw,
+                      struct xrt_frame *frame,
+                      uint16_t exposure,
+                      uint16_t gain,
+                      int roi_x,
+                      int roi_y,
+                      int roi_w,
+                      int roi_h,
+                      blobservation **output);
 void
 blobwatch_update_labels(blobwatch *bw, blobservation *ob, uint8_t device_id);
 void
