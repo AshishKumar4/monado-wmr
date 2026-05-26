@@ -114,6 +114,11 @@ namespace {
 	constexpr int64_t REENTRY_WINDOW_NS = ms_to_ns(120);
 	constexpr double REENTRY_MAX_STEP_M = 0.05; //!< per-frame position cap during the ease
 	constexpr double REENTRY_MIN_SNAP_M = 0.05; //!< only ease jumps at/above this
+	//! Same ease applied to orientation on the manifold (SLERP from the last reported orient to the fresh
+	//! fold orient). MAX_STEP_RAD = ~5.7°/frame caps the angular slide; MIN_SNAP_RAD ~5° matches the
+	//! position threshold's spirit (small re-acq deltas pass through; meaningful angular snaps are eased).
+	constexpr double REENTRY_MAX_STEP_RAD = 0.10; //!< per-frame angular cap during the ease (~5.7°)
+	constexpr double REENTRY_MIN_SNAP_RAD = 0.087; //!< only ease angular jumps >= ~5°
 
 	//! Precomputed per-view geometry+intrinsics for the per-LED reprojection (built once per frame).
 	struct LedViewCache
@@ -977,7 +982,9 @@ namespace {
 		timepoint_ns m_reentry_render_epoch_ns{0}; //!< which blend (its start time) m_reentry_cur_pos belongs to
 		timepoint_ns m_reentry_last_render_ns{0};
 		bool m_reentry_epoch_blends{false}; //!< this epoch's initial gap >= REENTRY_MIN_SNAP_M (else pass-through)
+		bool m_reentry_epoch_blends_orient{false}; //!< this epoch's initial orient gap >= REENTRY_MIN_SNAP_RAD
 		Vector3d m_reentry_cur_pos{0, 0, 0};
+		Quaterniond m_reentry_cur_orient{1, 0, 0, 0}; //!< eased reported orientation (gyro-quat slid on the manifold)
 		//! last_optical_ns at the PREVIOUS position-constraining fold, so capture_body_lock can measure the
 		//! out-of-view gap and detect the re-entry edge (last_optical_ns is already advanced by the caller).
 		timepoint_ns m_prev_capture_optical_ns{0};
@@ -2687,28 +2694,51 @@ namespace {
 		}
 
 		// Re-entry ease: on re-acquisition after a coast the state jumps to the fresh fold; ease the reported
-		// position toward it over ~REENTRY_WINDOW_NS (time-based, call-rate-independent) so it slides, not
-		// teleports. m_reentry_cur_pos tracks the live report under a leaf lock (never the filter lock), so an
-		// edge eases from the last coast report; orientation isn't eased (it's the gyro estimate throughout).
+		// position AND orientation toward it over ~REENTRY_WINDOW_NS (time-based, call-rate-independent) so
+		// it slides, not teleports. m_reentry_cur_{pos,orient} track the live report under a leaf lock (never
+		// the filter lock); orientation is SLERPed on the manifold (capped at REENTRY_MAX_STEP_RAD/frame).
 		{
 			std::lock_guard<std::mutex> lk(m_reentry_render_lock);
 			const bool edge = snap.reentry_active && snap.reentry_start_ns != 0 &&
 			                  time_ns_to_s(when_ns - snap.reentry_start_ns) < 4.0 * time_ns_to_s(REENTRY_WINDOW_NS);
 			if (edge && m_reentry_render_epoch_ns != snap.reentry_start_ns) {
-				m_reentry_render_epoch_ns = snap.reentry_start_ns; // new edge: ease only a meaningful jump
+				m_reentry_render_epoch_ns = snap.reentry_start_ns; // new edge: ease only meaningful jumps
 				m_reentry_epoch_blends = (report - m_reentry_cur_pos).norm() >= REENTRY_MIN_SNAP_M;
+				// Geodesic angle between last reported orient and fresh: 2*acos(|w|) of their quotient.
+				const double q_dot = std::abs(m_reentry_cur_orient.dot(orient));
+				const double gap_rad = 2.0 * std::acos(std::min(1.0, q_dot));
+				m_reentry_epoch_blends_orient = gap_rad >= REENTRY_MIN_SNAP_RAD;
 			}
+			const double dt = std::max(0.0, time_ns_to_s(when_ns - m_reentry_last_render_ns));
+			const double tau = time_ns_to_s(REENTRY_WINDOW_NS) / 3.0;
+			const double alpha = std::min(1.0, tau > 0.0 ? dt / tau : 1.0);
 			if (edge && m_reentry_epoch_blends) {
-				const double dt = std::max(0.0, time_ns_to_s(when_ns - m_reentry_last_render_ns));
-				const double tau = time_ns_to_s(REENTRY_WINDOW_NS) / 3.0;
-				Vector3d step = std::min(1.0, tau > 0.0 ? dt / tau : 1.0) * (report - m_reentry_cur_pos);
+				Vector3d step = alpha * (report - m_reentry_cur_pos);
 				if (step.norm() > REENTRY_MAX_STEP_M) {
 					step *= REENTRY_MAX_STEP_M / step.norm();
 				}
 				m_reentry_cur_pos += step;
 				report = m_reentry_cur_pos;
 			} else {
-				m_reentry_cur_pos = report; // not easing: track the live report so the next edge eases from it
+				m_reentry_cur_pos = report;
+			}
+			if (edge && m_reentry_epoch_blends_orient) {
+				// Cap the per-step angular slide so a 180° re-acq snap doesn't visually teleport. SLERP
+				// to a fraction of the geodesic, capped by REENTRY_MAX_STEP_RAD; quaternion shortest-path.
+				Quaterniond from = m_reentry_cur_orient;
+				Quaterniond to = orient;
+				if (from.dot(to) < 0.0) {
+					to.coeffs() *= -1.0; // shortest-path
+				}
+				const double gap_rad = 2.0 * std::acos(std::min(1.0, std::abs(from.dot(to))));
+				double t_step = std::min(1.0, alpha);
+				if (gap_rad > 0.0 && t_step * gap_rad > REENTRY_MAX_STEP_RAD) {
+					t_step = REENTRY_MAX_STEP_RAD / gap_rad;
+				}
+				m_reentry_cur_orient = from.slerp(t_step, to).normalized();
+				orient = m_reentry_cur_orient;
+			} else {
+				m_reentry_cur_orient = orient;
 			}
 			m_reentry_last_render_ns = when_ns;
 		}
