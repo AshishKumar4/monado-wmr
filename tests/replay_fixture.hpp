@@ -1,5 +1,3 @@
-// Copyright 2026, NVIDIA CORPORATION.
-// SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief Loader for binary .replay fixtures: REAL recorded controller sessions

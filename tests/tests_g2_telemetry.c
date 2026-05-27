@@ -1,5 +1,3 @@
-// Copyright 2026, G2-on-Linux project
-// SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief  Standalone stress + correctness test for u_g2_telemetry.

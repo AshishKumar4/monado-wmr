@@ -1,5 +1,3 @@
-// Copyright 2026, NVIDIA CORPORATION.
-// SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief Offline controller-VIO replay: drive the REAL constellation tracker + ESKF over recorded raw

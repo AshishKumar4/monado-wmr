@@ -1,5 +1,3 @@
-// Copyright 2026, G2-on-Linux project
-// SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief G2 tracking telemetry — lock-free, async, single-clock data capture.
