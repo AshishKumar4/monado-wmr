@@ -67,12 +67,13 @@ DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
  * cold-start/ab-initio bootstrap). The
  * Huber knee reuses the 3-sigma envelope (PRIOR_GATE_SIGMA): within it the penalty is quadratic, beyond
  * it linear, so a gross outlier (flip) cannot dominate pathologically. FLIP_COST_WEIGHT commensurates the
- * dimensionless robustified distance with the per-LED reprojection error (px^2). FLIP_COST_YAW_SIGMA_MAX is
- * the untracked/long-dropout yaw scale: ~half a turn, so the yaw term contributes negligibly and the tilt
- * term (still gravity-anchored) carries the decision alone. */
+ * dimensionless robustified distance with the per-LED reprojection error (px^2). FLIP_COST_YAW_SIGMA_MAX
+ * is the untracked/long-dropout yaw scale CEILING — at 180deg it lets a 180deg flip cost d^2=1.0
+ * (negligible), so twins tie on reprojection during fast motion. 90deg keeps the legitimate-motion
+ * relaxation while still penalising flips at d^2=4. */
 #define FLIP_COST_WEIGHT 1.0
 #define FLIP_COST_HUBER_KNEE_SIGMA PRIOR_GATE_SIGMA
-#define FLIP_COST_YAW_SIGMA_MAX DEG_TO_RAD(180)
+#define FLIP_COST_YAW_SIGMA_MAX DEG_TO_RAD(90)
 /* The yaw-scale FLOOR for the soft flip cost: the minimum yaw 1-sigma the cost will use, regardless of how
  * confident the ESKF reports it is. This is a separate concept from the GRAVITY_TILT_TOL tilt scale (they are
  * different DoFs and must not share one constant), but the VALUE here is governed by a real effect the ESKF
@@ -86,6 +87,10 @@ DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
  * decides). Equal to MIN_ROT_ERROR, the prior gate's per-axis rotation floor: the yaw scale never claims more
  * yaw confidence than the gate's tightest accepted rotation tolerance, the empirically validated knee. */
 #define FLIP_COST_YAW_SIGMA_MIN MIN_ROT_ERROR
+
+/* Yaw-sigma above which a 4-LED single-cam PnP defers: above this, the soft prior cost can no longer
+ * reliably tell the mirror twins apart. 5+ LEDs break near-coplanarity so no twin is emitted. */
+#define FLIP_COST_YAW_SIGMA_GUARD DEG_TO_RAD(60)
 
 /* Covariance-gated partial-fold. When the fast paths cannot solve a PnP (<4 cleanly-labelled LEDs for the
  * device in any single camera — the dominant fall-through, a visibility limit not a bug) but the fusion HAS
@@ -910,6 +915,11 @@ device_solve_view_from_labelled(struct t_constellation_tracker *ct,
 		}
 	}
 	if (num_blobs < 4) {
+		return false;
+	}
+	/* Mirror-ambiguity guard: 4-LED is the near-coplanar twin geometry; defer when the yaw prior is too
+	 * loose for the soft cost to discriminate. Wait for tighter prior or 5+ LEDs. */
+	if (num_blobs == 4 && dev_state->prior_yaw_sigma_rad > FLIP_COST_YAW_SIGMA_GUARD) {
 		return false;
 	}
 

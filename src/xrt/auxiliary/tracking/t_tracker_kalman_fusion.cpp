@@ -909,7 +909,9 @@ namespace {
 		static constexpr double MAX_CONTROLLER_REACH_M = 1.5;
 		//! Out-of-view REPORT bound: a body-anchored controller is within an arm of the head, so the reported
 		//! (dead-reckon-drifting) position is held to this. Report-only — the matcher reads the raw state.
-		static constexpr double BODY_REACH_M = 0.9;
+		/* Max plausible controller-to-head distance when optical is stale; clamps body-anchored
+		 * report. 0.9m (outstretched-arm grip) clipped overhead/torso-lean reach — bumped to 1.1m. */
+		static constexpr double BODY_REACH_M = 1.1;
 		//! World-origin fallback bound used ONLY when no live HMD pose is available (standalone use; head
 		//! pose not yet valid). Without a head reference the head-relative distance cannot be measured, so the
 		//! gate degrades to the world-origin distance — kept generous (room excursion + reach) so it never

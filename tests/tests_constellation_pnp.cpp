@@ -519,6 +519,33 @@ TEST_CASE("soft flip cost: an untracked (large) yaw sigma defers to reprojection
 	CHECK(cost_tilt > 10.0);
 }
 
+TEST_CASE("soft flip cost: stale-prior yaw_sigma at the CEILING still penalises a 180° flip (F1 guard)")
+{
+	const struct xrt_vec3 up = {0.f, 1.f, 0.f};
+	const struct xrt_quat q_prior = quat_axis_deg(0, 1, 0, 0);
+
+	// Post-dropout stale prior: yaw_sigma can inflate up to FLIP_COST_YAW_SIGMA_MAX. A near-180° flip
+	// at the ceiling must still cost meaningfully more than legitimate fast yaw motion at the same
+	// ceiling — otherwise the matcher coin-flips between the twins. With the 90° cap a 180° flip
+	// yields d² = (180/90)² = 4 (Huber-quadratic at s=2 < knee=3) while a legitimate 60° yaw still
+	// costs d² = (60/90)² ≈ 0.44 — a 9× margin. With the prior 180° cap the same flip cost d²=1.0
+	// against legitimate 60° cost d²≈0.11 — same 9× ratio in cost-space but a tiny ABSOLUTE penalty
+	// that loses to a marginally-better reprojection. The cap is the empirical knob for "how much
+	// flip-cost a stale-prior frame should pay".
+	const double cap = 90.0 * M_PI / 180.0; // current FLIP_COST_YAW_SIGMA_MAX after F1
+	struct xrt_quat q_180_flip = quat_axis_deg(0, 1, 0, 175);
+	struct xrt_quat q_60_motion = quat_axis_deg(0, 1, 0, 60);
+	const double cost_flip = pose_metrics_prior_orient_cost(&q_180_flip, &q_prior, &up, SIGMA_TILT,
+	                                                       cap, HUBER_KNEE, COST_WEIGHT);
+	const double cost_motion = pose_metrics_prior_orient_cost(&q_60_motion, &q_prior, &up, SIGMA_TILT,
+	                                                         cap, HUBER_KNEE, COST_WEIGHT);
+	INFO("180° flip cost at cap=90°: " << cost_flip << "  60° motion cost: " << cost_motion);
+	// The flip cost must clearly dominate the legitimate-motion cost.
+	CHECK(cost_flip > 3.0);
+	CHECK(cost_motion < 0.6);
+	CHECK(cost_flip > cost_motion * 5.0);
+}
+
 TEST_CASE("soft flip cost: the Huber knee bounds a gross outlier to a linear penalty")
 {
 	const struct xrt_vec3 up = {0.f, 1.f, 0.f};
