@@ -92,6 +92,24 @@ DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
  * reliably tell the mirror twins apart. 5+ LEDs break near-coplanarity so no twin is emitted. */
 #define FLIP_COST_YAW_SIGMA_GUARD DEG_TO_RAD(60)
 
+/* Head-anchored yaw cue (Fix A): the soft flip cost adds the candidate's HEAD-RELATIVE-yaw distance
+ * from the last accepted controller-in-head orientation. INDEPENDENT of the world-frame fusion prior:
+ * a 180-deg mirror flip flips head-relative yaw too, so this signal stays valid even when the world
+ * prior is stale, and is robust to SLAM global drift (a delta in head frame cancels common drift).
+ *
+ * TTL caps how long after the last accept the cue is trusted: too long and head+hand have moved
+ * independently enough that head-relative yaw is no longer a tight constraint; too short and we miss
+ * the consecutive-frame disambiguation that is the whole point. ~100ms covers ~3 frames at 30Hz —
+ * the regime in which the twin-disambiguation matters most. */
+#define HEAD_YAW_CUE_TTL_NS (100ll * 1000ll * 1000ll)
+/* Yaw scale for the head-anchored term: chosen so legitimate head-vs-controller relative motion (the
+ * fastest plausible 30deg / frame at 30Hz, i.e. ~900deg/s relative rotation) sits within ~1 sigma
+ * while a 180-deg flip is ~3 sigma -> huber-bent linear penalty. */
+#define HEAD_YAW_CUE_YAW_SIGMA DEG_TO_RAD(60)
+/* Tilt scale wide enough to NOT penalise legitimate hand-tilt-vs-head-tilt motion: this term is the
+ * YAW signal; the world-frame term already handles the driftless tilt. */
+#define HEAD_YAW_CUE_TILT_SIGMA DEG_TO_RAD(180)
+
 /* Covariance-gated partial-fold. When the fast paths cannot solve a PnP (<4 cleanly-labelled LEDs for the
  * device in any single camera — the dominant fall-through, a visibility limit not a bug) but the fusion HAS
  * a usable prior, we still fold the
@@ -267,6 +285,16 @@ struct constellation_tracker_device
 	int last_matched_blobs;
 	int last_matched_cam;
 	struct xrt_pose last_matched_cam_pose; // Camera-relative pose
+
+	/* Head-anchored yaw cue for the soft mirror-flip cost (Fix A): the last accepted controller
+	 * orientation expressed in the HMD/head IMU frame, and its timestamp. Used as a SECOND prior
+	 * (alongside the world-frame fusion prior) when ranking mirror twins on the next solve: a 180-deg
+	 * flip is reflected in both world and head-relative yaw, so adding the head-relative yaw distance
+	 * roughly doubles flip-vs-legit discrimination at the matcher gate. Stale by HEAD_YAW_CUE_TTL_NS;
+	 * silently skipped when no fresh accept is available. */
+	bool have_last_head_rel_quat;
+	uint64_t last_head_rel_quat_ts;
+	struct xrt_quat last_head_rel_quat; // controller orientation in head/IMU frame
 };
 
 struct constellation_tracker_camera_state
@@ -779,6 +807,15 @@ submit_device_pose(struct t_constellation_tracker *ct,
 		device->last_matched_cam = view_id;
 		device->last_matched_cam_pose = *P_cam_obj;
 
+		/* Cache controller-in-head orientation for the next frame's head-anchored flip cue
+		 * (Fix A): P_imu_obj = P_imu_cam . P_cam_obj. The TTL on the consumer side keeps a
+		 * stale cache from biasing twin selection across dropouts. */
+		struct xrt_pose P_imu_obj_cache;
+		math_pose_transform(&cam->P_imu_cam, P_cam_obj, &P_imu_obj_cache);
+		device->last_head_rel_quat = P_imu_obj_cache.orientation;
+		device->last_head_rel_quat_ts = sample->timestamp;
+		device->have_last_head_rel_quat = true;
+
 		/* Submit this pose observation to the fusion / real device. Flip back to OpenXR coords first, then
 		 * apply model pose */
 		struct xrt_pose P_xrworld_model;
@@ -964,7 +1001,13 @@ device_solve_view_from_labelled(struct t_constellation_tracker *ct,
 	 * when the yaw prior is stale), while a fresh-yaw flip is out-ranked by
 	 * its yaw distance. When the prior is untracked the yaw scale widens and reprojection decides. The
 	 * penalty is keyed off the prior only when tilt-trusted (gravity-anchored); otherwise it is zero and
-	 * the comparison is the plain reprojection ordering (cold reacquire). */
+	 * the comparison is the plain reprojection ordering (cold reacquire).
+	 *
+	 * Head-anchored yaw cue (Fix A): a SECOND, INDEPENDENT prior is added when a fresh head-relative
+	 * orientation is cached (within HEAD_YAW_CUE_TTL_NS). A 180-deg mirror flip reflects in head frame
+	 * the same as in world frame, so adding the head-relative-yaw distance doubles flip-vs-legit
+	 * discrimination at the gate; because it's a LOCAL delta in head frame it is robust to SLAM
+	 * global drift. Silently skipped when no fresh accept exists (cold start, post-dropout). */
 	if (has_twin) {
 		struct pose_metrics twin_score;
 		pose_metrics_evaluate_pose_with_prior(&twin_score, &twin_pose, true, &P_cam_obj_prior,
@@ -980,6 +1023,25 @@ device_solve_view_from_labelled(struct t_constellation_tracker *ct,
 			twin_cost = pose_metrics_prior_orient_cost(
 			    &twin_pose.orientation, &P_cam_obj_prior.orientation, &view->cam_gravity_vector,
 			    GRAVITY_TILT_TOL, dev_state->prior_yaw_sigma_rad, FLIP_COST_HUBER_KNEE_SIGMA,
+			    FLIP_COST_WEIGHT);
+		}
+		if (device->have_last_head_rel_quat && sample->timestamp >= device->last_head_rel_quat_ts &&
+		    (sample->timestamp - device->last_head_rel_quat_ts) < (uint64_t)HEAD_YAW_CUE_TTL_NS) {
+			/* candidate in head/IMU frame: P_imu_obj = P_imu_cam . P_cam_obj */
+			struct xrt_pose P_imu_obj_prim, P_imu_obj_twin;
+			math_pose_transform(&cam->P_imu_cam, &P_cam_obj, &P_imu_obj_prim);
+			math_pose_transform(&cam->P_imu_cam, &twin_pose, &P_imu_obj_twin);
+			/* world-up axis (cam_gravity_vector) rotated from cam frame into head/IMU frame */
+			struct xrt_vec3 imu_gravity;
+			math_quat_rotate_vec3(&cam->P_imu_cam.orientation, &view->cam_gravity_vector,
+			                      &imu_gravity);
+			prim_cost += pose_metrics_prior_orient_cost(
+			    &P_imu_obj_prim.orientation, &device->last_head_rel_quat, &imu_gravity,
+			    HEAD_YAW_CUE_TILT_SIGMA, HEAD_YAW_CUE_YAW_SIGMA, FLIP_COST_HUBER_KNEE_SIGMA,
+			    FLIP_COST_WEIGHT);
+			twin_cost += pose_metrics_prior_orient_cost(
+			    &P_imu_obj_twin.orientation, &device->last_head_rel_quat, &imu_gravity,
+			    HEAD_YAW_CUE_TILT_SIGMA, HEAD_YAW_CUE_YAW_SIGMA, FLIP_COST_HUBER_KNEE_SIGMA,
 			    FLIP_COST_WEIGHT);
 		}
 		if (pose_metrics_score_is_better_pose_prior(&dev_state->score, prim_cost, &twin_score, twin_cost)) {

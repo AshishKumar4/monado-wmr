@@ -546,6 +546,61 @@ TEST_CASE("soft flip cost: stale-prior yaw_sigma at the CEILING still penalises 
 	CHECK(cost_flip > cost_motion * 5.0);
 }
 
+TEST_CASE("soft flip cost: head-anchored yaw cue penalises a head-relative 180° flip (Fix A)")
+{
+	// Fix A adds a SECOND independent prior term: the candidate's head-relative orientation vs the last
+	// accepted controller-in-head orientation. A 180° mirror flip in the WORLD frame is also a 180° flip
+	// in HEAD frame (the head doesn't change between consecutive frames, the controller does), so the
+	// head-anchored term penalises the same flip independently — doubling the discrimination at the gate.
+	const struct xrt_vec3 imu_up = {0.f, 1.f, 0.f}; // world-up rotated into head/IMU frame (identity head)
+	const struct xrt_quat q_last_head_rel = quat_axis_deg(0, 1, 0, 0); // controller-in-head at last frame
+	// Production knobs (mirror t_constellation_tracking.c):
+	const double SIGMA_TILT_HEAD = 180.0 * M_PI / 180.0; // HEAD_YAW_CUE_TILT_SIGMA -> effectively disable tilt
+	const double SIGMA_YAW_HEAD = 60.0 * M_PI / 180.0;   // HEAD_YAW_CUE_YAW_SIGMA
+
+	// Same controller still in head frame, but two candidates: the prior-consistent twin (~5° drift) and
+	// the 180° mirror twin (the flip we want to reject).
+	const struct xrt_quat q_cand_consistent = quat_axis_deg(0, 1, 0, 5);
+	const struct xrt_quat q_cand_flipped = quat_axis_deg(0, 1, 0, 175);
+
+	const double cost_consistent = pose_metrics_prior_orient_cost(
+	    &q_cand_consistent, &q_last_head_rel, &imu_up, SIGMA_TILT_HEAD, SIGMA_YAW_HEAD, HUBER_KNEE,
+	    COST_WEIGHT);
+	const double cost_flipped = pose_metrics_prior_orient_cost(
+	    &q_cand_flipped, &q_last_head_rel, &imu_up, SIGMA_TILT_HEAD, SIGMA_YAW_HEAD, HUBER_KNEE,
+	    COST_WEIGHT);
+	INFO("Fix A: head-rel flip cost=" << cost_flipped << "  consistent cost=" << cost_consistent);
+	// 180° / 60° = 3 sigma -> Huber knee — penalty becomes linear at d=3, so cost should be substantial.
+	CHECK(cost_flipped > 3.0);
+	CHECK(cost_consistent < 0.05);
+	CHECK(cost_flipped > cost_consistent * 50.0);
+}
+
+TEST_CASE("soft flip cost: head-anchored cue tolerates legitimate fast head-vs-controller motion (Fix A)")
+{
+	// Sanity bound for Fix A's yaw sigma choice (60°): a legitimate ~30° head-relative yaw delta between
+	// consecutive frames (one frame at 30Hz of fast head-and-controller motion in opposite directions
+	// totalling ~900°/s relative angular rate) must cost MUCH less than a 180° flip at the same sigma —
+	// otherwise the cue would over-fire and reject legitimate motion as if it were a flip.
+	const struct xrt_vec3 imu_up = {0.f, 1.f, 0.f};
+	const struct xrt_quat q_last_head_rel = quat_axis_deg(0, 1, 0, 0);
+	const double SIGMA_TILT_HEAD = 180.0 * M_PI / 180.0;
+	const double SIGMA_YAW_HEAD = 60.0 * M_PI / 180.0;
+
+	const struct xrt_quat q_legit_motion = quat_axis_deg(0, 1, 0, 30); // 30° head-rel yaw in 1 frame
+	const struct xrt_quat q_flip = quat_axis_deg(0, 1, 0, 175);
+
+	const double cost_legit = pose_metrics_prior_orient_cost(
+	    &q_legit_motion, &q_last_head_rel, &imu_up, SIGMA_TILT_HEAD, SIGMA_YAW_HEAD, HUBER_KNEE,
+	    COST_WEIGHT);
+	const double cost_flip = pose_metrics_prior_orient_cost(
+	    &q_flip, &q_last_head_rel, &imu_up, SIGMA_TILT_HEAD, SIGMA_YAW_HEAD, HUBER_KNEE, COST_WEIGHT);
+	INFO("Fix A tolerance: legit 30° head-rel cost=" << cost_legit << "  flip cost=" << cost_flip);
+	// 30°/60° = 0.5 sigma -> d²=0.25 — small, well within the gate.
+	CHECK(cost_legit < 0.3);
+	CHECK(cost_flip > cost_legit * 10.0);
+}
+
 TEST_CASE("soft flip cost: the Huber knee bounds a gross outlier to a linear penalty")
 {
 	const struct xrt_vec3 up = {0.f, 1.f, 0.f};
