@@ -1401,7 +1401,16 @@ namespace {
 			MatX H = MatX::Zero(3, 15);
 			H.block<3, 3>(0, EP) = Mat3::Identity();
 			const VecX r = (map_vec3(hmd_pose->position).cast<double>() + m_body_offset_world) - m_x.p;
-			const MatX Rp = Mat3::Identity() * BODY_ANCHOR_VAR;
+			/* Stale-anchor aging: inflate variance ∝ time-since-optical (arm-speed drift), capped at 4x
+			 * so the fold doesn't dissolve. Without this the anchor pulls toward a stale offset →
+			 * "wander off" + "snap back" on re-acquisition. */
+			constexpr double BODY_OFFSET_DRIFT_M_S = 0.5;
+			const double coast_s = (last_optical_ns != 0)
+			    ? (double)(filter_time_ns - last_optical_ns) / 1e9
+			    : 0.0;
+			const double drift_var = sq(BODY_OFFSET_DRIFT_M_S * coast_s);
+			const double inflated_var = std::min(BODY_ANCHOR_VAR + drift_var, BODY_ANCHOR_VAR * 4.0);
+			const MatX Rp = Mat3::Identity() * inflated_var;
 			(void)ekf_update(H, r, Rp);
 		}
 		return true;

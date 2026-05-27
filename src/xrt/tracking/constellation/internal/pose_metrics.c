@@ -604,13 +604,13 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 
 	/* At this point, we have at least 3 LEDs and their blobs matching */
 	if (POSE_HAS_FLAGS(score, POSE_MATCH_POSITION | POSE_MATCH_ORIENT)) {
-		if (error_per_led < 2.0 && (score->unmatched_blobs * 4 <= score->matched_blobs ||
-		                            (2 * score->visible_leds <= 3 * score->matched_blobs))) {
-#if 0
-			printf("Got good prior match within pos (%f, %f, %f) rot (%f, %f, %f)\n", pos_error_thresh->x,
-			       pos_error_thresh->y, pos_error_thresh->z, rot_error_thresh->x, rot_error_thresh->y,
-			       rot_error_thresh->z);
-#endif
+		/* Two routes to GOOD: (A) "cluster mostly explained" — also require matched >= 5, otherwise
+		 * a 4-LED coincidental cluster on textures (curtain stripes, window blinds) passes; (B)
+		 * "covers >= 2/3 of visible LEDs". */
+		const bool ratio_a_clean_cluster = score->unmatched_blobs * 4 <= score->matched_blobs &&
+		                                   score->matched_blobs >= 5;
+		const bool ratio_b_covers_visible = 2 * score->visible_leds <= 3 * score->matched_blobs;
+		if (error_per_led < 2.0 && (ratio_a_clean_cluster || ratio_b_covers_visible)) {
 			score->match_flags |= POSE_MATCH_GOOD;
 
 			if (error_per_led < 1.5)
