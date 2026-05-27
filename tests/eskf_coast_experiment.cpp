@@ -1,3 +1,5 @@
+// Copyright 2026, NVIDIA CORPORATION.
+// SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief Characterize the controller's INERTIAL coast drift on real recorded data, through the real

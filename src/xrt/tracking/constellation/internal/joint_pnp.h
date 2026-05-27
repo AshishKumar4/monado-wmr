@@ -1,3 +1,5 @@
+// Copyright 2026, NVIDIA CORPORATION.
+// SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief  Multi-camera joint (generalised / non-central) PnP over pooled LED bearing rays.

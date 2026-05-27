@@ -1,3 +1,5 @@
+// Copyright 2026, NVIDIA CORPORATION.
+// SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief Decoupled unit tests for the constellation PnP mirror-twin enumeration

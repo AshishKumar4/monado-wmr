@@ -1,6 +1,9 @@
+// Copyright 2026, G2-on-Linux project
+// SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief  G2 tracking telemetry implementation.
+ * @author G2 telemetry
  * @ingroup aux_util
  *
  * Ring discipline (per stream): a bounded MPSC queue (Vyukov-style) with a

@@ -1,3 +1,5 @@
+// Copyright 2026, Collabora, Ltd.
+// SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief Regression test for WMR controller inertial-sensor calibration selection.
