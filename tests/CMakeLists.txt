@@ -74,6 +74,13 @@ target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)
 
+add_executable(tests_association_hypothesis tests_association_hypothesis.cpp)
+target_link_libraries(tests_association_hypothesis PRIVATE xrt-external-catch2 aux_util)
+target_include_directories(
+	tests_association_hypothesis PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/tracking/constellation)
+add_test(NAME tests_association_hypothesis COMMAND tests_association_hypothesis --success --allow-running-no-tests)
+set_target_properties(tests_association_hypothesis PROPERTIES FOLDER monado_tests)
+
 if(XRT_HAVE_OPENCV)
 	target_link_libraries(tests_kalman_fusion PRIVATE aux_math aux_tracking Threads::Threads ${OpenCV_LIBRARIES})
 	target_include_directories(tests_kalman_fusion PRIVATE ${OpenCV_INCLUDE_DIRS})

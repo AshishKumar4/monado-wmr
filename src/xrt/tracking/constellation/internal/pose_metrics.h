@@ -46,6 +46,8 @@ enum pose_match_flags
 	POSE_HAD_PRIOR =
 	    0x100, /* If a pose prior was supplied when calculating the score, then rot/trans_error are set */
 	POSE_MATCH_LED_IDS = 0x200, /* The LED IDs on the blobs all matched the LEDs we thought (or were unassigned) */
+	POSE_MATCH_PRIOR_SUPPORTED_PARTIAL =
+	    0x400, /* Prior-consistent sparse visual cue: valid for per-LED fusion, not a standalone 6DoF pose */
 };
 
 #define POSE_SET_FLAG(score, f) ((score)->match_flags |= (f))

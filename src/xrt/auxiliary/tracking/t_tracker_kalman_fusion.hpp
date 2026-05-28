@@ -66,6 +66,17 @@ public:
 	             const struct xrt_pose *hmd_world_pose) = 0;
 
 	/*!
+	 * Position-only optical observation for visually-supported but orientation-ambiguous frames. This lets the
+	 * front-end use a controller whose LEDs constrain translation while mirror-twin/yaw evidence is not strong
+	 * enough to accept a full 6DoF pose. It never changes orientation directly.
+	 */
+	virtual void
+	process_position(const timepoint_ns timestamp_ns,
+	                 const struct xrt_vec3 *position,
+	                 const struct xrt_vec3 *position_variance_optional,
+	                 const struct xrt_pose *hmd_world_pose) = 0;
+
+	/*!
 	 * Tightly-coupled optical update: fold each matched LED's reprojection
 	 * into the filter directly, instead of solving one PnP pose and feeding
 	 * that. Works with as few as a single LED, so frames that have too few

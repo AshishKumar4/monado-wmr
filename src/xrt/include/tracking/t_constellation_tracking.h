@@ -92,6 +92,7 @@ struct t_constellation_led_obs
 {
 	struct xrt_vec2 obs_px;  //!< undistorted blob centroid, in camera PIXELS (distortion removed)
 	struct xrt_vec3 led_obj; //!< LED position in the OpenXR object frame (m)
+	float pos_var_px2;      //!< optional isotropic centroid variance; <= 0 uses the fusion default
 };
 
 //! Camera pinhole intrinsics for one view, so the fusion can reproject in physical pixels (the per-LED
@@ -141,6 +142,11 @@ struct t_constellation_tracked_device_callbacks
 	bool (*predict_led_gate)(struct xrt_device *xdev, const struct xrt_pose *P_xrworld_cam,
 	                         const struct t_constellation_cam_calib *cam_calib, const struct xrt_vec3 *led_obj,
 	                         float out_zhat[2], float out_S[4]);
+	//! Position-only visual observation for frames where LED correspondences constrain translation but not
+	//! orientation. Optional — callers still use push_observed_pose for full 6DoF locks.
+	void (*push_observed_position)(struct xrt_device *xdev, timepoint_ns frame_mono_ns,
+	                               const struct xrt_vec3 *position,
+	                               const struct xrt_vec3 *position_variance);
 };
 
 struct t_constellation_tracked_device_connection *

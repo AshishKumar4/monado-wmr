@@ -86,6 +86,65 @@ struct g2_telem_pose_attempt
 	float qx, qy, qz, qw;
 } G2_PACKED;
 
+struct g2_telem_candidate
+{
+	uint64_t t_mono_ns;
+	uint64_t hw_ts_ns;
+	uint8_t device_id;
+	uint8_t cam_id;
+	uint8_t stage;
+	uint8_t candidate;
+	uint8_t selected;
+	uint8_t had_twin;
+	uint8_t outcome;
+	uint8_t prior_tilt_trusted;
+	uint8_t leds_visible;
+	uint8_t blobs_matched;
+	uint8_t unmatched_blobs;
+	uint8_t inliers;
+	uint32_t match_flags;
+	float reproj_err_px;
+	float prior_cost;
+	float total_cost;
+	float yaw_sigma_rad;
+	float tilt_err_rad;
+	float yaw_err_rad;
+	float prior_pos_err_x, prior_pos_err_y, prior_pos_err_z;
+	float prior_rot_err_x, prior_rot_err_y, prior_rot_err_z;
+	float px, py, pz;
+	float qx, qy, qz, qw;
+} G2_PACKED;
+
+struct g2_telem_search
+{
+	uint64_t t_mono_ns;
+	uint64_t hw_ts_ns;
+	uint8_t device_id;
+	uint8_t cam_id;
+	uint8_t pass;
+	uint8_t result;
+	uint16_t search_flags;
+	uint8_t prior_tilt_trusted;
+	uint32_t input_blobs;
+	uint32_t searchable_anchors;
+	uint32_t filtered_anchors;
+	uint32_t anchors_with_3_neighbours;
+	uint32_t neighbour_links;
+	uint32_t num_trials;
+	uint32_t num_pose_checks;
+	uint32_t num_pose_checks_pruned;
+	uint8_t min_led_depth;
+	uint8_t max_led_depth;
+	uint8_t max_blob_depth;
+	uint8_t best_blob_depth;
+	uint8_t best_led_depth;
+	uint32_t match_flags;
+	uint8_t leds_visible;
+	uint8_t blobs_matched;
+	uint8_t unmatched_blobs;
+	float reproj_err_px;
+} G2_PACKED;
+
 struct g2_telem_fusion
 {
 	uint64_t t_mono_ns;
@@ -302,6 +361,7 @@ test_peak(const char *dir)
 	}
 
 	float pose[7] = {0.1f, 0.2f, 0.3f, 0.0f, 0.0f, 0.0f, 1.0f};
+	float err3[3] = {0.01f, 0.02f, 0.03f};
 	float opt[7] = {1, 2, 3, 0, 0, 0, 1};
 	float pred[7] = {1, 2, 3, 0, 0, 0, 1};
 	for (long i = 0; i < N_FRAME; i++) {
@@ -312,6 +372,10 @@ test_peak(const char *dir)
 	}
 	for (long i = 0; i < N_POSE; i++) {
 		g2_telem_pose_attempt(0, 0, (uint64_t)i, 10, 8, 7, 0.5f, pose, 1);
+		g2_telem_candidate(0, 0, (uint64_t)i, 3, 0, 1, 1, 1, 0x31, 10, 8, 2, 7, 0.5f, 1.0f, 1.5f, 1,
+		                  0.2f, 0.1f, 0.15f, err3, err3, pose);
+		g2_telem_search(0, 0, (uint64_t)i, 1, 6, 0x35, 1, 12, 8, 4, 6, 32, 100, 50, 2, 1, 8, 5, 4, 7,
+		               0x31, 10, 8, 2, 0.5f);
 		if ((i % CHUNK) == (CHUNK - 1)) {
 			pace();
 		}
@@ -335,6 +399,8 @@ test_peak(const char *dir)
 	long imu_bytes = file_size(dir, "imu.bin");
 	long frame_bytes = file_size(dir, "frame.bin");
 	long pose_bytes = file_size(dir, "pose_attempt.bin");
+	long candidate_bytes = file_size(dir, "candidate.bin");
+	long search_bytes = file_size(dir, "search.bin");
 	long fusion_bytes = file_size(dir, "fusion.bin");
 	long event_bytes = file_size(dir, "event.bin");
 
@@ -343,24 +409,32 @@ test_peak(const char *dir)
 	long imu_rs = find_row_size(m, "imu");
 	long frame_rs = find_row_size(m, "frame");
 	long pose_rs = find_row_size(m, "pose_attempt");
+	long candidate_rs = find_row_size(m, "candidate");
+	long search_rs = find_row_size(m, "search");
 	long fusion_rs = find_row_size(m, "fusion");
 	long event_rs = find_row_size(m, "event");
 
 	long imu_rows = imu_bytes / imu_rs;
 	long frame_rows = frame_bytes / frame_rs;
 	long pose_rows = pose_bytes / pose_rs;
+	long candidate_rows = candidate_bytes / candidate_rs;
+	long search_rows = search_bytes / search_rs;
 	long fusion_rows = fusion_bytes / fusion_rs;
 	long event_rows = event_bytes / event_rs;
 
 	fprintf(stderr, "  imu: emitted=%ld written=%ld\n", imu_total, imu_rows);
 	fprintf(stderr, "  frame: emitted=%d written=%ld\n", N_FRAME, frame_rows);
 	fprintf(stderr, "  pose: emitted=%d written=%ld\n", N_POSE, pose_rows);
+	fprintf(stderr, "  candidate: emitted=%d written=%ld\n", N_POSE, candidate_rows);
+	fprintf(stderr, "  search: emitted=%d written=%ld\n", N_POSE, search_rows);
 	fprintf(stderr, "  fusion: emitted=%d written=%ld\n", N_FUSION, fusion_rows);
 	fprintf(stderr, "  event: emitted=1 written=%ld\n", event_rows);
 
 	CHECK(imu_rows == imu_total, "imu count matches (%ld != %ld)", imu_rows, imu_total);
 	CHECK(frame_rows == N_FRAME, "frame count matches");
 	CHECK(pose_rows == N_POSE, "pose count matches");
+	CHECK(candidate_rows == N_POSE, "candidate count matches");
+	CHECK(search_rows == N_POSE, "search count matches");
 	CHECK(fusion_rows == N_FUSION, "fusion count matches");
 	// event = 1 emitted; with zero overflow there must be NO ring_overflow rows.
 	CHECK(event_rows == 1, "event count matches (zero overflow expected), got %ld", event_rows);
@@ -458,6 +532,19 @@ test_offsets(const char *dir)
 	CHKOFF("pose_attempt", g2_telem_pose_attempt, outcome);
 	CHKOFF("pose_attempt", g2_telem_pose_attempt, reproj_err_px);
 	CHKOFF("pose_attempt", g2_telem_pose_attempt, qw);
+	CHKOFF("candidate", g2_telem_candidate, stage);
+	CHKOFF("candidate", g2_telem_candidate, selected);
+	CHKOFF("candidate", g2_telem_candidate, match_flags);
+	CHKOFF("candidate", g2_telem_candidate, prior_cost);
+	CHKOFF("candidate", g2_telem_candidate, yaw_err_rad);
+	CHKOFF("candidate", g2_telem_candidate, prior_pos_err_z);
+	CHKOFF("candidate", g2_telem_candidate, qw);
+	CHKOFF("search", g2_telem_search, result);
+	CHKOFF("search", g2_telem_search, search_flags);
+	CHKOFF("search", g2_telem_search, anchors_with_3_neighbours);
+	CHKOFF("search", g2_telem_search, num_pose_checks_pruned);
+	CHKOFF("search", g2_telem_search, best_led_depth);
+	CHKOFF("search", g2_telem_search, reproj_err_px);
 	CHKOFF("fusion", g2_telem_fusion, pos_residual_m);
 	CHKOFF("fusion", g2_telem_fusion, opt_px);
 	CHKOFF("fusion", g2_telem_fusion, opt_qw);
@@ -470,6 +557,8 @@ test_offsets(const char *dir)
 	CHECK(find_row_size(m, "imu") == (long)sizeof(struct g2_telem_imu), "imu row_size");
 	CHECK(find_row_size(m, "frame") == (long)sizeof(struct g2_telem_frame), "frame row_size");
 	CHECK(find_row_size(m, "pose_attempt") == (long)sizeof(struct g2_telem_pose_attempt), "pose row_size");
+	CHECK(find_row_size(m, "candidate") == (long)sizeof(struct g2_telem_candidate), "candidate row_size");
+	CHECK(find_row_size(m, "search") == (long)sizeof(struct g2_telem_search), "search row_size");
 	CHECK(find_row_size(m, "fusion") == (long)sizeof(struct g2_telem_fusion), "fusion row_size");
 	CHECK(find_row_size(m, "event") == (long)sizeof(struct g2_telem_event), "event row_size");
 

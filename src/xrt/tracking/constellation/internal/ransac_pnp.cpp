@@ -323,3 +323,63 @@ ransac_pnp_pose(struct xrt_pose *pose,
 	return ransac_pnp_pose_with_twin(pose, blobs, num_blobs, leds_model, calib, num_leds_out, num_inliers,
 	                                 nullptr, nullptr);
 }
+
+int
+pnp_solve_p3p(struct blob *blobs,
+              int num_blobs,
+              struct t_constellation_led_model *leds_model,
+              struct camera_model *calib,
+              struct xrt_pose *out_poses,
+              int max_out)
+{
+	if (max_out <= 0) {
+		return 0;
+	}
+
+	std::vector<cv::Point3f> p3d;
+	std::vector<cv::Point2f> p2d;
+	p3d.reserve(3);
+	p2d.reserve(3);
+	uint64_t taken = 0;
+	for (int i = 0; i < num_blobs && p3d.size() < 3; i++) {
+		int led_id = blobs[i].led_id;
+		if (LED_OBJECT_ID(led_id) != leds_model->id) {
+			continue;
+		}
+		led_id = LED_LOCAL_ID(led_id);
+		if (led_id < 0 || led_id >= leds_model->num_leds || led_id >= 64) {
+			continue;
+		}
+		if (taken & (1ULL << led_id)) {
+			continue;
+		}
+		taken |= (1ULL << led_id);
+		p3d.push_back(cv::Point3f(leds_model->leds[led_id].pos.x, leds_model->leds[led_id].pos.y,
+		                           leds_model->leds[led_id].pos.z));
+		p2d.push_back(cv::Point2f(blobs[i].x, blobs[i].y));
+	}
+	if (p3d.size() != 3) {
+		return 0;
+	}
+
+	std::vector<cv::Point2f> p2d_und(3);
+	undistort_blob_points(p2d, p2d_und, calib);
+
+	cv::Mat K = cv::Mat::eye(3, 3, CV_64FC1);
+	cv::Mat D = cv::Mat::zeros(4, 1, CV_64FC1);
+	std::vector<cv::Mat> rvecs, tvecs;
+	try {
+		cv::solveP3P(p3d, p2d_und, K, D, rvecs, tvecs, cv::SOLVEPNP_AP3P);
+	} catch (const cv::Exception &) {
+		return 0;
+	}
+
+	int written = 0;
+	for (size_t i = 0; i < rvecs.size() && written < max_out; i++) {
+		if (tvecs[i].at<double>(2) <= 0.0) {
+			continue;
+		}
+		rtvec_to_pose(rvecs[i], tvecs[i], &out_poses[written++]);
+	}
+	return written;
+}

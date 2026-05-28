@@ -144,6 +144,7 @@ struct blobwatch
 	uint32_t next_blob_id;
 	uint8_t pixel_threshold;         /* Minimum pixel magnitude considered non-black */
 	uint8_t blob_required_threshold; /* Minimum pixel magnitude a blob must contain somewhere to be retained */
+	uint8_t adapt_margin;            /* Minimum contrast above the local adaptive background */
 	uint8_t cam_id;                  /* Camera index this blobwatch processes (for telemetry) */
 	int blob_max_wh;
 
@@ -187,6 +188,7 @@ blobwatch_new(uint8_t pixel_threshold, uint8_t blob_required_threshold, uint8_t 
 
 	/* Minimum pixel magnitude to be included in a blob at all */
 	bw->pixel_threshold = pixel_threshold;
+	bw->adapt_margin = ADAPT_MARGIN;
 
 	/* Require at least 1 pixel over this threshold in a blob -
 	 * allows for collecting fainter blobs, as long as they have a bright
@@ -620,7 +622,7 @@ process_scanline(uint8_t *line,
 		 * separates dim LEDs from bright reflections and stops a uniformly
 		 * bright background from forming blobs. */
 		if (line[x] <= bw->pixel_threshold ||
-		    line[x] < local_bg_mean(bw, x, y, frame->width, frame->height) + ADAPT_MARGIN)
+		    line[x] < local_bg_mean(bw, x, y, frame->width, frame->height) + bw->adapt_margin)
 			continue;
 
 		start = x;
@@ -632,7 +634,7 @@ process_scanline(uint8_t *line,
 
 		/* Loop until pixel value falls below threshold (bounded by the ROI's x_max). */
 		while (x < x_max && line[x] > bw->pixel_threshold &&
-		       line[x] >= local_bg_mean(bw, x, y, frame->width, frame->height) + ADAPT_MARGIN) {
+		       line[x] >= local_bg_mean(bw, x, y, frame->width, frame->height) + bw->adapt_margin) {
 			if (line[x] > max_pixel)
 				max_pixel = line[x];
 			intensity_sum += line[x];
@@ -835,6 +837,41 @@ void
 blobwatch_process(blobwatch *bw, struct xrt_frame *frame, uint16_t exposure, uint16_t gain, blobservation **output)
 {
 	blobwatch_process_roi(bw, frame, exposure, gain, 0, 0, (int)frame->width, (int)frame->height, output);
+}
+
+void
+blobwatch_process_roi_lowthresh(blobwatch *bw,
+                                struct xrt_frame *frame,
+                                uint16_t exposure,
+                                uint16_t gain,
+                                int roi_x,
+                                int roi_y,
+                                int roi_w,
+                                int roi_h,
+                                uint8_t roi_pixel_threshold,
+                                uint8_t roi_adapt_margin,
+                                uint8_t roi_required_threshold,
+                                blobservation **output)
+{
+	const uint8_t saved_pixel = bw->pixel_threshold;
+	const uint8_t saved_adapt = bw->adapt_margin;
+	const uint8_t saved_required = bw->blob_required_threshold;
+
+	if (roi_pixel_threshold != 0 && roi_pixel_threshold < saved_pixel) {
+		bw->pixel_threshold = roi_pixel_threshold;
+	}
+	if (roi_adapt_margin != 0 && roi_adapt_margin < saved_adapt) {
+		bw->adapt_margin = roi_adapt_margin;
+	}
+	if (roi_required_threshold != 0 && roi_required_threshold < saved_required) {
+		bw->blob_required_threshold = roi_required_threshold;
+	}
+
+	blobwatch_process_roi(bw, frame, exposure, gain, roi_x, roi_y, roi_w, roi_h, output);
+
+	bw->pixel_threshold = saved_pixel;
+	bw->adapt_margin = saved_adapt;
+	bw->blob_required_threshold = saved_required;
 }
 
 void

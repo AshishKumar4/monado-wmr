@@ -760,11 +760,22 @@ cb_push_leds(struct xrt_device *xdev, timepoint_ns t, const struct xrt_pose *P_x
 	for (size_t i = 0; i < m; i++) {
 		obs[i].observed_px = leds[i].obs_px;
 		obs[i].led_obj = leds[i].led_obj;
+		obs[i].pos_var_px2 = leds[i].pos_var_px2;
 	}
-	// NULL variance => the filter's own LED_PIXEL_STD² (single source of truth, == production driver).
+	// NULL variance => uniform fallback; per-blob variance is carried in obs when available.
 	struct xrt_pose hp;
 	kalman_fusion_process_led_observations(c->kf, t, obs, m, &view, nullptr, 8.0f, true,
 	                                       ctrl_head_pose(c, t, &hp));
+}
+void
+cb_push_position(struct xrt_device *xdev,
+                 timepoint_ns t,
+                 const struct xrt_vec3 *position,
+                 const struct xrt_vec3 *position_variance)
+{
+	FakeController *c = reinterpret_cast<FakeController *>(xdev);
+	struct xrt_pose hp;
+	kalman_fusion_process_position(c->kf, t, position, position_variance, ctrl_head_pose(c, t, &hp));
 }
 bool
 cb_get_unc(struct xrt_device *xdev, double *ps, double *os, double *ys)
@@ -1024,6 +1035,7 @@ main(int argc, char **argv)
 	cbs.get_led_model = cb_get_led_model;
 	cbs.notify_frame_received = cb_noop_frame;
 	cbs.push_observed_pose = cb_push_pose;
+	cbs.push_observed_position = cb_push_position;
 	cbs.push_brightness_update = cb_noop_bright;
 	cbs.push_observed_leds = cb_push_leds;
 	cbs.get_pose_uncertainty = cb_get_unc;

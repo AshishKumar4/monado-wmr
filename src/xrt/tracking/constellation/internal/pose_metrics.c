@@ -604,14 +604,27 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 
 	/* At this point, we have at least 3 LEDs and their blobs matching */
 	if (POSE_HAS_FLAGS(score, POSE_MATCH_POSITION | POSE_MATCH_ORIENT)) {
-		/* Two routes to GOOD: (A) "cluster mostly explained" — also require matched >= 5, otherwise
-		 * a 4-LED coincidental cluster on textures (curtain stripes, window blinds) passes; (B)
-		 * "covers >= 2/3 of visible LEDs". */
+		/* Three routes to GOOD:
+		 * (A) "cluster mostly explained" — require matched >= 5 for priorless texture safety;
+		 * (B) "covers >= 2/3 of visible LEDs";
+		 * (C) a minimal 4-LED pose that is prior-consistent, blob-label-compatible, and clutter-free.
+		 * Route C is not a looser texture gate: blob labels are tracker state, not physical LED IDs, so
+		 * they are only a weak contradiction check. The hard evidence is still prior agreement, no clutter,
+		 * and low reprojection error. This keeps side/edge-FOV frames from being discarded solely because
+		 * the geometric model projects many more LEDs than the camera actually extracts at high speed or
+		 * oblique angles. */
 		const bool ratio_a_clean_cluster = score->unmatched_blobs * 4 <= score->matched_blobs &&
 		                                   score->matched_blobs >= 5;
 		const bool ratio_b_covers_visible = 2 * score->visible_leds <= 3 * score->matched_blobs;
-		if (error_per_led < 2.0 && (ratio_a_clean_cluster || ratio_b_covers_visible)) {
+		const bool ratio_c_prior_supported_minimal = score->matched_blobs >= 4 &&
+		                                             score->unmatched_blobs == 0 &&
+		                                             POSE_HAS_FLAGS(score, POSE_MATCH_LED_IDS);
+		if (error_per_led < 2.0 &&
+		    (ratio_a_clean_cluster || ratio_b_covers_visible || ratio_c_prior_supported_minimal)) {
 			score->match_flags |= POSE_MATCH_GOOD;
+			if (ratio_c_prior_supported_minimal && !ratio_a_clean_cluster && !ratio_b_covers_visible) {
+				score->match_flags |= POSE_MATCH_PRIOR_SUPPORTED_PARTIAL;
+			}
 
 			if (error_per_led < 1.5)
 				score->match_flags |= POSE_MATCH_STRONG;

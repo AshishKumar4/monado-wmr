@@ -89,10 +89,6 @@ struct constellation_tracking_sample
 
 	struct tracking_sample_frame views[CONSTELLATION_MAX_CAMERAS];
 	uint8_t n_views;
-
-	bool need_long_analysis;
-
-	bool long_analysis_found_new_blobs;
 };
 
 struct constellation_tracking_sample *

@@ -91,6 +91,67 @@ g2_telem_pose_attempt(uint8_t device_id,
                       const float pose[7],
                       uint8_t outcome);
 
+/*! Candidate/twin decision telemetry. @p stage: 1=global/last pose, 2=recovery, 3=prior-refine,
+ * 4=long-search. @p candidate: 0=primary/no-twin, 1=twin. @p selected says this candidate was the one carried
+ * forward by the front-end. @p outcome uses pose_attempt's 0/1/2 rejected/accepted/recovered convention.
+ * @p prior_pos_err and @p prior_rot_err are the per-axis errors from pose_metrics, and @p pose is
+ * [px,py,pz,qx,qy,qz,qw] in the camera-relative frame. */
+void
+g2_telem_candidate(uint8_t device_id,
+                   uint8_t cam_id,
+                   uint64_t ts_ns,
+                   uint8_t stage,
+                   uint8_t candidate,
+                   uint8_t selected,
+                   uint8_t had_twin,
+                   uint8_t outcome,
+                   uint32_t match_flags,
+                   uint8_t leds_visible,
+                   uint8_t blobs_matched,
+                   uint8_t unmatched_blobs,
+                   uint8_t inliers,
+                   float reproj_err_px,
+                   float prior_cost,
+                   float total_cost,
+                   uint8_t prior_tilt_trusted,
+                   float yaw_sigma_rad,
+                   float tilt_err_rad,
+                   float yaw_err_rad,
+                   const float prior_pos_err[3],
+                   const float prior_rot_err[3],
+                   const float pose[7]);
+
+/*! Correspondence long-search diagnostics. This is emitted once per search pass,
+ * including failed passes, so visible-controller dropouts are not silent. @p result:
+ * 0=success, 1=no_searchable_anchors, 2=no_anchor_with_3_neighbours, 3=no_p3p_trials,
+ * 4=no_pose_checks, 5=all_pose_checks_pruned, 6=best_not_good, 7=no_good_candidate. */
+void
+g2_telem_search(uint8_t device_id,
+                uint8_t cam_id,
+                uint64_t ts_ns,
+                uint8_t pass,
+                uint8_t result,
+                uint16_t search_flags,
+                uint8_t prior_tilt_trusted,
+                uint32_t input_blobs,
+                uint32_t searchable_anchors,
+                uint32_t filtered_anchors,
+                uint32_t anchors_with_3_neighbours,
+                uint32_t neighbour_links,
+                uint32_t num_trials,
+                uint32_t num_pose_checks,
+                uint32_t num_pose_checks_pruned,
+                uint8_t min_led_depth,
+                uint8_t max_led_depth,
+                uint8_t max_blob_depth,
+                uint8_t best_blob_depth,
+                uint8_t best_led_depth,
+                uint32_t match_flags,
+                uint8_t leds_visible,
+                uint8_t blobs_matched,
+                uint8_t unmatched_blobs,
+                float reproj_err_px);
+
 /*! Fusion step: optical observation vs IMU-predicted state -> residual (the SLAM<->IMU
  *  drift). @p outcome: 0=rejected,1=accepted,2=reset. Poses are [px,py,pz,qx,qy,qz,qw]. */
 void

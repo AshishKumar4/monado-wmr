@@ -117,6 +117,22 @@ blobwatch_process_roi(blobwatch *bw,
                       int roi_w,
                       int roi_h,
                       blobservation **output);
+
+//! Predictive-ROI variant with caller-supplied lower thresholds. A zero threshold keeps the blobwatch
+//! default for that component.
+void
+blobwatch_process_roi_lowthresh(blobwatch *bw,
+                                struct xrt_frame *frame,
+                                uint16_t exposure,
+                                uint16_t gain,
+                                int roi_x,
+                                int roi_y,
+                                int roi_w,
+                                int roi_h,
+                                uint8_t roi_pixel_threshold,
+                                uint8_t roi_adapt_margin,
+                                uint8_t roi_required_threshold,
+                                blobservation **output);
 void
 blobwatch_update_labels(blobwatch *bw, blobservation *ob, uint8_t device_id);
 void

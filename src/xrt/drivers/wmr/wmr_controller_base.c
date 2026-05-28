@@ -1398,6 +1398,7 @@ wmr_controller_base_push_observed_leds(struct xrt_device *xdev,
 	for (size_t i = 0; i < n; i++) {
 		obs[i].observed_px = leds[i].obs_px;
 		obs[i].led_obj = leds[i].led_obj;
+		obs[i].pos_var_px2 = leds[i].pos_var_px2;
 	}
 
 	// Live HMD pose at this frame's capture time: the body-lock reference + arm-reach gate origin. Queried
@@ -1563,10 +1564,32 @@ wmr_controller_base_push_observed_pose(struct xrt_device *xdev, timepoint_ns fra
 	os_mutex_unlock(&wcb->data_lock);
 }
 
+static void
+wmr_controller_base_push_observed_position(struct xrt_device *xdev,
+                                           timepoint_ns frame_mono_ns,
+                                           const struct xrt_vec3 *position,
+                                           const struct xrt_vec3 *position_variance)
+{
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
+	if (wcb->kalman_fusion == NULL || position == NULL) {
+		return;
+	}
+
+	struct xrt_pose hmd_pose;
+	const struct xrt_pose *hmd_world_pose = wmr_controller_query_hmd_pose(wcb, frame_mono_ns, &hmd_pose);
+	const timepoint_ns fusion_ts = frame_mono_ns + wcb->ctrl_optical_td_ns;
+
+	os_mutex_lock(&wcb->data_lock);
+	kalman_fusion_process_position(wcb->kalman_fusion, fusion_ts, position, position_variance,
+	                               hmd_world_pose);
+	os_mutex_unlock(&wcb->data_lock);
+}
+
 static struct t_constellation_tracked_device_callbacks tracking_callbacks = {
     .get_led_model = wmr_controller_base_get_led_model,
     .notify_frame_received = wmr_controller_base_notify_frame,
     .push_observed_pose = wmr_controller_base_push_observed_pose,
+    .push_observed_position = wmr_controller_base_push_observed_position,
     .push_observed_leds = wmr_controller_base_push_observed_leds,
     .push_brightness_update = wmr_controller_base_push_brightness_update,
     .get_pose_uncertainty = wmr_controller_base_get_pose_uncertainty,

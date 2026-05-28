@@ -121,6 +121,19 @@ kalman_fusion_get_predicted_pose(struct KalmanFusionInterfaceWrapper *wrapper,
 	wrapper->fusion->get_predicted_pose(timestamp_ns, out_relation);
 }
 
+void
+kalman_fusion_process_position(struct KalmanFusionInterfaceWrapper *wrapper,
+                               timepoint_ns timestamp_ns,
+                               const struct xrt_vec3 *position,
+                               const struct xrt_vec3 *position_variance_optional,
+                               const struct xrt_pose *hmd_world_pose)
+{
+	if (wrapper == nullptr) {
+		return;
+	}
+	wrapper->fusion->process_position(timestamp_ns, position, position_variance_optional, hmd_world_pose);
+}
+
 bool
 kalman_fusion_predict_led_gate(struct KalmanFusionInterfaceWrapper *wrapper,
                                const struct kalman_led_observation *obs,

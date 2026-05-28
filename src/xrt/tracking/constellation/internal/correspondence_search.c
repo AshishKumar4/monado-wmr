@@ -295,6 +295,99 @@ prune_by_prior_bound(const struct cs_model_info *mi, double prior_cost, double c
 }
 
 static bool
+diagnostic_score_is_better_any(const struct pose_metrics *old_score, const struct pose_metrics *new_score)
+{
+	if (old_score->visible_leds == 0 && old_score->matched_blobs == 0) {
+		return true;
+	}
+	if (new_score->matched_blobs > old_score->matched_blobs) {
+		return true;
+	}
+	if (new_score->matched_blobs < old_score->matched_blobs) {
+		return false;
+	}
+	const float old_per_led =
+	    old_score->matched_blobs > 0 ? old_score->reprojection_error / old_score->matched_blobs : INFINITY;
+	const float new_per_led =
+	    new_score->matched_blobs > 0 ? new_score->reprojection_error / new_score->matched_blobs : INFINITY;
+	if (new_per_led < old_per_led) {
+		return true;
+	}
+	if (new_per_led > old_per_led) {
+		return false;
+	}
+	return new_score->unmatched_blobs < old_score->unmatched_blobs;
+}
+
+static bool
+search_result_duplicate(const struct correspondence_search_result *a, const struct xrt_pose *pose)
+{
+	struct xrt_vec3 dp = a->pose.position;
+	math_vec3_subtract(&pose->position, &dp);
+	double d = fabs((double)a->pose.orientation.x * pose->orientation.x +
+	                (double)a->pose.orientation.y * pose->orientation.y +
+	                (double)a->pose.orientation.z * pose->orientation.z +
+	                (double)a->pose.orientation.w * pose->orientation.w);
+	d = d > 1.0 ? 1.0 : d;
+	return m_vec3_len(dp) < 0.02 && (2.0 * acos(d)) < (5.0 * M_PI / 180.0);
+}
+
+static bool
+search_result_better(const struct correspondence_search_result *old_result,
+                     double old_prior_cost,
+                     const struct pose_metrics *new_score,
+                     double new_prior_cost)
+{
+	struct pose_metrics old_score = old_result->score;
+	struct pose_metrics score = *new_score;
+	return pose_metrics_score_is_better_pose_prior(&old_score, old_prior_cost, &score, new_prior_cost);
+}
+
+static void
+insert_search_result(struct cs_model_info *mi,
+                     const struct xrt_pose *pose,
+                     const struct pose_metrics *score,
+                     double prior_cost)
+{
+	for (int i = 0; i < mi->result_count; i++) {
+		if (search_result_duplicate(&mi->results[i], pose)) {
+			if (search_result_better(&mi->results[i], mi->result_prior_cost[i], score, prior_cost)) {
+				mi->results[i].pose = *pose;
+				mi->results[i].score = *score;
+				mi->result_prior_cost[i] = prior_cost;
+			}
+			return;
+		}
+	}
+
+	if (mi->result_count < CORRESPONDENCE_SEARCH_MAX_RESULTS) {
+		const int i = mi->result_count++;
+		mi->results[i].pose = *pose;
+		mi->results[i].score = *score;
+		mi->result_prior_cost[i] = prior_cost;
+	} else if (search_result_better(&mi->results[mi->result_count - 1],
+	                                mi->result_prior_cost[mi->result_count - 1], score, prior_cost)) {
+		const int i = mi->result_count - 1;
+		mi->results[i].pose = *pose;
+		mi->results[i].score = *score;
+		mi->result_prior_cost[i] = prior_cost;
+	}
+
+	for (int i = mi->result_count - 1; i > 0; i--) {
+		if (!search_result_better(&mi->results[i - 1], mi->result_prior_cost[i - 1], &mi->results[i].score,
+		                          mi->result_prior_cost[i])) {
+			break;
+		}
+		struct correspondence_search_result tmp = mi->results[i - 1];
+		double tmp_cost = mi->result_prior_cost[i - 1];
+		mi->results[i - 1] = mi->results[i];
+		mi->result_prior_cost[i - 1] = mi->result_prior_cost[i];
+		mi->results[i] = tmp;
+		mi->result_prior_cost[i] = tmp_cost;
+	}
+}
+
+static bool
 correspondence_search_project_pose(struct correspondence_search *cs,
                                    struct t_constellation_search_model *model,
                                    struct xrt_pose *pose,
@@ -349,9 +442,16 @@ correspondence_search_project_pose(struct correspondence_search *cs,
 	} else {
 		pose_metrics_evaluate_pose(&score, pose, cs->blobs, cs->num_points, leds, cs->calib, NULL);
 	}
+	if (diagnostic_score_is_better_any(&mi->best_any_score, &score)) {
+		mi->best_any_score = score;
+		mi->best_any_pose = *pose;
+		mi->best_any_pose_blob_depth = depth;
+		mi->best_any_pose_led_depth = mi->led_depth;
+	}
 
 	/* If this pose is any good, test it further */
 	if (POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD)) {
+		insert_search_result(mi, pose, &score, prior_cost);
 		if (pose_metrics_score_is_better_pose_prior(&mi->best_score, mi->best_prior_cost, &score,
 		                                            prior_cost)) {
 			mi->best_score = score;
@@ -809,14 +909,24 @@ search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi
 
 	/* clear the info for this model */
 	memset(&mi->best_score, 0, sizeof(struct pose_metrics));
+	memset(&mi->best_any_score, 0, sizeof(struct pose_metrics));
+	mi->best_any_pose_blob_depth = -1;
+	mi->best_any_pose_led_depth = -1;
 	mi->best_prior_cost = 0.0;
 	mi->best_combined_cost = 0.0;
 	mi->best_cost_per_led = 0.0;
 	mi->best_orient_err_len = 0.0;
 	mi->match_flags = 0;
+	mi->result_count = 0;
 
 	/* Clear stats */
 	cs->num_trials = cs->num_pose_checks = cs->num_pose_checks_pruned = 0;
+	memset(&cs->last_diag, 0, sizeof(cs->last_diag));
+	cs->last_diag.input_blobs = (uint32_t)cs->num_points;
+	cs->last_diag.best_pose_blob_depth = -1;
+	cs->last_diag.best_pose_led_depth = -1;
+	cs->last_diag.best_any_pose_blob_depth = -1;
+	cs->last_diag.best_any_pose_led_depth = -1;
 
 	/* Configure search params from the flags */
 	if (mi->search_flags & CS_FLAG_SHALLOW_SEARCH) {
@@ -833,6 +943,9 @@ search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi
 		mi->max_blob_depth = MAX_BLOB_SEARCH_DEPTH;
 		mi->max_led_depth = MAX_LED_SEARCH_DEPTH;
 	}
+	cs->last_diag.min_led_depth = mi->min_led_depth;
+	cs->last_diag.max_led_depth = mi->max_led_depth;
+	cs->last_diag.max_blob_depth = mi->max_blob_depth;
 
 #if DUMP_TIMING
 	/* Set the search start time */
@@ -848,6 +961,7 @@ search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi
 
 		if ((mi->search_flags & CS_FLAG_MATCH_ALL_BLOBS) || led_id == LED_INVALID_ID ||
 		    LED_OBJECT_ID(led_id) == mi->id) {
+			cs->last_diag.searchable_anchors++;
 			for (in_index = 0; in_index < cs->num_points && out_index < MAX_BLOB_SEARCH_DEPTH; in_index++) {
 				struct cs_image_point *p = all_neighbours[in_index];
 
@@ -860,8 +974,14 @@ search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi
 				    LED_OBJECT_ID(led_id) == mi->id)
 					anchor->neighbours[out_index++] = p;
 			}
+		} else {
+			cs->last_diag.filtered_anchors++;
 		}
 		anchor->num_neighbours = out_index;
+		cs->last_diag.neighbour_links += (uint32_t)out_index;
+		if (out_index >= 3) {
+			cs->last_diag.anchors_with_3_neighbours++;
+		}
 
 #if DUMP_FULL_LOG
 		printf("Model %d, blob %d @ %f,%f neighbours %d Search list:\n", mi->id, b, anchor->blob->x,
@@ -892,6 +1012,25 @@ search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi
 		return true;
 
 	return false;
+}
+
+static void
+finish_search_diagnostics(struct correspondence_search *cs, const struct cs_model_info *mi)
+{
+	cs->last_diag.num_trials = cs->num_trials;
+	cs->last_diag.num_pose_checks = cs->num_pose_checks;
+	cs->last_diag.num_pose_checks_pruned = cs->num_pose_checks_pruned;
+	cs->last_diag.best_pose_blob_depth = mi->best_pose_blob_depth;
+	cs->last_diag.best_pose_led_depth = mi->best_pose_led_depth;
+	cs->last_diag.best_any_pose_blob_depth = mi->best_any_pose_blob_depth;
+	cs->last_diag.best_any_pose_led_depth = mi->best_any_pose_led_depth;
+	cs->last_diag.best_any_score = mi->best_any_score;
+	cs->last_diag.best_any_pose = mi->best_any_pose;
+	cs->last_diag.best_any_match_flags = mi->best_any_score.match_flags;
+	cs->last_diag.best_any_leds_visible = mi->best_any_score.visible_leds;
+	cs->last_diag.best_any_blobs_matched = mi->best_any_score.matched_blobs;
+	cs->last_diag.best_any_unmatched_blobs = mi->best_any_score.unmatched_blobs;
+	cs->last_diag.best_any_reproj_err_px = mi->best_any_score.reprojection_error;
 }
 
 bool
@@ -943,6 +1082,7 @@ correspondence_search_find_one_pose(struct correspondence_search *cs,
 	}
 
 	if (search_pose_for_model(cs, &mi) && (mi.match_flags & POSE_MATCH_GOOD)) {
+		finish_search_diagnostics(cs, &mi);
 		*pose = mi.best_pose;
 		*score = mi.best_score;
 
@@ -958,7 +1098,81 @@ correspondence_search_find_one_pose(struct correspondence_search *cs,
 		return true;
 	}
 
+	finish_search_diagnostics(cs, &mi);
 	*pose = mi.best_pose;
 	*score = mi.best_score;
 	return false;
+}
+
+int
+correspondence_search_find_pose_candidates(struct correspondence_search *cs,
+                                           struct t_constellation_search_model *model,
+                                           enum correspondence_search_flags search_flags,
+                                           struct xrt_pose *pose,
+                                           struct xrt_vec3 *pos_error_thresh,
+                                           struct xrt_vec3 *rot_error_thresh,
+                                           struct xrt_vec3 *up_vector,
+                                           float sigma_tilt_rad,
+                                           float sigma_yaw_rad,
+                                           float huber_knee_sigma,
+                                           float cost_weight,
+                                           struct correspondence_search_result *results,
+                                           int max_results)
+{
+	assert(pose != NULL);
+	assert(results != NULL || max_results == 0);
+
+	if (max_results <= 0) {
+		return 0;
+	}
+	if (max_results > CORRESPONDENCE_SEARCH_MAX_RESULTS) {
+		max_results = CORRESPONDENCE_SEARCH_MAX_RESULTS;
+	}
+	if ((search_flags & (CS_FLAG_SHALLOW_SEARCH | CS_FLAG_DEEP_SEARCH)) == 0) {
+		search_flags |= CS_FLAG_SHALLOW_SEARCH | CS_FLAG_DEEP_SEARCH;
+	}
+
+	struct cs_model_info mi;
+	mi.id = model->id;
+	mi.model = model;
+	mi.search_flags = search_flags;
+	mi.match_flags = 0;
+
+	if (search_flags & CS_FLAG_HAVE_POSE_PRIOR) {
+		assert(pos_error_thresh != NULL);
+		assert(rot_error_thresh != NULL);
+		mi.pose_prior = *pose;
+		mi.pos_error_thresh = pos_error_thresh;
+		mi.rot_error_thresh = rot_error_thresh;
+	}
+
+	if (search_flags & CS_FLAG_TRUST_PRIOR_ORIENT) {
+		assert((search_flags & CS_FLAG_HAVE_POSE_PRIOR) != 0);
+		assert(up_vector != NULL);
+		mi.up_vector = *up_vector;
+		mi.sigma_tilt_rad = sigma_tilt_rad;
+		mi.sigma_yaw_rad = sigma_yaw_rad;
+		mi.huber_knee_sigma = huber_knee_sigma;
+		mi.cost_weight = cost_weight;
+	}
+
+	search_pose_for_model(cs, &mi);
+	finish_search_diagnostics(cs, &mi);
+	const int n = mi.result_count < max_results ? mi.result_count : max_results;
+	for (int i = 0; i < n; i++) {
+		results[i] = mi.results[i];
+	}
+	if (n > 0) {
+		*pose = results[0].pose;
+	}
+	return n;
+}
+
+void
+correspondence_search_get_last_diagnostics(struct correspondence_search *cs,
+                                           struct correspondence_search_diagnostics *out_diag)
+{
+	assert(cs != NULL);
+	assert(out_diag != NULL);
+	*out_diag = cs->last_diag;
 }

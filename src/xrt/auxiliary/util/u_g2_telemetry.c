@@ -102,6 +102,67 @@ struct g2_telem_pose_attempt
 	float qx, qy, qz, qw;
 } G2_PACKED;
 
+//! candidate stream row: front-end candidate/twin/ranking diagnostics.
+struct g2_telem_candidate
+{
+	uint64_t t_mono_ns;
+	uint64_t hw_ts_ns;
+	uint8_t device_id;
+	uint8_t cam_id;
+	uint8_t stage;
+	uint8_t candidate;
+	uint8_t selected;
+	uint8_t had_twin;
+	uint8_t outcome;
+	uint8_t prior_tilt_trusted;
+	uint8_t leds_visible;
+	uint8_t blobs_matched;
+	uint8_t unmatched_blobs;
+	uint8_t inliers;
+	uint32_t match_flags;
+	float reproj_err_px;
+	float prior_cost;
+	float total_cost;
+	float yaw_sigma_rad;
+	float tilt_err_rad;
+	float yaw_err_rad;
+	float prior_pos_err_x, prior_pos_err_y, prior_pos_err_z;
+	float prior_rot_err_x, prior_rot_err_y, prior_rot_err_z;
+	float px, py, pz;
+	float qx, qy, qz, qw;
+} G2_PACKED;
+
+//! search stream row: one correspondence-search pass, including failed passes.
+struct g2_telem_search
+{
+	uint64_t t_mono_ns;
+	uint64_t hw_ts_ns;
+	uint8_t device_id;
+	uint8_t cam_id;
+	uint8_t pass;
+	uint8_t result;
+	uint16_t search_flags;
+	uint8_t prior_tilt_trusted;
+	uint32_t input_blobs;
+	uint32_t searchable_anchors;
+	uint32_t filtered_anchors;
+	uint32_t anchors_with_3_neighbours;
+	uint32_t neighbour_links;
+	uint32_t num_trials;
+	uint32_t num_pose_checks;
+	uint32_t num_pose_checks_pruned;
+	uint8_t min_led_depth;
+	uint8_t max_led_depth;
+	uint8_t max_blob_depth;
+	uint8_t best_blob_depth;
+	uint8_t best_led_depth;
+	uint32_t match_flags;
+	uint8_t leds_visible;
+	uint8_t blobs_matched;
+	uint8_t unmatched_blobs;
+	float reproj_err_px;
+} G2_PACKED;
+
 //! fusion stream row. Pose components are stored as named scalar f32 fields (not
 //! arrays) so the manifest emits only scalar types the Python consumer parses.
 struct g2_telem_fusion
@@ -152,6 +213,8 @@ enum g2_telem_event_type
 	G2_TELEM_EV_PARTIAL_FOLD_COUNT = 9, //!< value = number of LEDs gate-folded this frame
 	G2_TELEM_EV_LABEL_PROPAGATED = 10,  //!< value = number of LEDs label-propagated from the predicted pose
 	G2_TELEM_EV_JOINT_PNP = 11,         //!< value = number of contributing cameras in a joint multi-cam PnP solve
+	G2_TELEM_EV_ASSOC_LOCKABLE_NOT_CHOSEN = 12, //!< value = shared-blob conflicts against selected hypotheses
+	G2_TELEM_EV_ASSOC_LOCK_COMMIT_FAILED = 13,  //!< value = matched blobs that survived exact commit
 };
 
 //! Stream ids, used as the value of a ring_overflow event and to index internals.
@@ -160,10 +223,12 @@ enum g2_telem_stream
 	G2_TELEM_STREAM_IMU = 0,
 	G2_TELEM_STREAM_FRAME = 1,
 	G2_TELEM_STREAM_POSE_ATTEMPT = 2,
-	G2_TELEM_STREAM_FUSION = 3,
-	G2_TELEM_STREAM_EVENT = 4,
-	G2_TELEM_STREAM_HEAD_POSE = 5,
-	G2_TELEM_STREAM_COUNT = 6,
+	G2_TELEM_STREAM_CANDIDATE = 3,
+	G2_TELEM_STREAM_SEARCH = 4,
+	G2_TELEM_STREAM_FUSION = 5,
+	G2_TELEM_STREAM_EVENT = 6,
+	G2_TELEM_STREAM_HEAD_POSE = 7,
+	G2_TELEM_STREAM_COUNT = 8,
 };
 
 
@@ -219,6 +284,43 @@ static const struct g2_field pose_attempt_fields[] = {
     F(g2_telem_pose_attempt, qz, "f32"), F(g2_telem_pose_attempt, qw, "f32"),
 };
 
+static const struct g2_field candidate_fields[] = {
+    F(g2_telem_candidate, t_mono_ns, "u64"), F(g2_telem_candidate, hw_ts_ns, "u64"),
+    F(g2_telem_candidate, device_id, "u8"), F(g2_telem_candidate, cam_id, "u8"),
+    F(g2_telem_candidate, stage, "u8"), F(g2_telem_candidate, candidate, "u8"),
+    F(g2_telem_candidate, selected, "u8"), F(g2_telem_candidate, had_twin, "u8"),
+    F(g2_telem_candidate, outcome, "u8"), F(g2_telem_candidate, prior_tilt_trusted, "u8"),
+    F(g2_telem_candidate, leds_visible, "u8"), F(g2_telem_candidate, blobs_matched, "u8"),
+    F(g2_telem_candidate, unmatched_blobs, "u8"), F(g2_telem_candidate, inliers, "u8"),
+    F(g2_telem_candidate, match_flags, "u32"), F(g2_telem_candidate, reproj_err_px, "f32"),
+    F(g2_telem_candidate, prior_cost, "f32"), F(g2_telem_candidate, total_cost, "f32"),
+    F(g2_telem_candidate, yaw_sigma_rad, "f32"), F(g2_telem_candidate, tilt_err_rad, "f32"),
+    F(g2_telem_candidate, yaw_err_rad, "f32"),
+    F(g2_telem_candidate, prior_pos_err_x, "f32"), F(g2_telem_candidate, prior_pos_err_y, "f32"),
+    F(g2_telem_candidate, prior_pos_err_z, "f32"),
+    F(g2_telem_candidate, prior_rot_err_x, "f32"), F(g2_telem_candidate, prior_rot_err_y, "f32"),
+    F(g2_telem_candidate, prior_rot_err_z, "f32"),
+    F(g2_telem_candidate, px, "f32"), F(g2_telem_candidate, py, "f32"), F(g2_telem_candidate, pz, "f32"),
+    F(g2_telem_candidate, qx, "f32"), F(g2_telem_candidate, qy, "f32"), F(g2_telem_candidate, qz, "f32"),
+    F(g2_telem_candidate, qw, "f32"),
+};
+
+static const struct g2_field search_fields[] = {
+    F(g2_telem_search, t_mono_ns, "u64"), F(g2_telem_search, hw_ts_ns, "u64"),
+    F(g2_telem_search, device_id, "u8"), F(g2_telem_search, cam_id, "u8"),
+    F(g2_telem_search, pass, "u8"), F(g2_telem_search, result, "u8"),
+    F(g2_telem_search, search_flags, "u16"), F(g2_telem_search, prior_tilt_trusted, "u8"),
+    F(g2_telem_search, input_blobs, "u32"), F(g2_telem_search, searchable_anchors, "u32"),
+    F(g2_telem_search, filtered_anchors, "u32"), F(g2_telem_search, anchors_with_3_neighbours, "u32"),
+    F(g2_telem_search, neighbour_links, "u32"), F(g2_telem_search, num_trials, "u32"),
+    F(g2_telem_search, num_pose_checks, "u32"), F(g2_telem_search, num_pose_checks_pruned, "u32"),
+    F(g2_telem_search, min_led_depth, "u8"), F(g2_telem_search, max_led_depth, "u8"),
+    F(g2_telem_search, max_blob_depth, "u8"), F(g2_telem_search, best_blob_depth, "u8"),
+    F(g2_telem_search, best_led_depth, "u8"), F(g2_telem_search, match_flags, "u32"),
+    F(g2_telem_search, leds_visible, "u8"), F(g2_telem_search, blobs_matched, "u8"),
+    F(g2_telem_search, unmatched_blobs, "u8"), F(g2_telem_search, reproj_err_px, "f32"),
+};
+
 static const struct g2_field fusion_fields[] = {
     F(g2_telem_fusion, t_mono_ns, "u64"), F(g2_telem_fusion, device_id, "u8"), F(g2_telem_fusion, outcome, "u8"),
     F(g2_telem_fusion, pos_residual_m, "f32"), F(g2_telem_fusion, rot_residual_deg, "f32"),
@@ -253,6 +355,10 @@ static const struct g2_stream_desc g2_descs[G2_TELEM_STREAM_COUNT] = {
                                NF(frame_fields)},
     [G2_TELEM_STREAM_POSE_ATTEMPT] = {"pose_attempt", "pose_attempt.bin", sizeof(struct g2_telem_pose_attempt), 65536,
                                       pose_attempt_fields, NF(pose_attempt_fields)},
+    [G2_TELEM_STREAM_CANDIDATE] = {"candidate", "candidate.bin", sizeof(struct g2_telem_candidate), 131072,
+                                   candidate_fields, NF(candidate_fields)},
+    [G2_TELEM_STREAM_SEARCH] = {"search", "search.bin", sizeof(struct g2_telem_search), 131072, search_fields,
+                                NF(search_fields)},
     [G2_TELEM_STREAM_FUSION] = {"fusion", "fusion.bin", sizeof(struct g2_telem_fusion), 65536, fusion_fields,
                                 NF(fusion_fields)},
     [G2_TELEM_STREAM_EVENT] = {"event", "event.bin", sizeof(struct g2_telem_event), 8192, event_fields,
@@ -852,6 +958,138 @@ g2_telem_pose_attempt(uint8_t device_id,
 		row.qw = pose[6];
 	}
 	(void)ring_emit(&g_telem.rings[G2_TELEM_STREAM_POSE_ATTEMPT], &row);
+}
+
+void
+g2_telem_candidate(uint8_t device_id,
+                   uint8_t cam_id,
+                   uint64_t ts_ns,
+                   uint8_t stage,
+                   uint8_t candidate,
+                   uint8_t selected,
+                   uint8_t had_twin,
+                   uint8_t outcome,
+                   uint32_t match_flags,
+                   uint8_t leds_visible,
+                   uint8_t blobs_matched,
+                   uint8_t unmatched_blobs,
+                   uint8_t inliers,
+                   float reproj_err_px,
+                   float prior_cost,
+                   float total_cost,
+                   uint8_t prior_tilt_trusted,
+                   float yaw_sigma_rad,
+                   float tilt_err_rad,
+                   float yaw_err_rad,
+                   const float prior_pos_err[3],
+                   const float prior_rot_err[3],
+                   const float pose[7])
+{
+	if (!g2_telem_enabled()) {
+		return;
+	}
+	struct g2_telem_candidate row = {0};
+	row.t_mono_ns = ts_ns;
+	row.hw_ts_ns = ts_ns;
+	row.device_id = device_id;
+	row.cam_id = cam_id;
+	row.stage = stage;
+	row.candidate = candidate;
+	row.selected = selected;
+	row.had_twin = had_twin;
+	row.outcome = outcome;
+	row.prior_tilt_trusted = prior_tilt_trusted;
+	row.leds_visible = leds_visible;
+	row.blobs_matched = blobs_matched;
+	row.unmatched_blobs = unmatched_blobs;
+	row.inliers = inliers;
+	row.match_flags = match_flags;
+	row.reproj_err_px = reproj_err_px;
+	row.prior_cost = prior_cost;
+	row.total_cost = total_cost;
+	row.yaw_sigma_rad = yaw_sigma_rad;
+	row.tilt_err_rad = tilt_err_rad;
+	row.yaw_err_rad = yaw_err_rad;
+	if (prior_pos_err != NULL) {
+		row.prior_pos_err_x = prior_pos_err[0];
+		row.prior_pos_err_y = prior_pos_err[1];
+		row.prior_pos_err_z = prior_pos_err[2];
+	}
+	if (prior_rot_err != NULL) {
+		row.prior_rot_err_x = prior_rot_err[0];
+		row.prior_rot_err_y = prior_rot_err[1];
+		row.prior_rot_err_z = prior_rot_err[2];
+	}
+	if (pose != NULL) {
+		row.px = pose[0];
+		row.py = pose[1];
+		row.pz = pose[2];
+		row.qx = pose[3];
+		row.qy = pose[4];
+		row.qz = pose[5];
+		row.qw = pose[6];
+	}
+	(void)ring_emit(&g_telem.rings[G2_TELEM_STREAM_CANDIDATE], &row);
+}
+
+void
+g2_telem_search(uint8_t device_id,
+                uint8_t cam_id,
+                uint64_t ts_ns,
+                uint8_t pass,
+                uint8_t result,
+                uint16_t search_flags,
+                uint8_t prior_tilt_trusted,
+                uint32_t input_blobs,
+                uint32_t searchable_anchors,
+                uint32_t filtered_anchors,
+                uint32_t anchors_with_3_neighbours,
+                uint32_t neighbour_links,
+                uint32_t num_trials,
+                uint32_t num_pose_checks,
+                uint32_t num_pose_checks_pruned,
+                uint8_t min_led_depth,
+                uint8_t max_led_depth,
+                uint8_t max_blob_depth,
+                uint8_t best_blob_depth,
+                uint8_t best_led_depth,
+                uint32_t match_flags,
+                uint8_t leds_visible,
+                uint8_t blobs_matched,
+                uint8_t unmatched_blobs,
+                float reproj_err_px)
+{
+	if (!g2_telem_enabled()) {
+		return;
+	}
+	struct g2_telem_search row = {0};
+	row.t_mono_ns = ts_ns;
+	row.hw_ts_ns = ts_ns;
+	row.device_id = device_id;
+	row.cam_id = cam_id;
+	row.pass = pass;
+	row.result = result;
+	row.search_flags = search_flags;
+	row.prior_tilt_trusted = prior_tilt_trusted;
+	row.input_blobs = input_blobs;
+	row.searchable_anchors = searchable_anchors;
+	row.filtered_anchors = filtered_anchors;
+	row.anchors_with_3_neighbours = anchors_with_3_neighbours;
+	row.neighbour_links = neighbour_links;
+	row.num_trials = num_trials;
+	row.num_pose_checks = num_pose_checks;
+	row.num_pose_checks_pruned = num_pose_checks_pruned;
+	row.min_led_depth = min_led_depth;
+	row.max_led_depth = max_led_depth;
+	row.max_blob_depth = max_blob_depth;
+	row.best_blob_depth = best_blob_depth;
+	row.best_led_depth = best_led_depth;
+	row.match_flags = match_flags;
+	row.leds_visible = leds_visible;
+	row.blobs_matched = blobs_matched;
+	row.unmatched_blobs = unmatched_blobs;
+	row.reproj_err_px = reproj_err_px;
+	(void)ring_emit(&g_telem.rings[G2_TELEM_STREAM_SEARCH], &row);
 }
 
 void

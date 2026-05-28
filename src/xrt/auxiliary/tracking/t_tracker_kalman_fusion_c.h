@@ -27,6 +27,7 @@ struct kalman_led_observation
 {
 	struct xrt_vec2 observed_px; //!< measured blob centroid (undistorted, normalized image coords)
 	struct xrt_vec3 led_obj;     //!< LED position in the object frame (caller applies any frame flip)
+	float pos_var_px2;          //!< optional isotropic centroid variance; <= 0 uses the fusion default
 };
 
 //! Pinhole camera + world->camera extrinsic for one constellation view. For normalized observations
@@ -64,6 +65,15 @@ kalman_fusion_process_pose(struct KalmanFusionInterfaceWrapper *wrapper,
                            const struct xrt_vec3 *orientation_variance_optional,
                            float residual_limit,
                            const struct xrt_pose *hmd_world_pose);
+
+//! Position-only optical observation for frames where visual evidence constrains translation but orientation is
+//! ambiguous. Does not directly change orientation.
+void
+kalman_fusion_process_position(struct KalmanFusionInterfaceWrapper *wrapper,
+                               timepoint_ns timestamp_ns,
+                               const struct xrt_vec3 *position,
+                               const struct xrt_vec3 *position_variance_optional,
+                               const struct xrt_pose *hmd_world_pose);
 
 //! Tightly-coupled per-LED optical update (the ESKF feed). @p feed=false runs a read-only diagnostic
 //! (computes the per-LED reprojection RMS vs the current pose) instead of folding — used to verify

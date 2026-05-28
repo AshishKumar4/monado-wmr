@@ -22,6 +22,7 @@ extern "C" {
 #endif
 
 #define MAX_BLOB_SEARCH_DEPTH 5
+#define CORRESPONDENCE_SEARCH_MAX_RESULTS 8
 
 enum correspondence_search_flags
 {
@@ -55,6 +56,12 @@ struct cs_image_point
 	struct cs_image_point *neighbours[MAX_BLOB_SEARCH_DEPTH];
 };
 
+struct correspondence_search_result
+{
+	struct xrt_pose pose;
+	struct pose_metrics score;
+};
+
 struct cs_model_info
 {
 	int id;
@@ -69,6 +76,13 @@ struct cs_model_info
 
 	struct pose_metrics best_score;
 	double best_prior_cost; /* soft prior penalty (px^2) of best_pose; folded into the candidate ranking */
+	struct pose_metrics best_any_score;
+	struct xrt_pose best_any_pose;
+	int best_any_pose_blob_depth;
+	int best_any_pose_led_depth;
+	int result_count;
+	struct correspondence_search_result results[CORRESPONDENCE_SEARCH_MAX_RESULTS];
+	double result_prior_cost[CORRESPONDENCE_SEARCH_MAX_RESULTS];
 
 	/* Admissible-bound prune state, cached when best_pose updates (CS_FLAG_TRUST_PRIOR_ORIENT). A new
 	 * candidate's prior penalty alone lower-bounds its combined cost (reproj >= 0), so a candidate whose
@@ -105,6 +119,32 @@ struct cs_model_info
 	float cost_weight;
 };
 
+struct correspondence_search_diagnostics
+{
+	uint32_t input_blobs;
+	uint32_t searchable_anchors;
+	uint32_t filtered_anchors;
+	uint32_t anchors_with_3_neighbours;
+	uint32_t neighbour_links;
+	uint32_t num_trials;
+	uint32_t num_pose_checks;
+	uint32_t num_pose_checks_pruned;
+	int32_t min_led_depth;
+	int32_t max_led_depth;
+	int32_t max_blob_depth;
+	int32_t best_pose_blob_depth;
+	int32_t best_pose_led_depth;
+	int32_t best_any_pose_blob_depth;
+	int32_t best_any_pose_led_depth;
+	struct pose_metrics best_any_score;
+	struct xrt_pose best_any_pose;
+	uint32_t best_any_match_flags;
+	uint32_t best_any_leds_visible;
+	uint32_t best_any_blobs_matched;
+	uint32_t best_any_unmatched_blobs;
+	float best_any_reproj_err_px;
+};
+
 struct correspondence_search
 {
 	int num_points;
@@ -119,6 +159,8 @@ struct correspondence_search
 
 	/* List of the nearest blobs for each blob */
 	struct cs_image_point *blob_neighbours[MAX_BLOBS_PER_FRAME][MAX_BLOBS_PER_FRAME];
+
+	struct correspondence_search_diagnostics last_diag;
 };
 
 struct correspondence_search *
@@ -142,6 +184,23 @@ correspondence_search_find_one_pose(struct correspondence_search *cs,
                                     float huber_knee_sigma,
                                     float cost_weight,
                                     struct pose_metrics *score);
+int
+correspondence_search_find_pose_candidates(struct correspondence_search *cs,
+                                           struct t_constellation_search_model *model,
+                                           enum correspondence_search_flags search_flags,
+                                           struct xrt_pose *pose,
+                                           struct xrt_vec3 *pos_error_thresh,
+                                           struct xrt_vec3 *rot_error_thresh,
+                                           struct xrt_vec3 *up_vector,
+                                           float sigma_tilt_rad,
+                                           float sigma_yaw_rad,
+                                           float huber_knee_sigma,
+                                           float cost_weight,
+                                           struct correspondence_search_result *results,
+                                           int max_results);
+void
+correspondence_search_get_last_diagnostics(struct correspondence_search *cs,
+                                           struct correspondence_search_diagnostics *out_diag);
 bool
 correspondence_search_have_pose(struct correspondence_search *cs,
                                 int model_id,

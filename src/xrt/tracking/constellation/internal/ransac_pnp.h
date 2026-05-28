@@ -55,6 +55,14 @@ ransac_pnp_pose_with_twin(struct xrt_pose *pose,
                           struct xrt_pose *twin,
                           bool *has_twin);
 
+int
+pnp_solve_p3p(struct blob *blobs,
+              int num_blobs,
+              struct t_constellation_led_model *leds_model,
+              struct camera_model *calib,
+              struct xrt_pose *out_poses,
+              int max_out);
+
 #else
 static inline bool
 ransac_pnp_pose(struct xrt_pose *pose,
@@ -98,6 +106,23 @@ ransac_pnp_pose_with_twin(struct xrt_pose *pose,
 		*has_twin = false;
 	}
 	return false;
+}
+
+static inline int
+pnp_solve_p3p(struct blob *blobs,
+              int num_blobs,
+              struct t_constellation_led_model *leds_model,
+              struct camera_model *calib,
+              struct xrt_pose *out_poses,
+              int max_out)
+{
+	(void)blobs;
+	(void)num_blobs;
+	(void)leds_model;
+	(void)calib;
+	(void)out_poses;
+	(void)max_out;
+	return 0;
 }
 #endif /* HAVE_OPENCV */
 
