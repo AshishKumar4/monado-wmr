@@ -112,7 +112,14 @@ namespace {
 	//! Re-entry ease: on re-acquisition, slide the reported position to the fresh fold over this window; only
 	//! a jump >= REENTRY_MIN_SNAP_M is eased (smaller ones pass through).
 	constexpr int64_t REENTRY_WINDOW_NS = ms_to_ns(120);
-	constexpr double REENTRY_MAX_STEP_M = 0.05; //!< per-frame position cap during the ease
+	constexpr double REENTRY_MAX_STEP_M = 0.05; //!< per-frame position cap during the ease (rate floor)
+	//! Time-scaled re-entry slide cap: the per-step position cap is max(REENTRY_MAX_STEP_M,
+	//! REENTRY_MAX_SPEED_M_S·dt). A FIXED per-frame cap stalls the ease at a low render/replay rate
+	//! (large dt) — the report then lags the fresh fold for several frames and the lag itself reads as
+	//! a snap when it finally catches up. Scaling by dt keeps the slide a bounded VELOCITY (≤4 m/s,
+	//! hand-plausible) regardless of call rate, so the ease completes in ~constant wall-time and never
+	//! degenerates into a delayed jump. Convergent with the g2-codex-global-reconciled re-entry fix.
+	constexpr double REENTRY_MAX_SPEED_M_S = 4.0;
 	constexpr double REENTRY_MIN_SNAP_M = 0.05; //!< only ease jumps at/above this
 	//! Same ease applied to orientation on the manifold (SLERP from the last reported orient to the fresh
 	//! fold orient). MAX_STEP_RAD = ~5.7°/frame caps the angular slide; MIN_SNAP_RAD ~5° matches the
@@ -497,6 +504,7 @@ namespace {
 		timepoint_ns filter_time_ns{0};
 		timepoint_ns last_imu_ns{0};
 			timepoint_ns last_optical_ns{0};
+			timepoint_ns last_orient_agree_ns{0};
 			timepoint_ns last_led_fold_ns{0};
 			timepoint_ns prev_capture_optical_ns{0};
 			timepoint_ns last_body_anchor_ns{0};
@@ -898,13 +906,21 @@ namespace {
 		//! during them the few-LED PnP keeps proposing mirror flips. Trusting the gyro this long rejects
 		//! those flips through the gap; past it (a true re-acquisition) the optical orientation is adopted.
 		static constexpr int64_t FLIP_GUARD_TRUST_NS = ms_to_ns(3000);
+		//! Flip-veto LOCK-IN release. The gyro flip-veto keeps the filter orientation only while the gyro
+		//! has been RECENTLY CONFIRMED by an AGREEING optical (disagreement <= FLIP_REJECT_RAD); we track the
+		//! last such agreement. If optical instead DISAGREES continuously for longer than this, the filter —
+		//! not optical — is the outlier (a bad seed drove the gyro orientation into a wrong basin while its
+		//! own optical kept reporting correctly), so the veto RELEASES and the optical orientation is adopted
+		//! (re-seed), breaking the lock-in. A transient one-off flip (brief disagreement, well under this)
+		//! is still vetoed. Shorter than FLIP_GUARD_TRUST_NS so the release can engage before the gyro-fresh
+		//! window itself lapses; longer than a few optical frames (empirically the normal optical op interval
+		//! is <=~p99 333 ms) so a momentary flip never trips it.
+		static constexpr int64_t FLIP_LOCKIN_RELEASE_NS = ms_to_ns(500);
 		//! How long the out-of-view body-lock hold may keep reporting POSITION_TRACKED before the controller
-		//! is declared abandoned (set down) and dropped to UNTRACKED. The hold rides brief occlusion (fix,
-		//! don't reject); past this it would be a lie. Sized at 2x the routine-occlusion ceiling (optical
-		//! dropouts during fast play are routinely <= FLIP_GUARD_TRUST_NS = 3 s), so a fast Beat Saber /
-		//! room-roam controller out of view at arm's reach for short bursts always keeps tracking, and only a
-		//! genuinely set-down one (out of view this long) drops.
-		static constexpr int64_t BODY_LOCK_ABANDON_NS = 2 * FLIP_GUARD_TRUST_NS;
+		//! is declared abandoned (set down) and dropped to UNTRACKED. The hold rides brief occlusion; beyond
+		//! this the captured sessions show decimetre-scale stale-body errors, so keeping POSITION_TRACKED is
+		//! a lie even though we still report a valid held pose for visual continuity.
+		static constexpr int64_t BODY_LOCK_ABANDON_NS = ms_to_ns(2000);
 		//! Hard physical sanity bound on the controller-to-HMD distance. An LED-constellation-tracked
 		//! controller is within the head cameras' range — physically a head-relative arm's reach — so a
 		//! candidate whose distance FROM THE LIVE HMD exceeds this is a degenerate few-blob PnP, never a
@@ -914,6 +930,20 @@ namespace {
 		//! origin is never wrongly rejected. Generous (full extension + slack) so it only catches artifacts.
 		//! Also the report runaway-safety bound: a report beyond it is a degenerate solve, clamped + untracked.
 		static constexpr double MAX_CONTROLLER_REACH_M = 1.5;
+		//! Covariance-and-time-scaled reachability bound for ADMITTING a PnP pose as the re-anchor
+		//! cache (m_pnp_pose). m_pnp_pose is the target process_led_observations snaps onto when the
+		//! per-LED fold detects divergence; a single discontinuous PnP solve that becomes the cache
+		//! poisons every snap until the next good commit (the felt teleport). This bound = how far the
+		//! controller could PLAUSIBLY have moved from the last optically-anchored position in the
+		//! elapsed dt, given its current speed, a generous max accel, and the filter's own position
+		//! uncertainty (3σ). Unlike a fixed radius it SELF-WIDENS through a dropout (dt grows, P
+		//! inflates) so a real re-acquisition is always admitted, while a same-frame jump to an
+		//! implausible point is held out of the cache. Reanchor still happens — just never onto a
+		//! solve the controller couldn't have reached.
+		static constexpr double REANCHOR_CACHE_MAX_SPEED_M_S = 8.0;
+		static constexpr double REANCHOR_CACHE_MAX_ACCEL_M_S2 = 80.0;
+		static constexpr double REANCHOR_CACHE_SLACK_M = 0.12;
+		static constexpr double REANCHOR_CACHE_SIGMA = 3.0;
 		//! Out-of-view REPORT bound: a body-anchored controller is within an arm of the head, so the reported
 		//! (dead-reckon-drifting) position is held to this. Report-only — the matcher reads the raw state.
 		/* Max plausible controller-to-head distance when optical is stale; clamps body-anchored
@@ -959,6 +989,11 @@ namespace {
 		int m_imu_anomaly_count{0};
 
 		timepoint_ns last_optical_ns{0};
+		//! Time optical orientation last AGREED with the gyro-propagated filter (disagreement <=
+		//! FLIP_REJECT_RAD). Unlike last_optical_ns (which advances on EVERY optical op, including flip-
+		//! REJECTED ones), this advances only on AGREEMENT, so a sustained disagreement ages it out and
+		//! releases the flip-veto (see FLIP_LOCKIN_RELEASE_NS / reject_orientation_flip).
+		timepoint_ns m_last_orient_agree_ns{0};
 		Vector3d last_good_position{0, 0, 0};
 		//! Time of the last successful per-LED fold; gates process_pose's measurement mode (see above).
 		timepoint_ns m_last_led_fold_ns{0};
@@ -1082,11 +1117,19 @@ namespace {
 		bootstrap_from_pose(const xrt_pose &pose);
 		void
 		reanchor(const Vector3d &p, const Quaterniond &q);
-		//! Gyro arbitration: return @p cand unless it is a likely optical mirror-flip — i.e. the gyro is
-		//! fresh (optical recent) AND @p cand disagrees with the gyro-propagated orientation by more than
-		//! FLIP_REJECT_RAD; in that case return the current (gyro) orientation so a flip cannot be adopted.
+		//! The gyro flip-veto DECISION (single source of truth for every flip-arbitration site). Returns true
+		//! iff @p cand should be rejected as a likely optical mirror-flip and the gyro orientation @p q_filter
+		//! kept. A flip is vetoed only while the gyro is fresh (optical recent) AND was confirmed by an
+		//! agreeing optical within FLIP_LOCKIN_RELEASE_NS; a SUSTAINED disagreement past that releases the
+		//! veto (the filter, not optical, is the outlier — adopt/re-seed optical), breaking a wrong-yaw
+		//! lock-in. Records the agreement time (m_last_orient_agree_ns = @p when_ns) whenever cand agrees, so
+		//! the release clock measures the disagreement run. Caller holds m_filter_lock.
+		bool
+		reject_orientation_flip(const Quaterniond &cand, const Quaterniond &q_filter, timepoint_ns when_ns);
+		//! Gyro arbitration helper: return @p cand unless reject_orientation_flip vetoes it, in which case
+		//! return the current gyro orientation so a flip cannot be adopted. Caller holds m_filter_lock.
 		Quaterniond
-		flip_guard(const Quaterniond &cand) const;
+		flip_guard(const Quaterniond &cand);
 		//! Fold an accel gravity-direction measurement (anchors roll+pitch) when the bias-corrected
 		//! body accel magnitude is within GRAV_BAND of g, i.e. linear acceleration is small enough that
 		//! the accel direction is the gravity direction. No-op otherwise. Caller holds m_filter_lock.
@@ -1159,6 +1202,34 @@ namespace {
 		{
 			return m_hmd_pos_valid ? (world_pos - m_hmd_pos).norm() < MAX_CONTROLLER_REACH_M
 			                       : world_pos.norm() < MAX_WORLD_POS_M;
+		}
+		//! Covariance-and-time-scaled reachability radius from the last optically-anchored position (see
+		//! REANCHOR_CACHE_* constants). Self-widens with the optical gap and the filter's own position
+		//! uncertainty, so a genuine re-acquisition after a dropout is always admitted while a same-frame
+		//! discontinuous solve is held out of the re-anchor cache. Caller holds m_filter_lock.
+		double
+		optical_motion_limit_m(timepoint_ns t_pose) const
+		{
+			if (last_optical_ns == 0) {
+				return MAX_CONTROLLER_REACH_M;
+			}
+			double dt = time_ns_to_s(t_pose - last_optical_ns);
+			if (dt < 0.0) {
+				dt = 0.0;
+			}
+			const double pos_sigma = std::sqrt(std::max(0.0, position_var_max()));
+			const double speed = std::min(m_x.v.norm(), REANCHOR_CACHE_MAX_SPEED_M_S);
+			const double limit = REANCHOR_CACHE_SLACK_M + REANCHOR_CACHE_SIGMA * pos_sigma + speed * dt +
+			                     0.5 * REANCHOR_CACHE_MAX_ACCEL_M_S2 * dt * dt;
+			return std::min(MAX_CONTROLLER_REACH_M, std::max(REANCHOR_CACHE_SLACK_M, limit));
+		}
+		//! True iff @p world_pos is within the reachability bound of the last optical anchor (or there is
+		//! no anchor / not tracking yet, where anything is admissible). Used to gate the m_pnp_pose cache.
+		bool
+		optical_motion_plausible(const Vector3d &world_pos, timepoint_ns t_pose) const
+		{
+			return !tracked || last_optical_ns == 0 ||
+			       (world_pos - last_good_position).norm() <= optical_motion_limit_m(t_pose);
 		}
 		//! On a position-observable fold, capture the controller's head-frame offset (the body-anchor target)
 		//! and signal a re-entry edge if we just re-acquired after a coast. No-op without a live HMD pose.
@@ -1263,6 +1334,9 @@ namespace {
 		tracked = false;
 		position_state = TrackingInfo{};
 		m_body_lock_valid = false; // a lost track invalidates the head-relative offset; re-captured on re-lock
+		// A reset wipes the orientation basin (m_x.q -> identity); there is no longer a gyro orientation
+		// confirmed by an agreeing optical, so the next optical re-seeds rather than being flip-vetoed.
+		m_last_orient_agree_ns = 0;
 	}
 
 	void
@@ -1330,18 +1404,41 @@ namespace {
 		last_good_position = p;
 	}
 
-	Quaterniond
-	EskfFusion::flip_guard(const Quaterniond &cand) const
+	bool
+	EskfFusion::reject_orientation_flip(const Quaterniond &cand, const Quaterniond &q_filter, timepoint_ns when_ns)
 	{
 		// Gyro untrustworthy only after a LONG optical gap (FLIP_GUARD_TRUST_NS, not the 0.5 s position
 		// freeze) — until then it stays a valid flip reference through dropouts. Past it -> accept the
-		// optical orientation as the sole reference. Otherwise compare against the gyro-propagated state.
-		const bool gyro_fresh = last_optical_ns != 0 && (filter_time_ns - last_optical_ns) < FLIP_GUARD_TRUST_NS;
-		if (!gyro_fresh) {
-			return cand;
+		// optical orientation as the sole reference (a true re-acquisition); the agreement clock restarts.
+		const bool gyro_fresh = last_optical_ns != 0 && (when_ns - last_optical_ns) < FLIP_GUARD_TRUST_NS;
+		const double ang = log_quat(cand.normalized() * q_filter.conjugate()).norm(); // rad between cand & gyro
+		if (ang <= FLIP_REJECT_RAD || !gyro_fresh) {
+			m_last_orient_agree_ns = when_ns; // optical confirms the gyro (or re-seeds it) -> restart the clock
+			return false;
 		}
-		const double ang = log_quat(cand.normalized() * m_x.q.conjugate()).norm(); // rad between cand & gyro
-		return (ang > FLIP_REJECT_RAD) ? m_x.q : cand; // a flip -> keep gyro orientation
+		// Disagreement past the flip threshold while the gyro is fresh: a mirror-flip OR the filter has
+		// locked into a wrong basin while its own (correct) optical keeps arriving. Distinguish by HOW LONG
+		// optical has been CONTINUOUSLY disagreeing:
+		//  - Optical absent (gap > FLIP_LOCKIN_RELEASE_NS, i.e. a dropout — empirically the normal optical
+		//    op interval is <=~p99 333 ms, dropouts are >500 ms): the gyro held ALONE through the gap, so the
+		//    disagreement is a fresh episode that just started — restart the clock to NOW and veto (a returning
+		//    few-LED flip after a coast is still rejected, the long-dropout invariant).
+		//  - Optical present + disagreeing within FLIP_LOCKIN_RELEASE_NS of the last evidence: a transient
+		//    one-off flip — veto.
+		//  - Optical present + disagreeing for LONGER than FLIP_LOCKIN_RELEASE_NS of continuous presence: the
+		//    filter, not optical, is the outlier — RELEASE the veto and adopt optical to re-seed.
+		const bool optical_was_absent =
+		    last_optical_ns == 0 || (when_ns - last_optical_ns) >= FLIP_LOCKIN_RELEASE_NS;
+		if (optical_was_absent || m_last_orient_agree_ns == 0) {
+			m_last_orient_agree_ns = when_ns; // gyro coasted alone (or reset): a fresh disagreement run
+		}
+		return (when_ns - m_last_orient_agree_ns) < FLIP_LOCKIN_RELEASE_NS; // veto until sustained
+	}
+
+	Quaterniond
+	EskfFusion::flip_guard(const Quaterniond &cand)
+	{
+		return reject_orientation_flip(cand, m_x.q, filter_time_ns) ? m_x.q : cand;
 	}
 
 	void
@@ -1431,6 +1528,7 @@ namespace {
 		c.filter_time_ns = filter_time_ns;
 		c.last_imu_ns = m_last_imu_ns;
 			c.last_optical_ns = last_optical_ns;
+			c.last_orient_agree_ns = m_last_orient_agree_ns;
 			c.last_led_fold_ns = m_last_led_fold_ns;
 			c.prev_capture_optical_ns = m_prev_capture_optical_ns;
 			c.last_body_anchor_ns = m_last_body_anchor_ns;
@@ -1455,6 +1553,7 @@ namespace {
 		filter_time_ns = c.filter_time_ns;
 		m_last_imu_ns = c.last_imu_ns;
 			last_optical_ns = c.last_optical_ns;
+			m_last_orient_agree_ns = c.last_orient_agree_ns;
 			m_last_led_fold_ns = c.last_led_fold_ns;
 			m_prev_capture_optical_ns = c.prev_capture_optical_ns;
 			m_last_body_anchor_ns = c.last_body_anchor_ns;
@@ -2264,11 +2363,10 @@ namespace {
 		// Absolute pose measurement. Position is always folded; the optical ORIENTATION is folded only
 		// if it agrees with the gyro-propagated orientation — a fresh-gyro disagreement past
 		// FLIP_REJECT_RAD is a PnP mirror flip, so we do a position-only update and keep gyro orientation.
+		// reject_orientation_flip releases this veto on a SUSTAINED disagreement (filter-side lock-in).
 		const Vector3d dpos = pos - m_x.p;
 		const Vector3d dtheta = log_quat(orient * m_x.q.conjugate());
-		const bool gyro_fresh =
-		    last_optical_ns != 0 && (filter_time_ns - last_optical_ns) < FLIP_GUARD_TRUST_NS;
-		const bool ori_flip = gyro_fresh && dtheta.norm() > FLIP_REJECT_RAD;
+		const bool ori_flip = reject_orientation_flip(orient, m_x.q, filter_time_ns);
 
 		bool ok;
 		if (ori_flip) {
@@ -2509,13 +2607,18 @@ namespace {
 				// disagrees with the FRESH gyro-propagated filter orientation (the same gyro arbitration
 				// integrate_pose_measurement uses) from becoming the re-anchor reference. A flipped pose
 				// then cannot poison the re-anchor. Bootstrap (untracked, no gyro reference yet) always
-				// takes it — the plausibility gate below guards a bad bootstrap.
+				// takes it — the plausibility gate below guards a bad bootstrap. Same lock-in release as
+				// the fold path: a SUSTAINED disagreement frees the gate so a correct pose can re-seed the
+				// re-anchor reference instead of being vetoed forever by a wrong-basin gyro.
 				const Quaterniond q_prior_filt = m_x.q.normalized();
-				const Vector3d dth = log_quat(orient.normalized() * q_prior_filt.conjugate());
-				const bool gyro_fresh = last_optical_ns != 0 &&
-				                        (sample->timestamp_ns - last_optical_ns) < FLIP_GUARD_TRUST_NS;
-				const bool pnp_flipped = tracked && gyro_fresh && dth.norm() > FLIP_REJECT_RAD;
-				if (!pnp_flipped) {
+				const bool pnp_flipped = tracked && reject_orientation_flip(orient.normalized(),
+				                                                            q_prior_filt, sample->timestamp_ns);
+				// A discontinuous solve that the controller could not physically have reached from the
+				// last optical anchor (covariance-and-time-scaled bound) must not become the re-anchor
+				// cache — that is the snap target a per-LED divergence will jump onto. The bound
+				// self-widens through dropouts so a real re-acquisition still refreshes the cache.
+				const bool pnp_motion_plausible = optical_motion_plausible(pos, sample->timestamp_ns);
+				if (!pnp_flipped && pnp_motion_plausible && position_plausible(pos)) {
 					m_pnp_pose = sample->pose;
 					m_pnp_ns = sample->timestamp_ns;
 					m_pnp_valid = true;
@@ -2679,8 +2782,10 @@ namespace {
 		// variance + the filter's own accel process growth PROC_ACCEL_CV²·dt (no new knob). Gravity is already
 		// cancelled in m_accel_world, so only linear accel is damped.
 		double dt = time_ns_to_s(when_ns - snap.filter_time_ns);
-		dt = std::min(std::max(dt, 0.0), MAX_PREDICT_AHEAD_S);
-		const double sigma_a2 = std::max(0.0, snap.acceleration_var_max) + PROC_ACCEL_CV * PROC_ACCEL_CV * dt;
+		dt = std::min(std::max(dt, -MAX_PREDICT_AHEAD_S), MAX_PREDICT_AHEAD_S);
+		const double dt_abs = std::abs(dt);
+		const double sigma_a2 =
+		    std::max(0.0, snap.acceleration_var_max) + PROC_ACCEL_CV * PROC_ACCEL_CV * dt_abs;
 		const double a2 = s_acc.squaredNorm();
 		const Vector3d a_eff = ((a2 + sigma_a2 > 0.0) ? a2 / (a2 + sigma_a2) : 0.0) * s_acc;
 
@@ -2828,32 +2933,16 @@ namespace {
 			const double alpha = std::min(1.0, tau > 0.0 ? dt / tau : 1.0);
 			if (edge && m_reentry_epoch_blends) {
 				Vector3d step = alpha * (report - m_reentry_cur_pos);
-				if (step.norm() > REENTRY_MAX_STEP_M) {
-					step *= REENTRY_MAX_STEP_M / step.norm();
+				const double max_step = std::max(REENTRY_MAX_STEP_M, REENTRY_MAX_SPEED_M_S * dt);
+				if (step.norm() > max_step) {
+					step *= max_step / step.norm();
 				}
 				m_reentry_cur_pos += step;
 				report = m_reentry_cur_pos;
 			} else {
 				m_reentry_cur_pos = report;
 			}
-			if (edge && m_reentry_epoch_blends_orient) {
-				// Cap the per-step angular slide so a 180° re-acq snap doesn't visually teleport. SLERP
-				// to a fraction of the geodesic, capped by REENTRY_MAX_STEP_RAD; quaternion shortest-path.
-				Quaterniond from = m_reentry_cur_orient;
-				Quaterniond to = orient;
-				if (from.dot(to) < 0.0) {
-					to.coeffs() *= -1.0; // shortest-path
-				}
-				const double gap_rad = 2.0 * std::acos(std::min(1.0, std::abs(from.dot(to))));
-				double t_step = std::min(1.0, alpha);
-				if (gap_rad > 0.0 && t_step * gap_rad > REENTRY_MAX_STEP_RAD) {
-					t_step = REENTRY_MAX_STEP_RAD / gap_rad;
-				}
-				m_reentry_cur_orient = from.slerp(t_step, to).normalized();
-				orient = m_reentry_cur_orient;
-			} else {
-				m_reentry_cur_orient = orient;
-			}
+			m_reentry_cur_orient = orient;
 			m_reentry_last_render_ns = when_ns;
 		}
 

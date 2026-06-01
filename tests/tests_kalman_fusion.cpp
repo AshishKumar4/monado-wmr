@@ -1009,7 +1009,7 @@ TEST_CASE("kalman: the body-anchor fold keeps an out-of-view controller TRACKED 
 	// pose is reported TRACKED. (The fold is a soft drift-BOUND, not a hard head-follow ride: a resting controller
 	// stays put — its IMU senses no motion — and a real in-hand controller's IMU dead-reckons the motion which the
 	// anchor then bounds; that drift-bounding is validated end-to-end on the offline replay, not here.) This locks,
-	// then coasts ~3 s (no optical, IMU rest, head fixed) driving the fold each sample as the WMR driver does, and
+	// then coasts ~1.5 s (no optical, IMU rest, head fixed) driving the fold each sample as the WMR driver does, and
 	// asserts the report is body-plausible + TRACKED WITH the fold — and is reported UNTRACKED WITHOUT it (TEETH:
 	// an out-of-view dead-reckon is not a trusted pose unless the body anchor holds it).
 	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
@@ -1030,7 +1030,7 @@ TEST_CASE("kalman: the body-anchor fold keeps an out-of-view controller TRACKED 
 		}
 		float max_dist_to_head = 0.f, max_world = 0.f;
 		bool untracked_while_stale = false;
-		for (int i = 0; i < 1500; i++) { // ~3 s coast (within the abandon horizon), no optical
+		for (int i = 0; i < 750; i++) { // ~1.5 s coast (within the abandon horizon), no optical
 			feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
 			if (fold) {
 				kf->update_body_anchor(&hmd);
@@ -1053,7 +1053,7 @@ TEST_CASE("kalman: the body-anchor fold keeps an out-of-view controller TRACKED 
 	(void)world_nofold;
 	(void)dist_nofold;
 
-	// WITH the fold: stays within ~an arm of the head, never flies to metres, and is TRACKED the whole coast.
+	// WITH the fold: stays within ~an arm of the head, never flies to metres, and is TRACKED through brief loss.
 	CHECK(dist_fold < 0.85f);
 	CHECK(world_fold < 1.5f);
 	CHECK_FALSE(untracked_fold);
@@ -1092,9 +1092,9 @@ TEST_CASE("kalman: an abandoned (set-down) controller drops to UNTRACKED after a
 		return (rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
 	};
 
-	// (1) A short out-of-view burst (~3 s = the routine fast-play occlusion ceiling): IMU-rest only, no
+	// (1) A short out-of-view burst (~1.5 s): IMU-rest only, no
 	// optical. The controller is at arm's reach in view of the head — the hold rides it, still TRACKED.
-	for (int i = 0; i < 1500; i++) { // 3.0 s, optical dropped
+	for (int i = 0; i < 750; i++) { // 1.5 s, optical dropped
 		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
 		kf->update_body_anchor(&hmd); // driver path: hold the position body-plausible out of view
 		t += DT_NS;
@@ -1103,9 +1103,9 @@ TEST_CASE("kalman: an abandoned (set-down) controller drops to UNTRACKED after a
 	REQUIRE(std::isfinite(held.pose.position.x));
 	CHECK(is_tracked(held)); // brief burst -> ride the hold, stay tracked
 
-	// (2) Sustained loss: keep dropping optical well past the abandon horizon (2x the 3 s routine ceiling =
-	// 6 s). The controller is now genuinely set down — it must report UNTRACKED, not be dragged at the head.
-	for (int i = 0; i < 2500; i++) { // another 5 s (total ~8 s of no optical, > 6 s abandon horizon)
+	// (2) Sustained loss: keep dropping optical well past the 2 s abandon horizon. The controller is now
+	// genuinely set down — it must report UNTRACKED, not be dragged at the head.
+	for (int i = 0; i < 1000; i++) { // another 2 s (total ~3.5 s of no optical, > 2 s abandon horizon)
 		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
 		kf->update_body_anchor(&hmd); // still body-anchoring, but past the abandon horizon it reports UNTRACKED
 		t += DT_NS;
@@ -1338,7 +1338,7 @@ TEST_CASE("kalman: FSM report-regime is consistent with the reported relation fl
 	}
 
 	// Long abandon (well past BODY_LOCK_ABANDON_NS) -> still body-anchored but reports NOT tracked.
-	for (int i = 0; i < 4000; i++) { // ~8 s total of no optical > 6 s abandon horizon
+	for (int i = 0; i < 4000; i++) { // ~8 s total of no optical > 2 s abandon horizon
 		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
 		kf->update_body_anchor(&hmd);
 		t += DT_NS;

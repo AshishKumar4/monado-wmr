@@ -1489,9 +1489,10 @@ wmr_hmd_fill_slam_calibration(struct wmr_hmd *wh)
 static void
 wmr_hmd_fill_constellation_calibration(struct wmr_hmd *wh)
 {
-/* WMR thresholds for min brightness and min-blob-required magnitude */
+/* WMR thresholds for the adaptive blob detector. Keep the hard peak floor low enough to retain dim LEDs;
+ * local contrast and shape gates handle clutter rejection. */
 #define BLOB_PIXEL_THRESHOLD_WMR 0x8
-#define BLOB_THRESHOLD_MIN_WMR 0x18
+#define BLOB_THRESHOLD_MIN_WMR 0x10
 
 	struct t_constellation_camera_group *out = &wh->tracking.constellation_calib;
 

@@ -205,6 +205,44 @@ gate_candidate_cmp(const void *a, const void *b)
 	return (ga->led_idx < gb->led_idx) ? -1 : (ga->led_idx > gb->led_idx) ? 1 : 0;
 }
 
+/* Bound LED detection odds: even a straight-on LED can be missed, and a grazing LED can still be detected. */
+#define DATA_NLL_P_MIN 0.05
+
+static double
+led_visibility_weight(double facing_dot)
+{
+	const double edge = cos(DEG_TO_RAD(180.0 - LED_ANGLE)); /* the visibility cutoff, ~cos(98 deg) < 0 */
+	double w = (edge - facing_dot) / (edge + 1.0);
+	if (w < 0.0)
+		w = 0.0;
+	if (w > 1.0)
+		w = 1.0;
+	return w;
+}
+
+/* Detection NLL for a finished assignment, plus the all-missed reference for matched LEDs. */
+static void
+compute_data_nll(struct pose_metrics_blob_match_info *match_info)
+{
+	double nll_detection = 0.0;
+	double nll_missed_if_matched = 0.0;
+	for (int i = 0; i < match_info->num_visible_leds; i++) {
+		const struct pose_metrics_visible_led_info *led_info = match_info->visible_leds + i;
+		const double w = led_visibility_weight(led_info->facing_dot);
+		double p = DATA_NLL_P_MIN + (1.0 - DATA_NLL_P_MIN) * w;
+		if (p > 1.0 - DATA_NLL_P_MIN)
+			p = 1.0 - DATA_NLL_P_MIN; /* ceiling: keep -log(1-p) finite for a straight-on LED */
+		if (led_info->matched_blob != NULL) {
+			nll_detection += -log(p);
+			nll_missed_if_matched += -log(1.0 - p);
+		} else {
+			nll_detection += -log(1.0 - p); /* visible LED left unmatched: miss cost */
+		}
+	}
+	match_info->data_nll_detection = nll_detection;
+	match_info->data_nll_missed_if_matched = nll_missed_if_matched;
+}
+
 static void
 check_pose_prior(struct pose_metrics *score,
                  struct xrt_pose *pose,
@@ -478,6 +516,8 @@ pose_metrics_match_pose_to_blobs_prior(struct xrt_pose *pose,
 	match_info->reprojection_error = 0.0;
 	match_info->matched_blobs = 0;
 	match_info->unmatched_blobs = 0;
+	match_info->data_nll_detection = 0.0;
+	match_info->data_nll_missed_if_matched = 0.0;
 
 	get_visible_leds_and_bounds(pose, led_model, calib, pos_error_thresh, rot_error_thresh, match_info->visible_leds,
 	                            &match_info->num_visible_leds, &match_info->bounds);
@@ -543,6 +583,10 @@ pose_metrics_match_pose_to_blobs_prior(struct xrt_pose *pose,
 
 	match_info->unmatched_blobs = considered - match_info->matched_blobs;
 	match_info->all_led_ids_matched = all_led_ids_matched;
+
+	/* Build the per-LED detection log-likelihood sums (half the matcher's nats objective) from the
+	 * finished assignment; the reprojection-fit half is the per-LED mean of reprojection_error. */
+	compute_data_nll(match_info);
 }
 
 void

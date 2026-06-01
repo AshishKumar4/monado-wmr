@@ -92,6 +92,12 @@ struct pose_metrics_blob_match_info
 	int unmatched_blobs;
 
 	double reprojection_error;
+
+	/* Visible-LED detection likelihood in nats. The matcher subtracts the matched-LED all-missed
+	 * reference so explaining high-probability LEDs is rewarded without unbounded count hacks. */
+	double data_nll_detection;
+	double data_nll_missed_if_matched;
+
 	struct pose_rect bounds;
 };
 
