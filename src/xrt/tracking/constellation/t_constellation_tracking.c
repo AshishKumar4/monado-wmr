@@ -31,6 +31,9 @@
 #include "internal/correspondence_search.h"
 #include "internal/debug_draw.h"
 #include "internal/joint_pnp.h"
+#include "internal/l2_accept_gate.h"
+#include "internal/l1_depth_verdict.h"
+#include "internal/multicam_triangulate.h"
 #include "internal/ransac_pnp.h"
 #include "internal/sample.h"
 
@@ -165,6 +168,7 @@ DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
 #define ROI_BASE_PAD_PX 32      /* floor: temporal-drift-aware; MS's 8 is too tight for our timing */
 #define ROI_SIGMA_K 3.0f        /* per-LED pad = k * sqrt(max-diag(S)); 3σ ~ 99.7% coverage */
 #define ROI_FALLBACK_MIN_PREDICTIONS 6
+#define ROI_MAX_OPTICAL_AGE_MS 150.0
 
 //! The OpenCV(+Y down, +Z away) <-> OpenXR(+Y up, +Z toward) camera-basis flip: a 180-deg rotation about
 //! X (i.e. negate Y and Z). Single source for the convention so every CV<->XR conversion agrees.
@@ -357,6 +361,14 @@ struct constellation_tracker_device
 	bool have_last_head_rel_quat;
 	uint64_t last_head_rel_quat_ts;
 	struct xrt_quat last_head_rel_quat; // controller orientation in head/IMU frame
+
+	/* Previous committed pose-lock orientation in the matcher's world frame. Used as a bounded temporal-yaw
+	 * continuity term for mirror-twin ranking; position-only and LED-fold observations do not update it. */
+	bool have_temporal_yaw_ref;
+	uint64_t temporal_yaw_ref_ts;
+	struct xrt_quat temporal_yaw_ref_quat;
+	bool have_temporal_yaw_prior;
+	struct xrt_quat temporal_yaw_ref_prior;
 };
 
 struct constellation_tracker_camera_state
@@ -497,6 +509,7 @@ constellation_tracked_device_connection_notify_leds(struct t_constellation_track
  * pairing. Returns false until the fusion is tracking, so partial fold is disabled at cold start. */
 static bool
 constellation_tracked_device_connection_predict_led_gate(struct t_constellation_tracked_device_connection *ctdc,
+                                                         timepoint_ns when_ns,
                                                          const struct xrt_pose *P_xrworld_cam,
                                                          const struct t_constellation_cam_calib *cam_calib,
                                                          const struct xrt_vec3 *led_obj,
@@ -507,7 +520,8 @@ constellation_tracked_device_connection_predict_led_gate(struct t_constellation_
 
 	os_mutex_lock(&ctdc->lock);
 	if (!ctdc->disconnected && ctdc->cb->predict_led_gate) {
-		ret = ctdc->cb->predict_led_gate(ctdc->xdev, P_xrworld_cam, cam_calib, led_obj, out_zhat, out_S);
+		ret = ctdc->cb->predict_led_gate(ctdc->xdev, when_ns, P_xrworld_cam, cam_calib, led_obj,
+		                                  out_zhat, out_S);
 	}
 	os_mutex_unlock(&ctdc->lock);
 
@@ -588,6 +602,22 @@ constellation_tracked_device_connection_get_predicted_pose(struct t_constellatio
 	os_mutex_lock(&ctdc->lock);
 	if (!ctdc->disconnected && ctdc->cb->get_predicted_pose) {
 		ret = ctdc->cb->get_predicted_pose(ctdc->xdev, when_ns, xsr);
+	}
+	os_mutex_unlock(&ctdc->lock);
+
+	return ret;
+}
+
+static bool
+constellation_tracked_device_connection_get_last_optical_age_ms(struct t_constellation_tracked_device_connection *ctdc,
+                                                                uint64_t when_ns,
+                                                                double *age_ms)
+{
+	bool ret = false;
+
+	os_mutex_lock(&ctdc->lock);
+	if (!ctdc->disconnected && ctdc->cb->get_last_optical_age_ms) {
+		ret = ctdc->cb->get_last_optical_age_ms(ctdc->xdev, when_ns, age_ms);
 	}
 	os_mutex_unlock(&ctdc->lock);
 
@@ -751,7 +781,7 @@ submit_device_pose(struct t_constellation_tracker *ct,
 		                      /* outcome */ is_recovered ? 2 /* recovered */ : 1 /* accepted */);
 		/* First accepted view for this device in this sample == lock (re)acquired. */
 		if (is_new_lock) {
-			g2_telem_event(dev_id, (uint64_t)sample->timestamp, 1 /* lock_acquired */, 0.0f);
+				g2_telem_event(dev_id, (uint64_t)sample->timestamp, G2_TELEM_EV_LOCK_ACQUIRED, 0.0f);
 		}
 	}
 
@@ -784,6 +814,12 @@ submit_device_pose(struct t_constellation_tracker *ct,
 		device->last_head_rel_quat = P_imu_obj_cache.orientation;
 		device->last_head_rel_quat_ts = sample->timestamp;
 		device->have_last_head_rel_quat = true;
+
+		device->temporal_yaw_ref_quat = dev_state->final_pose.orientation;
+		device->temporal_yaw_ref_ts = sample->timestamp;
+		device->have_temporal_yaw_ref = true;
+		device->temporal_yaw_ref_prior = dev_state->P_world_obj_prior.orientation;
+		device->have_temporal_yaw_prior = true;
 
 		/* Submit this pose observation to the fusion / real device. Flip back to OpenXR coords first, then
 		 * apply model pose */
@@ -990,9 +1026,12 @@ association_fold_prior_leds(struct t_constellation_tracker *ct,
 
 			float zhat[2], S[4];
 			if (!constellation_tracked_device_connection_predict_led_gate(
-			        device->connection, &P_xrworld_cam, &cam_calib, &led_obj, zhat, S)) {
-				/* Untracked / non-finite -> no usable gate for any LED this frame: stop (cold start). */
-				return false;
+			        device->connection, sample->timestamp, &P_xrworld_cam, &cam_calib, &led_obj,
+			        zhat, S)) {
+				/* Untracked or non-finite for this LED. Keep testing the remaining LEDs: edge-FOV
+				 * sparse frames often have only a few useful LEDs, and one bad projection must not
+				 * suppress the whole partial-information fold. */
+				continue;
 			}
 
 			/* S = [[s0,s1],[s2,s3]]; S^-1 = 1/det [[s3,-s1],[-s2,s0]]. d² = rᵀ S⁻¹ r. */
@@ -1034,8 +1073,8 @@ association_fold_prior_leds(struct t_constellation_tracker *ct,
 			emit_view_led_observations(dev_state, device, cam, view, view_id, sample->timestamp);
 			folded_any = true;
 			if (g2_telem_enabled()) {
-				g2_telem_event(telem_device_id(device->connection->xdev), (uint64_t)sample->timestamp,
-				               9 /* partial_fold_count */, (float)n_matched);
+					g2_telem_event(telem_device_id(device->connection->xdev), (uint64_t)sample->timestamp,
+					               G2_TELEM_EV_PARTIAL_FOLD_COUNT, (float)n_matched);
 			}
 		}
 	}
@@ -1048,20 +1087,52 @@ association_fold_prior_leds(struct t_constellation_tracker *ct,
 #define ASSOC_VISUAL_LOCK_COST 10.0f
 #define ASSOC_VISUAL_AMBIG_COST 20.0f
 #define ASSOC_ABSENT_WITH_BLOBS_COST 14.0f
-#define ASSOC_EV_LOCKABLE_NOT_CHOSEN 12
-#define ASSOC_EV_LOCK_COMMIT_FAILED 13
-#define ASSOC_EV_POSITION_ONLY_SELECTED 14
 #define ASSOC_MATCH_ALL_BLOBS_MAX 16
 #define ASSOC_POSITION_ONLY_MIN_MATCHED 4
 #define ASSOC_POSITION_ONLY_MAX_REPROJ_PER_LED 3.0f
-#define ASSOC_POSITION_ONLY_ACTION_NLL 4.0f
+#define ASSOC_POSITION_ONLY_ACTION_NLL 3.0f
 #define ASSOC_LED_FOLD_ACTION_NLL 7.0f
+#define ASSOC_LOCK_MATCH_EVIDENCE_NLL 0.35f
+#define ASSOC_LOCK_MULTIVIEW_EVIDENCE_NLL 1.0f
+#define ASSOC_LOCK_STRONG_EVIDENCE_NLL 1.0f
+#define ASSOC_LOCK_MAX_EVIDENCE_NLL 5.0f
+#define ASSOC_SIBLING_NEG_MIN_VISIBLE 4
+#define ASSOC_SIBLING_NEG_MIN_BLOBS 3
+#define ASSOC_SIBLING_NEG_MAX_NLL 8.0f
+#define ASSOC_ORIENT_CONSENSUS_POS_GATE_M 0.06f
+#define ASSOC_ORIENT_CONSENSUS_FREE_RAD DEG_TO_RAD(5.0)
+#define ASSOC_ORIENT_CONSENSUS_SIGMA_RAD DEG_TO_RAD(10.0)
+#define ASSOC_ORIENT_CONSENSUS_MAX_NLL 4.0f
+#define ASSOC_TEMPORAL_YAW_TTL_NS HEAD_YAW_CUE_TTL_NS
+#define ASSOC_TEMPORAL_YAW_SIGMA_RAD DEG_TO_RAD(45.0)
+#define ASSOC_TEMPORAL_TILT_SIGMA_RAD DEG_TO_RAD(180.0)
+#define ASSOC_TEMPORAL_MAX_NLL 3.0f
+#define ASSOC_TEMPORAL_MAX_PROPAGATION_RAD DEG_TO_RAD(90.0)
+#define ASSOC_POSITION_ONLY_UNRESOLVED_ORIENT_NLL 0.0f
+#define ASSOC_SINGLE_VIEW_PRIOR_MAX_NLL 6.0f
+#define ASSOC_SINGLE_VIEW_PRIOR_MAX_DISP_M 0.8f
+#define ASSOC_SINGLE_VIEW_PRIOR_DISP_MIN_NLL 1.0f
 #define ASSOC_POSITION_ONLY_BASE_STD_M 0.06f
 #define ASSOC_POSITION_ONLY_PER_REPROJ_STD_M 0.02f
 #define ASSOC_POSITION_ONLY_SINGLE_VIEW_INFLATE_M 0.04f
 #define ASSOC_POSITION_ONLY_FEW_LED_INFLATE_M 0.03f
+#define ASSOC_POSITION_ONLY_PARTIAL_INFLATE_M 0.05f
 #define ASSOC_POSITION_ONLY_MIN_STD_M 0.04f
 #define ASSOC_POSITION_ONLY_MAX_STD_M 0.20f
+#define ASSOC_L2_MIN_MATCHED 6
+#define ASSOC_L2_MIN_DISTINCT_VIEWS 2
+#define ASSOC_L2_MAX_TILT_RAD DEG_TO_RAD(12.0)
+#define ASSOC_L2_MAX_REPROJ_PER_LED_PX2 2.0
+#define ASSOC_L2_MAX_TOTAL_NLL ASSOC_VISUAL_AMBIG_COST
+#define ASSOC_L2_RECOVERY_ACTION_NLL 8.0f
+#define ASSOC_L1_DISPUTE_SIGMA 3.0
+#define ASSOC_L1_MIN_DISPUTE_LEDS 2
+#define ASSOC_L1_REFINE_PER_CAM_LEDS 4
+#define ASSOC_L1_REFINE_MAX_STD_M ASSOC_POSITION_ONLY_MIN_STD_M
+#define ASSOC_L1_EPIPOLAR_MODEL_GATE_M 0.06f
+#define ASSOC_L1_EPIPOLAR_REACH_SIGMA 3.0f
+#define ASSOC_L1_EPIPOLAR_REACH_MIN_M 0.30f
+#define ASSOC_L1_EPIPOLAR_REACH_MAX_M 1.35f
 
 enum association_observation_kind
 {
@@ -1077,6 +1148,7 @@ struct association_device_work
 	int count;
 	bool has_blobs;
 	bool folded_partial;
+	bool sibling_negative_enabled;
 };
 
 struct association_joint_choice
@@ -1137,6 +1209,57 @@ association_quat_angle(const struct xrt_quat *a, const struct xrt_quat *b)
 	return 2.0 * acos(d);
 }
 
+static struct xrt_quat
+association_propagate_temporal_ref(const struct xrt_quat *ref_quat,
+                                   const struct xrt_quat *ref_prior,
+                                   const struct xrt_quat *prior_now)
+{
+	struct xrt_quat prior_ref_inv;
+	math_quat_invert(ref_prior, &prior_ref_inv);
+
+	struct xrt_quat prior_delta;
+	math_quat_rotate(prior_now, &prior_ref_inv, &prior_delta);
+	math_quat_normalize(&prior_delta);
+
+	if (association_quat_angle(ref_prior, prior_now) > ASSOC_TEMPORAL_MAX_PROPAGATION_RAD) {
+		return *ref_quat;
+	}
+
+	struct xrt_quat out;
+	math_quat_rotate(&prior_delta, ref_quat, &out);
+	math_quat_normalize(&out);
+	return out;
+}
+
+static float
+association_temporal_yaw_nll(const struct constellation_tracker_device *device,
+                             const struct tracking_sample_device_state *dev_state,
+                             uint64_t timestamp_ns,
+                             const struct xrt_pose *pose_world)
+{
+	if (device == NULL || dev_state == NULL || pose_world == NULL || !device->have_temporal_yaw_ref) {
+		return 0.0f;
+	}
+	if (timestamp_ns < device->temporal_yaw_ref_ts ||
+	    timestamp_ns - device->temporal_yaw_ref_ts >= (uint64_t)ASSOC_TEMPORAL_YAW_TTL_NS) {
+		return 0.0f;
+	}
+
+	struct xrt_quat ref = device->temporal_yaw_ref_quat;
+	if (device->have_temporal_yaw_prior) {
+		ref = association_propagate_temporal_ref(&device->temporal_yaw_ref_quat,
+		                                         &device->temporal_yaw_ref_prior,
+		                                         &dev_state->P_world_obj_prior.orientation);
+	}
+
+	const struct xrt_vec3 cv_world_gravity = {0.0f, 1.0f, 0.0f};
+	const double cost = pose_metrics_prior_orient_cost(&pose_world->orientation, &ref, &cv_world_gravity,
+	                                                   ASSOC_TEMPORAL_TILT_SIGMA_RAD,
+	                                                   ASSOC_TEMPORAL_YAW_SIGMA_RAD,
+	                                                   FLIP_COST_HUBER_KNEE_SIGMA, 1.0);
+	return (float)(cost > ASSOC_TEMPORAL_MAX_NLL ? ASSOC_TEMPORAL_MAX_NLL : cost);
+}
+
 static bool
 association_pose_duplicate(const struct association_pose_hypothesis *a,
                            const struct association_pose_hypothesis *b)
@@ -1144,6 +1267,68 @@ association_pose_duplicate(const struct association_pose_hypothesis *a,
 	struct xrt_vec3 dp = m_vec3_sub(a->pose_world.position, b->pose_world.position);
 	return m_vec3_len(dp) < 0.02 && association_quat_angle(&a->pose_world.orientation, &b->pose_world.orientation) <
 	                                  DEG_TO_RAD(2.0);
+}
+
+static bool
+association_lock_eligible(const struct association_pose_hypothesis *hyp);
+
+static float
+association_orientation_consensus_unit_nll(double angle_rad)
+{
+	const double excess = angle_rad - ASSOC_ORIENT_CONSENSUS_FREE_RAD;
+	if (excess <= 0.0) {
+		return 0.0f;
+	}
+	const double x = excess / ASSOC_ORIENT_CONSENSUS_SIGMA_RAD;
+	const double nll = x * x;
+	return (float)(nll > ASSOC_ORIENT_CONSENSUS_MAX_NLL ? ASSOC_ORIENT_CONSENSUS_MAX_NLL : nll);
+}
+
+static bool
+association_same_position_consensus_neighbour(const struct association_pose_hypothesis *a,
+                                              const struct association_pose_hypothesis *b)
+{
+	if (a == b || b == NULL || b->matched_count < 4 || !POSE_HAS_FLAGS(&b->score, POSE_MATCH_POSITION)) {
+		return false;
+	}
+	if (a->source == b->source && a->primary_view_id == b->primary_view_id) {
+		return false;
+	}
+	struct xrt_vec3 dp = m_vec3_sub(a->pose_world.position, b->pose_world.position);
+	return m_vec3_len(dp) <= ASSOC_ORIENT_CONSENSUS_POS_GATE_M;
+}
+
+static void
+association_apply_orientation_consensus(struct association_device_work *work)
+{
+	for (int i = 0; work != NULL && i < work->count; i++) {
+		struct association_pose_hypothesis *hyp = &work->hyps[i];
+		hyp->cost.orientation_consensus_nll = 0.0f;
+		if (!association_lock_eligible(hyp) || !POSE_HAS_FLAGS(&hyp->score, POSE_MATCH_POSITION)) {
+			continue;
+		}
+
+		double weighted_nll = 0.0;
+		double total_weight = 0.0;
+		int support = 0;
+		for (int j = 0; j < work->count; j++) {
+			const struct association_pose_hypothesis *other = &work->hyps[j];
+			if (!association_same_position_consensus_neighbour(hyp, other)) {
+				continue;
+			}
+			const double angle = association_quat_angle(&hyp->pose_world.orientation, &other->pose_world.orientation);
+			const double weight = other->matched_count > 0 ? (double)other->matched_count : 1.0;
+			weighted_nll += weight * association_orientation_consensus_unit_nll(angle);
+			total_weight += weight;
+			support++;
+		}
+
+		if (support >= 2 && total_weight > 0.0) {
+			const double avg = weighted_nll / total_weight;
+			hyp->cost.orientation_consensus_nll =
+			    (float)(avg > ASSOC_ORIENT_CONSENSUS_MAX_NLL ? ASSOC_ORIENT_CONSENSUS_MAX_NLL : avg);
+		}
+	}
 }
 
 static int
@@ -1244,6 +1429,10 @@ association_prior_pose_nll(const struct constellation_tracker_device *device,
 	       association_head_anchor_nll(device, cam, view, sample, P_cam_obj);
 }
 
+/* @p pose_cam_override, when non-NULL, is the pose expressed in THIS view's camera frame (the hypothesis
+ * stores pose_cam in its PRIMARY view's frame). A committed multi-view pose is applied and folded into every
+ * contributing view (association_fold_hypothesis_view), so each such view emits its own outcome=1 record with
+ * the pose re-expressed in its frame; NULL keeps the primary-view pose_cam. */
 static void
 association_emit_candidate(const struct constellation_tracker_device *device,
                            const struct tracking_sample_device_state *dev_state,
@@ -1252,18 +1441,20 @@ association_emit_candidate(const struct constellation_tracker_device *device,
                            uint64_t timestamp_ns,
                            const struct association_pose_hypothesis *hyp,
                            bool selected,
-                           uint8_t outcome)
+                           uint8_t outcome,
+                           const struct xrt_pose *pose_cam_override)
 {
 	if (hyp == NULL || view == NULL) {
 		return;
 	}
+	const struct xrt_pose *pose_cam = pose_cam_override != NULL ? pose_cam_override : &hyp->pose_cam;
 	struct xrt_pose P_cam_obj_prior;
 	math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
 
 	double tilt_rad = 0.0;
 	double yaw_rad = 0.0;
 	if (dev_state->prior_tilt_trusted) {
-		pose_metrics_prior_orient_split(&hyp->pose_cam.orientation, &P_cam_obj_prior.orientation,
+		pose_metrics_prior_orient_split(&pose_cam->orientation, &P_cam_obj_prior.orientation,
 		                                &view->cam_gravity_vector, &tilt_rad, &yaw_rad);
 	}
 
@@ -1278,7 +1469,7 @@ association_emit_candidate(const struct constellation_tracker_device *device,
 	    (float)hyp->score.orient_error.z,
 	};
 	float pose[7];
-	telem_pack_pose(&hyp->pose_cam, pose);
+	telem_pack_pose(pose_cam, pose);
 	const struct xrt_device *xdev = device != NULL && device->connection != NULL ? device->connection->xdev : NULL;
 	const float prior_cost = hyp->cost.position_prior_nll + hyp->cost.orientation_prior_nll +
 	                         hyp->cost.head_anchor_nll + hyp->cost.body_state_nll;
@@ -1513,14 +1704,70 @@ association_hypothesis_less(const struct association_pose_hypothesis *a,
 }
 
 static bool
-association_lock_eligible(const struct association_pose_hypothesis *hyp)
+association_single_view_prior_disagrees(const struct association_pose_hypothesis *hyp)
 {
-	if (hyp == NULL || hyp->matched_count < 4 || !POSE_HAS_FLAGS(&hyp->score, POSE_MATCH_GOOD) ||
-	    (hyp->flags & ASSOC_HYP_PARTIAL_ONLY) != 0 || hyp->cost.total_nll >= ASSOC_VISUAL_LOCK_COST) {
+	const struct single_view_prior_gate_params params = {
+	    .max_prior_nll = ASSOC_SINGLE_VIEW_PRIOR_MAX_NLL,
+	    .max_prior_pos_err_m = ASSOC_SINGLE_VIEW_PRIOR_MAX_DISP_M,
+	    .min_prior_nll_for_pos_gate = ASSOC_SINGLE_VIEW_PRIOR_DISP_MIN_NLL,
+	};
+	const struct single_view_prior_gate_evidence evidence = {
+	    .distinct_view_count = association_distinct_view_count(hyp),
+	    .prior_nll = hyp != NULL ? hyp->cost.position_prior_nll + hyp->cost.orientation_prior_nll +
+	                                  hyp->cost.head_anchor_nll + hyp->cost.body_state_nll
+	                              : 0.0,
+	    .prior_pos_err_m = hyp != NULL ? m_vec3_len(hyp->score.pos_error) : 0.0,
+	    .has_pose = hyp != NULL && (hyp->flags & ASSOC_HYP_HAS_POSE) != 0,
+	};
+	return single_view_prior_gate_disagrees(&evidence, &params);
+}
+
+static bool
+association_baseline_lock_eligible(const struct association_pose_hypothesis *hyp)
+{
+	return hyp != NULL && !association_single_view_prior_disagrees(hyp) && hyp->matched_count >= 4 &&
+	       POSE_HAS_FLAGS(&hyp->score, POSE_MATCH_GOOD) && (hyp->flags & ASSOC_HYP_PARTIAL_ONLY) == 0 &&
+	       hyp->cost.total_nll < ASSOC_VISUAL_LOCK_COST;
+}
+
+static bool
+association_l2_lock_recoverable(const struct association_pose_hypothesis *hyp)
+{
+	if (hyp == NULL) {
+		return false;
+	}
+	if (association_baseline_lock_eligible(hyp)) {
+		return false;
+	}
+	if (association_single_view_prior_disagrees(hyp)) {
 		return false;
 	}
 
-	return true;
+	const struct l2_accept_params params = {
+	    .min_matched = ASSOC_L2_MIN_MATCHED,
+	    .min_distinct_views = ASSOC_L2_MIN_DISTINCT_VIEWS,
+	    .max_tilt_rad = ASSOC_L2_MAX_TILT_RAD,
+	    .max_reproj_per_led_px2 = ASSOC_L2_MAX_REPROJ_PER_LED_PX2,
+	    .max_total_nll = ASSOC_L2_MAX_TOTAL_NLL,
+	};
+	const struct l2_accept_evidence evidence = {
+	    .matched_count = hyp->matched_count,
+	    .distinct_view_count = association_distinct_view_count(hyp),
+	    .reproj_per_led_px2 = hyp->matched_count > 0 ? hyp->score.reprojection_error / (double)hyp->matched_count
+	                                                 : INFINITY,
+	    .total_nll = hyp->cost.total_nll,
+	    .tilt_error_rad = hyp->tilt_error_rad,
+	    .tilt_valid = hyp->tilt_valid,
+	    .pose_match_good = POSE_HAS_FLAGS(&hyp->score, POSE_MATCH_GOOD),
+	    .already_lock_eligible = false,
+	};
+	return l2_accept_recoverable(&evidence, &params);
+}
+
+static bool
+association_lock_eligible(const struct association_pose_hypothesis *hyp)
+{
+	return association_baseline_lock_eligible(hyp) || association_l2_lock_recoverable(hyp);
 }
 
 static double
@@ -1533,8 +1780,10 @@ association_reprojection_per_match(const struct association_pose_hypothesis *hyp
 static bool
 association_position_only_eligible(const struct association_pose_hypothesis *hyp)
 {
-	if (hyp == NULL || (hyp->flags & ASSOC_HYP_PARTIAL_ONLY) != 0 ||
-	    hyp->matched_count < ASSOC_POSITION_ONLY_MIN_MATCHED) {
+	if (hyp == NULL || hyp->matched_count < ASSOC_POSITION_ONLY_MIN_MATCHED) {
+		return false;
+	}
+	if (association_single_view_prior_disagrees(hyp)) {
 		return false;
 	}
 
@@ -1542,13 +1791,19 @@ association_position_only_eligible(const struct association_pose_hypothesis *hyp
 		return false;
 	}
 
-	return POSE_HAS_FLAGS(&hyp->score, POSE_MATCH_POSITION) || association_distinct_view_count(hyp) >= 2 ||
-	       hyp->matched_count >= 6;
+	if ((hyp->flags & ASSOC_HYP_PARTIAL_ONLY) != 0 && hyp->matched_count < 5) {
+		return false;
+	}
+
+	return POSE_HAS_FLAGS(&hyp->score, POSE_MATCH_POSITION) || association_distinct_view_count(hyp) >= 2;
 }
 
 static bool
 association_led_fold_eligible(const struct association_pose_hypothesis *hyp)
 {
+	if (association_single_view_prior_disagrees(hyp)) {
+		return false;
+	}
 	return hyp != NULL && hyp->matched_count > 0 && hyp->cost.total_nll < ASSOC_VISUAL_AMBIG_COST;
 }
 
@@ -1563,6 +1818,9 @@ association_position_observation_std_m(const struct association_pose_hypothesis 
 	if (hyp->matched_count <= 4) {
 		std_m += ASSOC_POSITION_ONLY_FEW_LED_INFLATE_M;
 	}
+	if ((hyp->flags & ASSOC_HYP_PARTIAL_ONLY) != 0) {
+		std_m += ASSOC_POSITION_ONLY_PARTIAL_INFLATE_M;
+	}
 	if (std_m < ASSOC_POSITION_ONLY_MIN_STD_M) {
 		std_m = ASSOC_POSITION_ONLY_MIN_STD_M;
 	}
@@ -1576,8 +1834,23 @@ static float
 association_option_cost(const struct association_pose_hypothesis *hyp, enum association_observation_kind kind)
 {
 	switch (kind) {
-	case ASSOC_OBS_POSE_LOCK: return hyp->cost.total_nll;
-	case ASSOC_OBS_POSITION_ONLY: return hyp->cost.total_nll + ASSOC_POSITION_ONLY_ACTION_NLL;
+	case ASSOC_OBS_POSE_LOCK: {
+		float evidence_nll = ASSOC_LOCK_MATCH_EVIDENCE_NLL * (float)hyp->matched_count;
+		if (association_distinct_view_count(hyp) >= 2) {
+			evidence_nll += ASSOC_LOCK_MULTIVIEW_EVIDENCE_NLL;
+		}
+		if (POSE_HAS_FLAGS(&hyp->score, POSE_MATCH_STRONG)) {
+			evidence_nll += ASSOC_LOCK_STRONG_EVIDENCE_NLL;
+		}
+		if (evidence_nll > ASSOC_LOCK_MAX_EVIDENCE_NLL) {
+			evidence_nll = ASSOC_LOCK_MAX_EVIDENCE_NLL;
+		}
+		const float recovery_nll = association_l2_lock_recoverable(hyp) ? ASSOC_L2_RECOVERY_ACTION_NLL : 0.0f;
+		return hyp->cost.total_nll + hyp->cost.orientation_consensus_nll + recovery_nll - evidence_nll;
+	}
+	case ASSOC_OBS_POSITION_ONLY:
+		return hyp->cost.total_nll + ASSOC_POSITION_ONLY_ACTION_NLL +
+		       ASSOC_POSITION_ONLY_UNRESOLVED_ORIENT_NLL;
 	case ASSOC_OBS_LED_FOLD: return hyp->cost.total_nll + ASSOC_LED_FOLD_ACTION_NLL;
 	case ASSOC_OBS_ABSENT:
 	default: return 0.0f;
@@ -1644,7 +1917,8 @@ association_add_pose_hypothesis(struct t_constellation_tracker *ct,
 	int total_visible = 0;
 	int total_unmatched = 0;
 	double total_reprojection = 0.0;
-	/* Detection-likelihood terms summed over every contributing view. */
+	/* Detection-likelihood terms summed over views with at least two plausible matches. Empty sibling views
+	 * are not hard negative evidence: edge-FOV and occlusion frames can be legitimate single-view observations. */
 	double total_data_nll_detection = 0.0;
 	double total_data_nll_missed_if_matched = 0.0;
 
@@ -1674,15 +1948,6 @@ association_add_pose_hypothesis(struct t_constellation_tracker *ct,
 			pose_metrics_evaluate_pose(&score, &P_match_cam_obj, bwobs->blobs, bwobs->num_blobs,
 			                           &device->led_model, &match_cam->camera_model, NULL);
 		}
-		if (score.matched_blobs < 2) {
-			continue;
-		}
-		const double view_error_per_blob = score.matched_blobs > 0
-		                                       ? score.reprojection_error / (double)score.matched_blobs
-		                                       : INFINITY;
-		if (match_view_id != view_id && view_error_per_blob > 4.0) {
-			continue;
-		}
 
 		struct pose_metrics_blob_match_info match_info;
 		if (use_prior) {
@@ -1694,6 +1959,27 @@ association_add_pose_hypothesis(struct t_constellation_tracker *ct,
 			pose_metrics_match_pose_to_blobs(&P_match_cam_obj, bwobs->blobs, bwobs->num_blobs,
 			                                 &device->led_model, &match_cam->camera_model, &match_info);
 		}
+		if (score.matched_blobs < 2) {
+			if (work->sibling_negative_enabled && match_view_id != view_id &&
+			    score.visible_leds >= ASSOC_SIBLING_NEG_MIN_VISIBLE &&
+			    bwobs->num_blobs >= ASSOC_SIBLING_NEG_MIN_BLOBS) {
+				double neg_nll = match_info.data_nll_detection;
+				if (neg_nll > ASSOC_SIBLING_NEG_MAX_NLL) {
+					neg_nll = ASSOC_SIBLING_NEG_MAX_NLL;
+				}
+				total_data_nll_detection += neg_nll;
+			}
+			continue;
+		}
+		total_data_nll_detection += match_info.data_nll_detection;
+		total_data_nll_missed_if_matched += match_info.data_nll_missed_if_matched;
+
+		const double view_error_per_blob = score.matched_blobs > 0
+		                                       ? score.reprojection_error / (double)score.matched_blobs
+		                                       : INFINITY;
+		if (match_view_id != view_id && view_error_per_blob > 4.0) {
+			continue;
+		}
 
 		const int added = association_fill_blob_refs(&hyp, &match_info, bwobs, match_view_id);
 		if (added == 0) {
@@ -1703,8 +1989,6 @@ association_add_pose_hypothesis(struct t_constellation_tracker *ct,
 		total_visible += score.visible_leds;
 		total_unmatched += score.unmatched_blobs;
 		total_reprojection += score.reprojection_error;
-		total_data_nll_detection += match_info.data_nll_detection;
-		total_data_nll_missed_if_matched += match_info.data_nll_missed_if_matched;
 		saw_partial_only |= POSE_HAS_FLAGS(&score, POSE_MATCH_PRIOR_SUPPORTED_PARTIAL);
 		if (!have_primary_score || match_view_id == view_id) {
 			primary_score = score;
@@ -1759,15 +2043,23 @@ association_add_pose_hypothesis(struct t_constellation_tracker *ct,
 	math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
 	hyp.cost.orientation_prior_nll =
 	    association_orientation_prior_nll(dev_state, P_cam_obj, &P_cam_obj_prior, &view->cam_gravity_vector);
+	if (dev_state->prior_tilt_trusted) {
+		double tilt_rad = 0.0;
+		double yaw_rad = 0.0;
+		pose_metrics_prior_orient_split(&P_cam_obj->orientation, &P_cam_obj_prior.orientation,
+		                                &view->cam_gravity_vector, &tilt_rad, &yaw_rad);
+		hyp.tilt_error_rad = (float)tilt_rad;
+		hyp.tilt_valid = true;
+	}
 	hyp.cost.head_anchor_nll = association_head_anchor_nll(device, cam, view, sample, P_cam_obj);
 	hyp.cost.body_state_nll = 0.0f;
-	hyp.cost.temporal_nll = 0.0f;
+	hyp.cost.temporal_nll = association_temporal_yaw_nll(device, dev_state, sample->timestamp, &hyp.pose_world);
 	hyp.cost.total_nll = hyp.cost.reprojection_nll + hyp.cost.missed_led_nll + hyp.cost.clutter_nll +
 	                     hyp.cost.matched_evidence_nll + hyp.cost.position_prior_nll + hyp.cost.orientation_prior_nll +
 	                     hyp.cost.head_anchor_nll + hyp.cost.body_state_nll + hyp.cost.temporal_nll;
 
 	association_insert_hypothesis(work, &hyp);
-	association_emit_candidate(device, dev_state, view, view_id, sample->timestamp, &hyp, false, 0);
+	association_emit_candidate(device, dev_state, view, view_id, sample->timestamp, &hyp, false, 0, NULL);
 	return true;
 }
 
@@ -2005,6 +2297,13 @@ association_build_device_work(struct t_constellation_tracker *ct,
                               bool allow_cold_search)
 {
 	*work = (struct association_device_work){0};
+	static int sibling_negative_env_init = 0;
+	static bool sibling_negative_enabled = false;
+	if (!sibling_negative_env_init) {
+		sibling_negative_env_init = 1;
+		sibling_negative_enabled = getenv("G2_ASSOC_SIBLING_NEGATIVE") != NULL;
+	}
+	work->sibling_negative_enabled = sibling_negative_enabled;
 	association_add_prior_pose_sources(ct, work, dev_state, sample);
 	association_add_joint_pnp_source(ct, work, dev_state, sample);
 	association_add_label_sources(ct, work, dev_state, sample);
@@ -2121,7 +2420,8 @@ association_emit_lockable_not_chosen(struct t_constellation_tracker *ct,
 	const struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
 	const struct xrt_device *xdev = device->connection != NULL ? device->connection->xdev : NULL;
 	const uint8_t conflicts = association_count_choice_conflicts(hyp, chosen, sample->n_devices, slot);
-	g2_telem_event(telem_device_id(xdev), sample->timestamp, ASSOC_EV_LOCKABLE_NOT_CHOSEN, (float)conflicts);
+	g2_telem_event(telem_device_id(xdev), sample->timestamp, G2_TELEM_EV_ASSOC_LOCKABLE_NOT_CHOSEN,
+	               (float)conflicts);
 }
 
 static void
@@ -2207,10 +2507,262 @@ association_fold_ambiguous_hypothesis(struct t_constellation_tracker *ct,
 	if (view->bwobs == NULL || view->bwobs->num_blobs == 0) {
 		return;
 	}
-	association_emit_candidate(device, dev_state, view, hyp->primary_view_id, sample->timestamp, hyp, true, 0);
+	association_emit_candidate(device, dev_state, view, hyp->primary_view_id, sample->timestamp, hyp, true, 0,
+	                           NULL);
 	for (int view_id = 0; view_id < sample->n_views; view_id++) {
 		association_fold_hypothesis_view(ct, dev_state, sample, hyp, view_id, false);
 	}
+}
+
+static void
+association_fold_triangulated_position(struct t_constellation_tracker *ct,
+                                       struct tracking_sample_device_state *dev_state,
+                                       struct constellation_tracking_sample *sample,
+                                       const struct multicam_tri_result *res)
+{
+	struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
+
+	struct xrt_pose P_cvworld_model = {.orientation = {0.f, 0.f, 0.f, 1.f}, .position = res->position};
+	struct xrt_pose P_xrworld_model;
+	pose_flip_YZ(&P_cvworld_model, &P_xrworld_model);
+
+	struct xrt_pose P_xrworld_device;
+	math_pose_transform(&P_xrworld_model, &device->led_model.P_model_device, &P_xrworld_device);
+
+	const float std_m = res->position_std_m;
+	const struct xrt_vec3 position_variance = {std_m * std_m, std_m * std_m, std_m * std_m};
+	constellation_tracked_device_connection_notify_position(device->connection, sample->timestamp,
+	                                                        &P_xrworld_device.position,
+	                                                        &position_variance);
+}
+
+static void
+association_l1_census_second_view(const int view_leds[],
+                                  int committed_view,
+                                  int n_views,
+                                  int *out_best,
+                                  int *out_n_ge_refine)
+{
+	int best = 0;
+	int n_ge = view_leds[committed_view] >= ASSOC_L1_REFINE_PER_CAM_LEDS ? 1 : 0;
+	for (int view_id = 0; view_id < n_views; view_id++) {
+		if (view_id == committed_view) {
+			continue;
+		}
+		if (view_leds[view_id] > best) {
+			best = view_leds[view_id];
+		}
+		if (view_leds[view_id] >= ASSOC_L1_REFINE_PER_CAM_LEDS) {
+			n_ge++;
+		}
+	}
+	*out_best = best;
+	*out_n_ge_refine = n_ge;
+}
+
+static bool
+association_l1_labelled_triangulate(struct t_constellation_tracker *ct,
+                                    struct tracking_sample_device_state *dev_state,
+                                    struct constellation_tracking_sample *sample,
+                                    const struct association_pose_hypothesis *hyp,
+                                    int view_led_count[CONSTELLATION_MAX_CAMERAS],
+                                    struct multicam_tri_result *out_res)
+{
+	struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
+	struct blob view_blobs[CONSTELLATION_MAX_CAMERAS][ASSOCIATION_MAX_BLOBS_PER_HYPOTHESIS];
+
+	for (uint8_t i = 0; i < hyp->matched_count; i++) {
+		const struct association_blob_ref *ref = &hyp->matched_blobs[i];
+		if (!association_blob_ref_is_valid(ref) || ref->view_id < 0 || ref->view_id >= sample->n_views ||
+		    hyp->matched_led_ids[i] < 0 || hyp->matched_led_ids[i] >= device->led_model.num_leds) {
+			continue;
+		}
+		struct tracking_sample_frame *view = sample->views + ref->view_id;
+		if (view->bwobs == NULL || ref->blob_id < 0 || ref->blob_id >= view->bwobs->num_blobs ||
+		    view_led_count[ref->view_id] >= ASSOCIATION_MAX_BLOBS_PER_HYPOTHESIS) {
+			continue;
+		}
+
+		struct blob labelled = view->bwobs->blobs[ref->blob_id];
+		labelled.led_id = LED_MAKE_ID(device->led_model.id, hyp->matched_led_ids[i]);
+		view_blobs[ref->view_id][view_led_count[ref->view_id]++] = labelled;
+	}
+
+	struct multicam_tri_view tri_views[CONSTELLATION_MAX_CAMERAS];
+	int n_tri_views = 0;
+	for (int view_id = 0; view_id < sample->n_views; view_id++) {
+		if (view_led_count[view_id] <= 0) {
+			continue;
+		}
+		tri_views[n_tri_views].blobs = view_blobs[view_id];
+		tri_views[n_tri_views].num_blobs = view_led_count[view_id];
+		tri_views[n_tri_views].calib = &ct->cam[view_id].camera_model;
+		tri_views[n_tri_views].P_world_cam = sample->views[view_id].P_world_cam;
+		n_tri_views++;
+	}
+
+	return n_tri_views >= 2 &&
+	       multicam_triangulate_position(tri_views, n_tri_views, &device->led_model,
+	                                      &hyp->pose_world.orientation, dev_state->prior_yaw_sigma_rad,
+	                                      ASSOC_L1_MIN_DISPUTE_LEDS, out_res);
+}
+
+static bool
+association_l1_epipolar_triangulate(struct t_constellation_tracker *ct,
+                                    struct tracking_sample_device_state *dev_state,
+                                    struct constellation_tracking_sample *sample,
+                                    int committed_view,
+                                    int view_led_count[CONSTELLATION_MAX_CAMERAS],
+                                    struct multicam_tri_result *out_res)
+{
+	struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
+	struct multicam_tri_view epi_views[CONSTELLATION_MAX_CAMERAS];
+	int epi_sample_view[CONSTELLATION_MAX_CAMERAS];
+	int n_epi_views = 0;
+	int committed_compact_view = -1;
+	for (int view_id = 0; view_id < sample->n_views; view_id++) {
+		struct tracking_sample_frame *view = sample->views + view_id;
+		if (view->bwobs == NULL || view->bwobs->num_blobs <= 0) {
+			continue;
+		}
+		epi_views[n_epi_views].blobs = view->bwobs->blobs;
+		epi_views[n_epi_views].num_blobs = view->bwobs->num_blobs;
+		epi_views[n_epi_views].calib = &ct->cam[view_id].camera_model;
+		epi_views[n_epi_views].P_world_cam = view->P_world_cam;
+		epi_sample_view[n_epi_views] = view_id;
+		if (view_id == committed_view) {
+			committed_compact_view = n_epi_views;
+		}
+		n_epi_views++;
+	}
+
+	if (n_epi_views < 2 || committed_compact_view < 0) {
+		return false;
+	}
+
+	static int primary_label_epipolar_enabled = -1;
+	if (primary_label_epipolar_enabled < 0) {
+		primary_label_epipolar_enabled = getenv("G2_ASSOC_L1_PRIMARY_EPIPOLAR") != NULL ? 1 : 0;
+	}
+
+	struct blob primary_blobs[ASSOCIATION_MAX_BLOBS_PER_HYPOTHESIS];
+	int n_primary_blobs = 0;
+	struct tracking_sample_frame *committed = sample->views + committed_view;
+	for (int bi = 0; committed->bwobs != NULL && bi < committed->bwobs->num_blobs &&
+	                 n_primary_blobs < ASSOCIATION_MAX_BLOBS_PER_HYPOTHESIS;
+	     bi++) {
+		const struct blob *blob = &committed->bwobs->blobs[bi];
+		if (LED_OBJECT_ID(blob->led_id) == device->led_model.id) {
+			primary_blobs[n_primary_blobs++] = *blob;
+		}
+	}
+	if (primary_label_epipolar_enabled && n_primary_blobs > 0) {
+		epi_views[committed_compact_view].blobs = primary_blobs;
+		epi_views[committed_compact_view].num_blobs = n_primary_blobs;
+
+		struct multicam_tri_result primary_epi = {0};
+		if (multicam_triangulate_primary_label_epipolar_position(
+		        epi_views, n_epi_views, committed_compact_view, &device->led_model,
+		        &dev_state->P_world_obj_prior.orientation, dev_state->prior_yaw_sigma_rad,
+		        ASSOC_L1_REFINE_PER_CAM_LEDS, &primary_epi) &&
+		    primary_epi.num_leds >= ASSOC_L1_REFINE_PER_CAM_LEDS &&
+		    primary_epi.position_std_m <= ASSOC_L1_REFINE_MAX_STD_M) {
+			memset(view_led_count, 0, sizeof(int) * CONSTELLATION_MAX_CAMERAS);
+			for (int i = 0; i < primary_epi.num_blob_refs; i++) {
+				const int compact_view = primary_epi.blob_refs[i].view_id;
+				if (compact_view >= 0 && compact_view < n_epi_views) {
+					const int sample_view = epi_sample_view[compact_view];
+					if (sample_view >= 0 && sample_view < CONSTELLATION_MAX_CAMERAS) {
+						view_led_count[sample_view]++;
+					}
+				}
+			}
+			*out_res = primary_epi;
+			return true;
+		}
+	}
+
+	if (!dev_state->prior_tilt_trusted) {
+		return false;
+	}
+
+	float reach_m = ASSOC_L1_EPIPOLAR_REACH_SIGMA * m_vec3_len(dev_state->prior_pos_error);
+	if (reach_m < ASSOC_L1_EPIPOLAR_REACH_MIN_M) {
+		reach_m = ASSOC_L1_EPIPOLAR_REACH_MIN_M;
+	}
+	if (reach_m > ASSOC_L1_EPIPOLAR_REACH_MAX_M) {
+		reach_m = ASSOC_L1_EPIPOLAR_REACH_MAX_M;
+	}
+
+	struct multicam_tri_result epi = {0};
+	if (n_epi_views < 2 ||
+	    !multicam_triangulate_epipolar_position(epi_views, n_epi_views, &device->led_model,
+	                                            &dev_state->P_world_obj_prior,
+	                                            dev_state->prior_yaw_sigma_rad, reach_m,
+	                                            ASSOC_L1_EPIPOLAR_MODEL_GATE_M,
+	                                            ASSOC_L1_MIN_DISPUTE_LEDS, &epi)) {
+		return false;
+	}
+
+	memset(view_led_count, 0, sizeof(int) * CONSTELLATION_MAX_CAMERAS);
+	for (int i = 0; i < epi.num_blob_refs; i++) {
+		const int compact_view = epi.blob_refs[i].view_id;
+		if (compact_view >= 0 && compact_view < n_epi_views) {
+			const int sample_view = epi_sample_view[compact_view];
+			if (sample_view >= 0 && sample_view < CONSTELLATION_MAX_CAMERAS) {
+				view_led_count[sample_view]++;
+			}
+		}
+	}
+	*out_res = epi;
+	return true;
+}
+
+static enum l1_verdict
+association_l1_depth_check(struct t_constellation_tracker *ct,
+                           struct tracking_sample_device_state *dev_state,
+                           struct constellation_tracking_sample *sample,
+                           const struct association_pose_hypothesis *hyp,
+                           struct multicam_tri_result *out_res)
+{
+	const int committed_view = hyp->primary_view_id;
+	int view_led_count[CONSTELLATION_MAX_CAMERAS] = {0};
+	struct multicam_tri_result res = {0};
+	bool tri_ok = association_l1_labelled_triangulate(ct, dev_state, sample, hyp, view_led_count, &res);
+
+	int best_second_view_leds = 0;
+	int n_cams_ge_refine = 0;
+	association_l1_census_second_view(view_led_count, committed_view, sample->n_views, &best_second_view_leds,
+	                                  &n_cams_ge_refine);
+
+	if (!tri_ok &&
+	    association_l1_epipolar_triangulate(ct, dev_state, sample, committed_view, view_led_count, &res)) {
+		tri_ok = true;
+		association_l1_census_second_view(view_led_count, committed_view, sample->n_views,
+		                                  &best_second_view_leds, &n_cams_ge_refine);
+	}
+
+	const struct xrt_vec3 dp = m_vec3_sub(res.position, hyp->pose_world.position);
+	const struct l1_depth_evidence evidence = {
+	    .disp_m = m_vec3_len(dp),
+	    .triangulated_std_m = (double)res.position_std_m,
+	    .committed_std_m = (double)association_position_observation_std_m(hyp),
+	    .best_second_view_leds = best_second_view_leds,
+	    .n_cams_ge_refine_leds = n_cams_ge_refine,
+	    .tri_succeeded = tri_ok,
+	};
+	const struct l1_depth_params params = {
+	    .dispute_sigma = ASSOC_L1_DISPUTE_SIGMA,
+	    .min_dispute_leds = ASSOC_L1_MIN_DISPUTE_LEDS,
+	    .refine_per_cam_leds = ASSOC_L1_REFINE_PER_CAM_LEDS,
+	    .refine_max_std_m = ASSOC_L1_REFINE_MAX_STD_M,
+	};
+
+	const enum l1_verdict verdict = l1_depth_verdict(&evidence, &params);
+	if (verdict == L1V_REFINE) {
+		*out_res = res;
+	}
+	return verdict;
 }
 
 static bool
@@ -2231,13 +2783,36 @@ association_commit_joint_pose(struct t_constellation_tracker *ct,
 	    association_apply_hypothesis_matches(dev_state, device, view, hyp, hyp->primary_view_id);
 	if (selected_matches < 4 && hyp->matched_count < 4) {
 		const struct xrt_device *xdev = device->connection != NULL ? device->connection->xdev : NULL;
-		g2_telem_event(telem_device_id(xdev), sample->timestamp, ASSOC_EV_LOCK_COMMIT_FAILED,
+		g2_telem_event(telem_device_id(xdev), sample->timestamp, G2_TELEM_EV_ASSOC_LOCK_COMMIT_FAILED,
 		               (float)selected_matches);
 		association_emit_candidate(device, dev_state, view, hyp->primary_view_id, sample->timestamp, hyp,
-		                           true, 0);
+		                           true, 0, NULL);
 		return false;
 	}
-	association_emit_candidate(device, dev_state, view, hyp->primary_view_id, sample->timestamp, hyp, true, 1);
+
+	if (association_distinct_view_count(hyp) < 2) {
+		struct multicam_tri_result tri_res = {0};
+		const enum l1_verdict verdict = association_l1_depth_check(ct, dev_state, sample, hyp, &tri_res);
+		if (g2_telem_enabled()) {
+			const struct xrt_device *xdev = device->connection != NULL ? device->connection->xdev : NULL;
+			g2_telem_event(telem_device_id(xdev), sample->timestamp, G2_TELEM_EV_ASSOC_L1_DEPTH_CHECK,
+			               (float)verdict);
+		}
+		if (verdict == L1V_DISPUTE) {
+			association_emit_candidate(device, dev_state, view, hyp->primary_view_id, sample->timestamp,
+			                           hyp, true, 0, NULL);
+			return false;
+		}
+		if (verdict == L1V_REFINE) {
+			association_emit_candidate(device, dev_state, view, hyp->primary_view_id, sample->timestamp,
+			                           hyp, true, 0, NULL);
+			association_fold_triangulated_position(ct, dev_state, sample, &tri_res);
+			return true;
+		}
+	}
+
+	association_emit_candidate(device, dev_state, view, hyp->primary_view_id, sample->timestamp, hyp, true, 1,
+	                           NULL);
 	dev_state->score = hyp->score;
 	dev_state->score.matched_blobs = hyp->matched_count;
 	struct xrt_pose pose = hyp->pose_cam;
@@ -2246,7 +2821,18 @@ association_commit_joint_pose(struct t_constellation_tracker *ct,
 		if (view_id == hyp->primary_view_id) {
 			continue;
 		}
-		association_fold_hypothesis_view(ct, dev_state, sample, hyp, view_id, true);
+		const int view_matches = association_fold_hypothesis_view(ct, dev_state, sample, hyp, view_id, true);
+		/* This contributing view also observed and folded the committed pose; record its commit with the
+		 * pose re-expressed in this camera's frame so the per-camera analysis sees the lock here too (the
+		 * lock is one device pose shared across views, not one-per-camera). Same >=4 matched-LED bar as the
+		 * primary lock so a view contributing only a stray LED or two isn't logged as a full pose commit. */
+		if (view_matches >= 4) {
+			struct tracking_sample_frame *fold_view = sample->views + view_id;
+			struct xrt_pose P_cam_obj_view;
+			math_pose_transform(&fold_view->P_cam_world, &hyp->pose_world, &P_cam_obj_view);
+			association_emit_candidate(device, dev_state, fold_view, view_id, sample->timestamp, hyp, true,
+			                           1, &P_cam_obj_view);
+		}
 	}
 	return true;
 }
@@ -2278,8 +2864,9 @@ association_commit_position_only(struct t_constellation_tracker *ct,
 	if (g2_telem_enabled()) {
 		const struct xrt_device *xdev = device->connection != NULL ? device->connection->xdev : NULL;
 		association_emit_candidate(device, dev_state, view, hyp->primary_view_id, sample->timestamp, hyp,
-		                           true, 0);
-		g2_telem_event(telem_device_id(xdev), sample->timestamp, ASSOC_EV_POSITION_ONLY_SELECTED, std_m);
+		                           true, 0, NULL);
+		g2_telem_event(telem_device_id(xdev), sample->timestamp, G2_TELEM_EV_ASSOC_POSITION_ONLY_SELECTED,
+		               std_m);
 	}
 
 	return true;
@@ -2293,6 +2880,7 @@ constellation_associate_covariance_frame(struct t_constellation_tracker *ct,
 	struct association_device_work work[CONSTELLATION_MAX_DEVICES] = {0};
 	for (int i = 0; i < sample->n_devices; i++) {
 		association_build_device_work(ct, &work[i], &sample->devices[i], sample, allow_cold_search);
+		association_apply_orientation_consensus(&work[i]);
 	}
 
 	const struct association_pose_hypothesis *current[CONSTELLATION_MAX_DEVICES] = {0};
@@ -2418,9 +3006,10 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 			 * crop out a controller that needs full-frame acquisition/re-acquisition). The scan pad is
 			 * per-LED-adaptive (max of the base pad floor and k * sqrt(max-diag(S))); base pad and sigma
 			 * multiplier are env-tunable for in-headset re-tuning across lighting/motion. */
-		static int predictive_roi_base_pad = ROI_BASE_PAD_PX;
-		static float predictive_roi_sigma_k = ROI_SIGMA_K;
-		static int predictive_roi_env_init = 0;
+			static int predictive_roi_base_pad = ROI_BASE_PAD_PX;
+			static float predictive_roi_sigma_k = ROI_SIGMA_K;
+			static double predictive_roi_max_optical_age_ms = ROI_MAX_OPTICAL_AGE_MS;
+			static int predictive_roi_env_init = 0;
 		if (!predictive_roi_env_init) {
 			predictive_roi_env_init = 1;
 			const char *p = getenv("G2_PREDICTIVE_ROI_BASE_PAD_PX");
@@ -2428,10 +3017,14 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 				predictive_roi_base_pad = atoi(p);
 			}
 			const char *k = getenv("G2_PREDICTIVE_ROI_SIGMA_K");
-			if (k != NULL && k[0] != '\0' && atof(k) > 0.0) {
-				predictive_roi_sigma_k = (float)atof(k);
+				if (k != NULL && k[0] != '\0' && atof(k) > 0.0) {
+					predictive_roi_sigma_k = (float)atof(k);
+				}
+				const char *age = getenv("G2_PREDICTIVE_ROI_MAX_OPTICAL_AGE_MS");
+				if (age != NULL && age[0] != '\0' && atof(age) >= 0.0) {
+					predictive_roi_max_optical_age_ms = atof(age);
+				}
 			}
-		}
 		bool used_roi = false;
 		{
 			/* Build the cam_calib + the OpenXR-camera-frame pose this camera uses for projection, the
@@ -2449,11 +3042,18 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 				for (int d = 0; d < ct->num_devices; d++) {
 					struct constellation_tracker_device *device = &ct->devices[d];
 					const struct t_constellation_led_model *lm = &device->led_model;
-					if (device->connection == NULL || lm->leds == NULL || lm->num_leds == 0) {
-						continue; /* not connected / model not loaded yet */
-					}
-					n_connected_devices++;
-					int device_in_frame = 0;
+						if (device->connection == NULL || lm->leds == NULL || lm->num_leds == 0) {
+							continue; /* not connected / model not loaded yet */
+						}
+						n_connected_devices++;
+						double optical_age_ms = 0.0;
+						if (predictive_roi_max_optical_age_ms > 0.0 &&
+						    constellation_tracked_device_connection_get_last_optical_age_ms(
+						        device->connection, xf->timestamp, &optical_age_ms) &&
+						    optical_age_ms > predictive_roi_max_optical_age_ms) {
+							continue;
+						}
+						int device_in_frame = 0;
 					for (int li = 0; li < lm->num_leds; li++) {
 						struct xrt_vec3 led_flip = {lm->leds[li].pos.x, -lm->leds[li].pos.y,
 						                            -lm->leds[li].pos.z};
@@ -2461,8 +3061,8 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 					math_pose_transform_point(&lm->P_device_model, &led_flip, &led_obj);
 					float zhat[2], S[4];
 						if (!constellation_tracked_device_connection_predict_led_gate(
-						        device->connection, &P_xrworld_cam_pred, &cam_calib_pred, &led_obj,
-						        zhat, S)) {
+						        device->connection, xf->timestamp, &P_xrworld_cam_pred,
+						        &cam_calib_pred, &led_obj, zhat, S)) {
 							continue; /* device untracked: no usable prior */
 						}
 						if (!isfinite(zhat[0]) || !isfinite(zhat[1]) || !isfinite(S[0]) || !isfinite(S[3])) {
@@ -2540,6 +3140,7 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 	}
 	uint64_t blob_extract_finish_ts = os_monotonic_get_ns();
 	ct->last_blob_analysis_ms = (blob_extract_finish_ts - fast_analysis_start_ts) / U_TIME_1MS_IN_NS;
+	g2_telem_event(0, xf->timestamp, G2_TELEM_EV_TRACKER_BLOB_MS, (float)ct->last_blob_analysis_ms);
 
 	// Ready to start processing device poses now. Make sure we have the
 	// LED models and collect the best estimate of the current pose
@@ -2631,6 +3232,7 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 
 	uint64_t fast_analysis_finish_ts = os_monotonic_get_ns();
 	ct->last_fast_analysis_ms = (fast_analysis_finish_ts - fast_analysis_start_ts) / U_TIME_1MS_IN_NS;
+	g2_telem_event(0, xf->timestamp, G2_TELEM_EV_TRACKER_FAST_MS, (float)ct->last_fast_analysis_ms);
 
 	/* Send analysis results to debug view if needed */
 	enum debug_draw_flag debug_flags = DEBUG_DRAW_FLAG_NONE;

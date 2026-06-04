@@ -62,6 +62,31 @@ g2_telem_shutdown(void);
 bool
 g2_telem_enabled(void);
 
+/*! Event type ids for event.bin. Append only: captured telemetry is decoded by these stable numeric ids. */
+enum g2_telem_event_type
+{
+	G2_TELEM_EV_LOCK_LOST = 0,
+	G2_TELEM_EV_LOCK_ACQUIRED = 1,
+	G2_TELEM_EV_RECOVER_ATTEMPT = 2,
+	G2_TELEM_EV_OPTICAL_JUMP_REJECTED = 3,
+	G2_TELEM_EV_IMU_ANOMALY = 4,
+	G2_TELEM_EV_RING_OVERFLOW = 5,
+	G2_TELEM_EV_ESKF_FOLD_COUNT = 7,
+	G2_TELEM_EV_ESKF_LEDS_SEEN = 8,
+	G2_TELEM_EV_PARTIAL_FOLD_COUNT = 9,
+	G2_TELEM_EV_LABEL_PROPAGATED = 10,
+	G2_TELEM_EV_JOINT_PNP = 11,
+	G2_TELEM_EV_ASSOC_LOCKABLE_NOT_CHOSEN = 12,
+	G2_TELEM_EV_ASSOC_LOCK_COMMIT_FAILED = 13,
+	G2_TELEM_EV_ASSOC_POSITION_ONLY_SELECTED = 14,
+	G2_TELEM_EV_ASSOC_L1_DEPTH_CHECK = 15,
+	G2_TELEM_EV_ASSOC_JOINT_CONTENTION = 16,
+	G2_TELEM_EV_TRACKER_SEQ_DELTA = 17,
+	G2_TELEM_EV_TRACKER_BLOB_MS = 18,
+	G2_TELEM_EV_TRACKER_FAST_MS = 19,
+	G2_TELEM_EV_FRAME_DUMP_DROPPED = 20,
+};
+
 /* ---- Stream emit functions (POD rows; lock-free; safe from any single producer) ---- */
 
 /*! Raw IMU sample. @p device_id: 0=HMD, 1=left controller, 2=right controller. */

@@ -201,22 +201,6 @@ struct g2_telem_head_pose
 #endif
 #undef G2_PACKED
 
-//! event_type enum (see schema). Extend by appending only.
-enum g2_telem_event_type
-{
-	G2_TELEM_EV_LOCK_LOST = 0,
-	G2_TELEM_EV_LOCK_ACQUIRED = 1,
-	G2_TELEM_EV_RECOVER_ATTEMPT = 2,
-	G2_TELEM_EV_OPTICAL_JUMP_REJECTED = 3,
-	G2_TELEM_EV_IMU_ANOMALY = 4,
-	G2_TELEM_EV_RING_OVERFLOW = 5,      //!< value = stream id
-	G2_TELEM_EV_PARTIAL_FOLD_COUNT = 9, //!< value = number of LEDs gate-folded this frame
-	G2_TELEM_EV_LABEL_PROPAGATED = 10,  //!< value = number of LEDs label-propagated from the predicted pose
-	G2_TELEM_EV_JOINT_PNP = 11,         //!< value = number of contributing cameras in a joint multi-cam PnP solve
-	G2_TELEM_EV_ASSOC_LOCKABLE_NOT_CHOSEN = 12, //!< value = shared-blob conflicts against selected hypotheses
-	G2_TELEM_EV_ASSOC_LOCK_COMMIT_FAILED = 13,  //!< value = matched blobs that survived exact commit
-};
-
 //! Stream ids, used as the value of a ring_overflow event and to index internals.
 enum g2_telem_stream
 {

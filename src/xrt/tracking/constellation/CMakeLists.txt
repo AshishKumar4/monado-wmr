@@ -13,6 +13,8 @@ add_library(
 	internal/debug_draw.h
 	internal/joint_pnp.cpp
 	internal/joint_pnp.h
+	internal/multicam_triangulate.cpp
+	internal/multicam_triangulate.h
 	internal/lambdatwist/cubic.h
 	internal/lambdatwist/eig3x3known0.h
 	internal/lambdatwist/lambdatwist_p3p.h

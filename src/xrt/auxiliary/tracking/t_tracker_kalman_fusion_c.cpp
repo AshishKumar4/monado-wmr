@@ -136,6 +136,7 @@ kalman_fusion_process_position(struct KalmanFusionInterfaceWrapper *wrapper,
 
 bool
 kalman_fusion_predict_led_gate(struct KalmanFusionInterfaceWrapper *wrapper,
+                               const timepoint_ns timestamp_ns,
                                const struct kalman_led_observation *obs,
                                const struct kalman_led_camera_view *view,
                                float out_zhat[2],
@@ -144,7 +145,7 @@ kalman_fusion_predict_led_gate(struct KalmanFusionInterfaceWrapper *wrapper,
 	if (wrapper == nullptr || obs == nullptr || view == nullptr) {
 		return false;
 	}
-	return wrapper->fusion->predict_led_gate(*obs, *view, out_zhat, out_S);
+	return wrapper->fusion->predict_led_gate(timestamp_ns, *obs, *view, out_zhat, out_S);
 }
 
 bool
@@ -212,5 +213,40 @@ kalman_fusion_update_body_anchor(struct KalmanFusionInterfaceWrapper *wrapper, c
 		return;
 	}
 	wrapper->fusion->update_body_anchor(hmd_pose);
+}
+
+int
+kalman_fusion_debug_get_fusion_state(struct KalmanFusionInterfaceWrapper *wrapper, char *name_out, size_t name_cap)
+{
+	if (wrapper == nullptr) {
+		if (name_out != nullptr && name_cap > 0) {
+			name_out[0] = '\0';
+		}
+		return 0;
+	}
+	return wrapper->fusion->debug_get_fusion_state(name_out, name_cap);
+}
+
+bool
+kalman_fusion_debug_get_last_optical_age_ms(struct KalmanFusionInterfaceWrapper *wrapper,
+                                            timepoint_ns timestamp_ns,
+                                            double *age_ms)
+{
+	if (wrapper == nullptr) {
+		return false;
+	}
+	return wrapper->fusion->debug_get_last_optical_age_ms(timestamp_ns, age_ms);
+}
+
+bool
+kalman_fusion_debug_get_oov_report(struct KalmanFusionInterfaceWrapper *wrapper,
+                                   timepoint_ns timestamp_ns,
+                                   const struct xrt_pose *hmd_world_pose,
+                                   struct kalman_fusion_oov_debug *out_debug)
+{
+	if (wrapper == nullptr) {
+		return false;
+	}
+	return wrapper->fusion->debug_get_oov_report(timestamp_ns, hmd_world_pose, out_debug);
 }
 }

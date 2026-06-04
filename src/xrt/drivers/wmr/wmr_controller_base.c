@@ -50,6 +50,7 @@
 #define WMR_INFO(wcb, ...) U_LOG_XDEV_IFL_I(&wcb->base, wcb->log_level, __VA_ARGS__)
 #define WMR_WARN(wcb, ...) U_LOG_XDEV_IFL_W(&wcb->base, wcb->log_level, __VA_ARGS__)
 #define WMR_ERROR(wcb, ...) U_LOG_XDEV_IFL_E(&wcb->base, wcb->log_level, __VA_ARGS__)
+#define WMR_BODY_ANCHOR_QUERY_PERIOD_NS (33ULL * 1000ULL * 1000ULL)
 
 #define wmr_controller_hexdump_buffer(wcb, label, buf, length)                                                         \
 	do {                                                                                                           \
@@ -111,7 +112,7 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 		 * value is the backwards delta in MILLISECONDS: an ns delta does not fit
 		 * f32's ~24-bit mantissa for large clock jumps; ms keeps it meaningful.
 		 * The schema documents value's unit for this event type. */
-		g2_telem_event(wmr_controller_telem_id(wcb), (uint64_t)mono_time_ns, 4 /* imu_anomaly */,
+		g2_telem_event(wmr_controller_telem_id(wcb), (uint64_t)mono_time_ns, G2_TELEM_EV_IMU_ANOMALY,
 		               (float)((double)back_ns / 1.0e6));
 		// Drop this sample and reset clock tracking so the next sample re-establishes the epoch.
 		// The filter keeps its state (it tolerates the gap; a non-monotonic sample is never fed to it).
@@ -149,16 +150,6 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 	// what the t_tracker_kalman_fusion test suite verifies.
 	kalman_fusion_process_imu_data(wcb->kalman_fusion, &k_imu_sample, NULL, NULL);
 
-	// Out-of-view body anchor: feed the live head pose so the fusion bounds the off-camera dead-reckon drift
-	// (no-op while in view; throttled internally).
-	if (wcb->hmd_xdev != NULL) {
-		struct xrt_space_relation hmd_rel;
-		if (xrt_device_get_tracked_pose(wcb->hmd_xdev, XRT_INPUT_GENERIC_TRACKER_POSE, mono_time_ns,
-		                                &hmd_rel) == XRT_SUCCESS &&
-		    (hmd_rel.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
-			kalman_fusion_update_body_anchor(wcb->kalman_fusion, &hmd_rel.pose);
-		}
-	}
 }
 
 static void
@@ -175,7 +166,8 @@ receive_bytes(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *buffer
 	}
 
 	switch (buffer[0]) {
-	case WMR_MOTION_CONTROLLER_STATUS_MSG:
+	case WMR_MOTION_CONTROLLER_STATUS_MSG: {
+		uint64_t body_anchor_query_ns = 0;
 		os_mutex_lock(&wcb->data_lock);
 		// Send a timesync packet if needed
 		if (wcb->timesync_updated) {
@@ -187,6 +179,7 @@ receive_bytes(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *buffer
 
 		// Note: skipping msg type byte
 		bool b = wcb->handle_input_packet(wcb, time_ns, &buffer[1], (size_t)buf_size - 1);
+		body_anchor_query_ns = wcb->last_imu_timestamp_ns;
 		os_mutex_unlock(&wcb->data_lock);
 
 		if (!b) {
@@ -196,7 +189,24 @@ receive_bytes(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *buffer
 			return;
 		}
 
+		// Out-of-view body anchor: query the live HMD pose outside data_lock. The IMU packet parser holds
+		// data_lock at controller packet rate, while xrt_device_get_tracked_pose may recurse into the HMD
+		// tracker; doing that under the controller lock can create avoidable lock contention and jitter.
+		if (wcb->hmd_xdev != NULL && body_anchor_query_ns != 0 &&
+		    (wcb->last_body_anchor_query_ns == 0 ||
+		     body_anchor_query_ns < wcb->last_body_anchor_query_ns ||
+		     body_anchor_query_ns - wcb->last_body_anchor_query_ns >= WMR_BODY_ANCHOR_QUERY_PERIOD_NS)) {
+			wcb->last_body_anchor_query_ns = body_anchor_query_ns;
+			struct xrt_space_relation hmd_rel;
+			if (xrt_device_get_tracked_pose(wcb->hmd_xdev, XRT_INPUT_GENERIC_TRACKER_POSE,
+			                                body_anchor_query_ns, &hmd_rel) == XRT_SUCCESS &&
+			    (hmd_rel.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
+				kalman_fusion_update_body_anchor(wcb->kalman_fusion, &hmd_rel.pose);
+			}
+		}
+
 		break;
+	}
 	default: WMR_DEBUG(wcb, "WMR Controller: Unknown message type: %02x, size: %i", buffer[0], buf_size); break;
 	}
 
@@ -1323,8 +1333,19 @@ wmr_controller_base_get_predicted_pose(struct xrt_device *xdev,
 		return false;
 	}
 	// The matcher's PRIOR uses the raw estimate (no body-lock ride), wait-free from the published snapshot.
-	kalman_fusion_get_predicted_pose(wcb->kalman_fusion, when_ns, out_relation);
+	kalman_fusion_get_predicted_pose(wcb->kalman_fusion, when_ns + wcb->ctrl_optical_td_ns, out_relation);
 	return true;
+}
+
+static bool
+wmr_controller_base_get_last_optical_age_ms(struct xrt_device *xdev, timepoint_ns when_ns, double *age_ms)
+{
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
+	if (wcb->kalman_fusion == NULL || age_ms == NULL) {
+		return false;
+	}
+	return kalman_fusion_debug_get_last_optical_age_ms(wcb->kalman_fusion, when_ns + wcb->ctrl_optical_td_ns,
+	                                                   age_ms);
 }
 
 /* Observed LED peak-brightness band (0-255 image counts) the LED-drive control loop rides toward.
@@ -1417,13 +1438,11 @@ wmr_controller_base_push_observed_leds(struct xrt_device *xdev,
 	                                                      hmd_world_pose);
 	os_mutex_unlock(&wcb->data_lock);
 
-	// Per-frame fold health for log diagnosis: event 7 = LEDs folded (0 = all gated), event 8 = LEDs
-	// submitted. folded < 0 => awaiting bootstrap.
-	if (g2_telem_enabled() && folded >= 0.0f) {
-		uint8_t id = wmr_controller_telem_id(wcb);
-		g2_telem_event(id, (uint64_t)frame_mono_ns, 7 /* eskf_fold_count */, folded);
-		g2_telem_event(id, (uint64_t)frame_mono_ns, 8 /* eskf_leds_seen */, (float)n);
-	}
+		if (g2_telem_enabled() && folded >= 0.0f) {
+			uint8_t id = wmr_controller_telem_id(wcb);
+			g2_telem_event(id, (uint64_t)frame_mono_ns, G2_TELEM_EV_ESKF_FOLD_COUNT, folded);
+			g2_telem_event(id, (uint64_t)frame_mono_ns, G2_TELEM_EV_ESKF_LEDS_SEEN, (float)n);
+		}
 }
 
 // Per-LED ANISOTROPIC covariance gate: predict one LED's image point + 2x2 innovation covariance S =
@@ -1433,6 +1452,7 @@ wmr_controller_base_push_observed_leds(struct xrt_device *xdev,
 // gate-fold (cold-start guard). The payload mirrors wmr_controller_base_push_observed_leds exactly.
 static bool
 wmr_controller_base_predict_led_gate(struct xrt_device *xdev,
+                                     timepoint_ns frame_mono_ns,
                                      const struct xrt_pose *P_xrworld_cam,
                                      const struct t_constellation_cam_calib *cam_calib,
                                      const struct xrt_vec3 *led_obj,
@@ -1452,8 +1472,9 @@ wmr_controller_base_predict_led_gate(struct xrt_device *xdev,
 	    .cam_world_pos = P_xrworld_cam->position,
 	};
 	struct kalman_led_observation obs = {.led_obj = *led_obj}; // observed_px unused by the gate predictor
+	const timepoint_ns fusion_ts = frame_mono_ns + wcb->ctrl_optical_td_ns;
 	os_mutex_lock(&wcb->data_lock);
-	bool ret = kalman_fusion_predict_led_gate(wcb->kalman_fusion, &obs, &view, out_zhat, out_S);
+	bool ret = kalman_fusion_predict_led_gate(wcb->kalman_fusion, fusion_ts, &obs, &view, out_zhat, out_S);
 	os_mutex_unlock(&wcb->data_lock);
 	return ret;
 }
@@ -1546,12 +1567,11 @@ wmr_controller_base_push_observed_pose(struct xrt_device *xdev, timepoint_ns fra
 
 		if (jump_rejected) {
 			outcome = 0 /* rejected */;
-			/* event_type=3 optical_jump_rejected; value = jump magnitude in m. */
-			struct xrt_vec3 jvec = {pose->position.x - prev_optical_pos.x,
-			                        pose->position.y - prev_optical_pos.y,
-			                        pose->position.z - prev_optical_pos.z};
-			g2_telem_event(wmr_controller_telem_id(wcb), (uint64_t)frame_mono_ns,
-			               3 /* optical_jump_rejected */, m_vec3_len(jvec));
+				struct xrt_vec3 jvec = {pose->position.x - prev_optical_pos.x,
+				                        pose->position.y - prev_optical_pos.y,
+				                        pose->position.z - prev_optical_pos.z};
+				g2_telem_event(wmr_controller_telem_id(wcb), (uint64_t)frame_mono_ns,
+				               G2_TELEM_EV_OPTICAL_JUMP_REJECTED, m_vec3_len(jvec));
 		} else if (pos_residual_m > 15.0f /* residual_limit */) {
 			/* Residual too large -> the filter reset (catastrophic). */
 			outcome = 2 /* reset */;
@@ -1592,9 +1612,10 @@ static struct t_constellation_tracked_device_callbacks tracking_callbacks = {
     .push_observed_position = wmr_controller_base_push_observed_position,
     .push_observed_leds = wmr_controller_base_push_observed_leds,
     .push_brightness_update = wmr_controller_base_push_brightness_update,
-    .get_pose_uncertainty = wmr_controller_base_get_pose_uncertainty,
-    .get_predicted_pose = wmr_controller_base_get_predicted_pose,
-    .predict_led_gate = wmr_controller_base_predict_led_gate,
+	.get_pose_uncertainty = wmr_controller_base_get_pose_uncertainty,
+	.get_predicted_pose = wmr_controller_base_get_predicted_pose,
+	.get_last_optical_age_ms = wmr_controller_base_get_last_optical_age_ms,
+	.predict_led_gate = wmr_controller_base_predict_led_gate,
 };
 
 void

@@ -21,6 +21,21 @@ extern "C" {
 
 struct KalmanFusionInterfaceWrapper;
 
+//! Diagnostic snapshot of the out-of-view report inputs at one timestamp. This is not used by production
+//! tracking decisions; offline replay writes it to CSV so OOV policies can be evaluated against captured GT.
+struct kalman_fusion_oov_debug
+{
+	bool valid;
+	bool body_valid;
+	double age_ms;
+	double position_var_max;
+	double inertial_var;
+	double body_var;
+	struct xrt_vec3 raw_predicted_position;
+	struct xrt_vec3 optical_hold_position;
+	struct xrt_vec3 body_report_position;
+};
+
 //! One matched constellation LED for the tightly-coupled per-LED fusion update. C-accessible mirror
 //! of the C++ LEDObservation (the C++ header aliases this exact struct, so there is one definition).
 struct kalman_led_observation
@@ -117,6 +132,7 @@ kalman_fusion_get_predicted_pose(struct KalmanFusionInterfaceWrapper *wrapper,
 //! nothing) until the filter is tracking, or on a null wrapper/view.
 bool
 kalman_fusion_predict_led_gate(struct KalmanFusionInterfaceWrapper *wrapper,
+                               const timepoint_ns timestamp_ns,
                                const struct kalman_led_observation *obs,
                                const struct kalman_led_camera_view *view,
                                float out_zhat[2],
@@ -167,6 +183,26 @@ kalman_fusion_get_imu_intrinsics(struct KalmanFusionInterfaceWrapper *wrapper,
 //! bounded. Call per controller IMU sample; a no-op while in view.
 void
 kalman_fusion_update_body_anchor(struct KalmanFusionInterfaceWrapper *wrapper, const struct xrt_pose *hmd_pose);
+
+//! Diagnostics: named report regime from the last kalman_fusion_get_prediction call. Codes:
+//! 0 Invalid, 1 VisualAccuracy, 2 InertialFastMotion, 3 WorldLocked, 4 BodyLocked, 5 ConfusedPosition.
+int
+kalman_fusion_debug_get_fusion_state(struct KalmanFusionInterfaceWrapper *wrapper,
+                                     char *name_out,
+                                     size_t name_cap);
+
+//! Diagnostics: milliseconds since the last position-constraining optical update at @p timestamp_ns.
+bool
+kalman_fusion_debug_get_last_optical_age_ms(struct KalmanFusionInterfaceWrapper *wrapper,
+                                            timepoint_ns timestamp_ns,
+                                            double *age_ms);
+
+//! Diagnostics: read raw, optical-hold, and body-report position candidates for OOV analysis.
+bool
+kalman_fusion_debug_get_oov_report(struct KalmanFusionInterfaceWrapper *wrapper,
+                                   timepoint_ns timestamp_ns,
+                                   const struct xrt_pose *hmd_world_pose,
+                                   struct kalman_fusion_oov_debug *out_debug);
 
 #ifdef __cplusplus
 }

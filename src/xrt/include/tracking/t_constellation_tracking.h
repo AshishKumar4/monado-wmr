@@ -131,6 +131,9 @@ struct t_constellation_tracked_device_callbacks
 	//! gate + flip cost. @p out receives the pose (identity / untracked flags until the fusion is tracking).
 	//! Optional — if NULL or it returns false, the caller falls back to the device's reported pose.
 	bool (*get_predicted_pose)(struct xrt_device *xdev, timepoint_ns when_ns, struct xrt_space_relation *out);
+	//! Milliseconds since the last position-constraining optical update at @p when_ns. Optional; if absent, the
+	//! tracker treats predictive ROI as freshness-unknown and falls back to covariance-only gating.
+	bool (*get_last_optical_age_ms)(struct xrt_device *xdev, timepoint_ns when_ns, double *age_ms);
 	//! Predict one LED's image point @p out_zhat (px) and 2x2 innovation covariance @p out_S (row-major
 	//! S00,S01,S10,S11 = H·P·Hᵀ + R) — the per-LED ANISOTROPIC gate ellipse from the fusion's live
 	//! covariance, using the SAME projection/Jacobian as the per-LED fold (one source of truth). @p
@@ -139,8 +142,10 @@ struct t_constellation_tracked_device_callbacks
 	//! real covariance (tight tilt / loose yaw after a dropout) instead of a fixed radius — the
 	//! covariance-driven associator. Optional — may be NULL, or return false until the fusion is
 	//! tracking (no usable prior, e.g. cold start); the caller then does NOT gate-fold.
-	bool (*predict_led_gate)(struct xrt_device *xdev, const struct xrt_pose *P_xrworld_cam,
-	                         const struct t_constellation_cam_calib *cam_calib, const struct xrt_vec3 *led_obj,
+	bool (*predict_led_gate)(struct xrt_device *xdev, timepoint_ns when_ns,
+	                         const struct xrt_pose *P_xrworld_cam,
+	                         const struct t_constellation_cam_calib *cam_calib,
+	                         const struct xrt_vec3 *led_obj,
 	                         float out_zhat[2], float out_S[4]);
 	//! Position-only visual observation for frames where LED correspondences constrain translation but not
 	//! orientation. Optional — callers still use push_observed_pose for full 6DoF locks.

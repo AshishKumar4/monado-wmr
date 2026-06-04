@@ -63,6 +63,7 @@ struct association_cost_terms
 	float orientation_prior_nll;
 	float head_anchor_nll;
 	float body_state_nll;
+	float orientation_consensus_nll;
 	float temporal_nll;
 	float total_nll;
 };
@@ -79,6 +80,9 @@ struct association_pose_hypothesis
 	uint8_t unmatched_count;
 	struct association_blob_ref matched_blobs[ASSOCIATION_MAX_BLOBS_PER_HYPOTHESIS];
 	int16_t matched_led_ids[ASSOCIATION_MAX_BLOBS_PER_HYPOTHESIS];
+
+	float tilt_error_rad;
+	bool tilt_valid;
 
 	struct association_cost_terms cost;
 	struct pose_metrics score;

@@ -81,6 +81,13 @@ target_include_directories(
 add_test(NAME tests_association_hypothesis COMMAND tests_association_hypothesis --success --allow-running-no-tests)
 set_target_properties(tests_association_hypothesis PROPERTIES FOLDER monado_tests)
 
+add_executable(tests_l2_accept_gate tests_l2_accept_gate.cpp)
+target_link_libraries(tests_l2_accept_gate PRIVATE xrt-external-catch2)
+target_include_directories(
+	tests_l2_accept_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/tracking/constellation)
+add_test(NAME tests_l2_accept_gate COMMAND tests_l2_accept_gate --success --allow-running-no-tests)
+set_target_properties(tests_l2_accept_gate PROPERTIES FOLDER monado_tests)
+
 if(XRT_HAVE_OPENCV)
 	target_link_libraries(tests_kalman_fusion PRIVATE aux_math aux_tracking Threads::Threads ${OpenCV_LIBRARIES})
 	target_include_directories(tests_kalman_fusion PRIVATE ${OpenCV_INCLUDE_DIRS})
@@ -154,6 +161,17 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 										${OpenCV_INCLUDE_DIRS})
 	add_test(NAME tests_constellation_pnp COMMAND tests_constellation_pnp --success --allow-running-no-tests)
 	set_target_properties(tests_constellation_pnp PROPERTIES FOLDER monado_tests)
+
+	# Decoupled unit tests for per-LED multi-camera triangulation and the L1 single-cam-depth verdict.
+	add_executable(tests_multicam_triangulate tests_multicam_triangulate.cpp)
+	target_link_libraries(
+		tests_multicam_triangulate PRIVATE xrt-external-catch2 constellation_tracker aux_math aux_util
+										   xrt-interfaces ${OpenCV_LIBRARIES})
+	target_include_directories(
+		tests_multicam_triangulate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/tracking/constellation
+										   ${OpenCV_INCLUDE_DIRS})
+	add_test(NAME tests_multicam_triangulate COMMAND tests_multicam_triangulate --success --allow-running-no-tests)
+	set_target_properties(tests_multicam_triangulate PROPERTIES FOLDER monado_tests)
 
 	# Decoupled, adversarial unit tests for the blob-detection layer (saturated-centroid recovery,
 	# per-blob R, reflection rejection). Synthetic frames, known truth.

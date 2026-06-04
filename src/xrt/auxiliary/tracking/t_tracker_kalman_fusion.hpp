@@ -141,8 +141,13 @@ public:
 	 * (S00,S01,S10,S11). Returns false (and writes nothing) until the filter is tracking.
 	 */
 	virtual bool
-	predict_led_gate(const LEDObservation &obs, const LEDCameraView &view, float out_zhat[2], float out_S[4])
+	predict_led_gate(const timepoint_ns when_ns,
+	                 const LEDObservation &obs,
+	                 const LEDCameraView &view,
+	                 float out_zhat[2],
+	                 float out_S[4])
 	{
+		(void)when_ns;
 		(void)obs;
 		(void)view;
 		(void)out_zhat;
@@ -316,6 +321,25 @@ public:
 		(void)name_out;
 		(void)name_cap;
 		return 0;
+	}
+
+	virtual bool
+	debug_get_last_optical_age_ms(timepoint_ns when_ns, double *age_ms)
+	{
+		(void)when_ns;
+		(void)age_ms;
+		return false;
+	}
+
+	virtual bool
+	debug_get_oov_report(timepoint_ns when_ns,
+	                     const struct xrt_pose *hmd_world_pose,
+	                     struct kalman_fusion_oov_debug *out_debug)
+	{
+		(void)when_ns;
+		(void)hmd_world_pose;
+		(void)out_debug;
+		return false;
 	}
 };
 } // namespace xrt::auxiliary::tracking

@@ -105,6 +105,34 @@ detect(TestFrame &tf)
 	return out;
 }
 
+std::vector<blob>
+detect_roi(TestFrame &tf, int x, int y, int w, int h)
+{
+	blobwatch *bw = blobwatch_new(PIX_THR, DETECT_THR, 0);
+	blobservation *ob = nullptr;
+	blobwatch_process_roi(bw, &tf.f, /*exposure=*/100, /*gain=*/0, x, y, w, h, &ob);
+	std::vector<blob> out;
+	if (ob != nullptr)
+		out.assign(ob->blobs, ob->blobs + ob->num_blobs);
+	blobwatch_free(bw);
+	return out;
+}
+
+std::vector<blob>
+detect_roi_lowthresh(TestFrame &tf, int x, int y, int w, int h)
+{
+	blobwatch *bw = blobwatch_new(PIX_THR, DETECT_THR, 0);
+	blobservation *ob = nullptr;
+	blobwatch_process_roi_lowthresh(bw, &tf.f, /*exposure=*/100, /*gain=*/0, x, y, w, h,
+	                                /*roi_pixel_threshold=*/4, /*roi_adapt_margin=*/3,
+	                                /*roi_required_threshold=*/12, &ob);
+	std::vector<blob> out;
+	if (ob != nullptr)
+		out.assign(ob->blobs, ob->blobs + ob->num_blobs);
+	blobwatch_free(bw);
+	return out;
+}
+
 // Nearest blob to (x,y); asserts there is exactly one within `tol` so a duplicate/missing blob fails.
 // Returns by value so it stays valid even when the caller passes a temporary blob vector.
 blob
@@ -151,6 +179,63 @@ TEST_CASE("blobwatch: unsaturated round LED is retained near its true centre")
 	REQUIRE(b.pos_var_px2 > 0.0f); // always a finite, positive R
 }
 
+TEST_CASE("blobwatch: non-zero ROI reports the same centroid as full-frame detection")
+{
+	TestFrame tf;
+	tf.add_gaussian(82.2, 71.4, 1.5, 190, /*clip=*/false);
+
+	const blob full = nearest(detect(tf), 82.2, 71.4);
+	const blob roi = nearest(detect_roi(tf, 74, 63, 18, 18), 82.2, 71.4);
+
+	INFO("full=(" << full.x << "," << full.y << ") roi=(" << roi.x << "," << roi.y << ")");
+	REQUIRE(std::hypot(full.x - roi.x, full.y - roi.y) < 0.2);
+}
+
+TEST_CASE("blobwatch: ROI scans and finalizes the bottom row")
+{
+	TestFrame tf;
+	tf.at(81, 72) = 50;
+	tf.at(82, 72) = 100;
+	tf.at(83, 72) = 50;
+
+	auto bs = detect_roi(tf, 78, 64, 10, 9);
+	const blob b = nearest(bs, 82.0, 72.0, 1.0);
+	INFO("bottom-row ROI blob=(" << b.x << "," << b.y << ") count=" << bs.size());
+	REQUIRE(std::abs(b.y - 72.0) < 0.25);
+}
+
+TEST_CASE("blobwatch: compact dim LED below detect threshold is retained inside an ROI")
+{
+	TestFrame tf;
+	tf.at(63, 64) = 12;
+	tf.at(64, 64) = 18;
+	tf.at(65, 64) = 12;
+	tf.at(64, 63) = 12;
+	tf.at(64, 65) = 12;
+
+	auto bs = detect_roi(tf, 56, 56, 17, 17);
+	const blob b = nearest(bs, 64.0, 64.0, 1.0);
+	REQUIRE(b.brightness < DETECT_THR);
+}
+
+TEST_CASE("blobwatch: low-threshold ROI retains shaped dim blobs above the ROI pixel floor")
+{
+	TestFrame tf;
+	tf.add_gaussian(64.0, 64.0, 2.2, 10, /*clip=*/false);
+
+	auto bs = detect_roi_lowthresh(tf, 52, 52, 25, 25);
+	const blob b = nearest(bs, 64.0, 64.0, 2.0);
+	REQUIRE(b.brightness < 12);
+}
+
+TEST_CASE("blobwatch: isolated one-pixel dim speck is rejected")
+{
+	TestFrame tf;
+	tf.at(64, 64) = 18;
+	auto bs = detect(tf);
+	REQUIRE(bs.empty());
+}
+
 TEST_CASE("blobwatch: saturated centroid beats the greysum plateau bias (asymmetric skirt)")
 {
 	// A saturated spot with an asymmetric skirt: a real LED whose one side has extra glow. The clipped
@@ -183,7 +268,7 @@ TEST_CASE("blobwatch: saturated blob carries larger R than a tight clean blob")
 	const blob bc = nearest(detect(clean), 40.0, 40.0);
 
 	TestFrame sat;
-	sat.add_gaussian(40.0, 40.0, 2.6, 700, true); // wide saturated plateau
+	sat.add_gaussian(40.0, 40.0, 2.1, 650, true);
 	const blob bs = nearest(detect(sat), 40.0, 40.0, 12.0);
 
 	INFO("clean R=" << bc.pos_var_px2 << " saturated R=" << bs.pos_var_px2);

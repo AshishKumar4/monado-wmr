@@ -169,14 +169,6 @@ struct g2_telem_event
 #endif
 #undef G2_PACKED
 
-enum
-{
-	G2_TELEM_EV_LOCK_ACQUIRED = 1,
-	G2_TELEM_EV_IMU_ANOMALY = 4,
-	G2_TELEM_EV_RING_OVERFLOW = 5,
-};
-
-
 /*
  *
  * Logging stubs (so we don't need to link aux_util's u_logging.c).

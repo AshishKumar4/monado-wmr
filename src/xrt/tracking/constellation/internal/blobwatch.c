@@ -11,12 +11,17 @@
  * @ingroup constellation
  */
 #include <assert.h>
+#include <inttypes.h>
 #include <limits.h>
+#include <math.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "os/os_threading.h"
 
 #include "util/u_logging.h"
 #include "util/u_g2_telemetry.h"
@@ -44,6 +49,7 @@
  * it lifts the floor without eroding real LED spots (validated on captures:
  * ~99% of dark-frame LEDs retained, bright-room false blobs cut >10x). */
 #define ADAPT_MARGIN 6
+#define BLOB_ADMISSION_NOISE_FLOOR 8
 /* Half-size of the local-background box (window = 2*r+1). Large enough to
  * straddle an LED spot so the LED itself barely lifts its own background. */
 #define ADAPT_BG_RADIUS 12
@@ -52,12 +58,25 @@
  * band also catches near-clipped pixels whose greysum centroid is already biased. */
 #define SATURATION_LEVEL (255 - 5)
 
-/* Blob qualification (reject reflections / streaks / window edges). */
-#define MIN_FILL_RATIO 0.40f /* area / bbox-area; round spot is high, streak low */
-/* Peaked LED spot vs flat bright patch. Validated on real captures: across 209 certain LEDs (peak>=32)
- * the ratio is always >=1.61 (0% dropped at 1.30), while room-noise blobs cluster <=1.26 (93% rejected). */
+/* Shape qualification rejects clutter without throwing away dim LED spots. */
+#define MAX_BLOB_WH 12
+#define MIN_BLOB_AREA 2
+#define MIN_BLOB_ASPECT 0.34f
+#define MIN_FILL_FLOOR 0.34f
+#define MIN_FILL_BRIGHT 0.45f
 #define MIN_PEAK_TO_MEAN 1.30f
-#define MIN_BLOB_AREA 3 /* drop salt-and-pepper specks */
+#define SHAPE_BRIGHT_REF 40.0f
+
+/* Bounded recovery for dim compact local maxima missed by the scanline gates. */
+#define RECOVER_NMS_RADIUS 2
+#define RECOVER_MAX_WH 5
+#define RECOVER_MIN_AREA 2
+#define RECOVER_MIN_SNR 6.0f
+#define RECOVER_CENTER_EXCESS 4.0f
+#define RECOVER_RING_STD_FLOOR 1.0f
+#define RECOVER_DEDUP_R 3.0f
+#define RECOVER_RIDGE_RING_MAX 1
+#define RECOVER_FRAME_MAX 4
 
 /* Centroid-uncertainty (R) inflation factors. A fully clipped or frame-edge-truncated spot has lost the
  * symmetry information its centre relies on, so its variance is inflated up to these multiples. Derived as
@@ -75,6 +94,154 @@
 #define abs(x) ((x) >= 0 ? (x) : -(x))
 #define min(x, y) ((x) < (y) ? (x) : (y))
 #define max(x, y) ((x) > (y) ? (x) : (y))
+
+#define G2_PGM_DUMP_QUEUE_CAP 64
+
+struct g2_pgm_dump_job
+{
+	char path[512];
+	struct xrt_frame *frame;
+};
+
+struct g2_pgm_dump_queue
+{
+	struct os_thread_helper helper;
+	bool initialized;
+	bool enabled;
+	bool blocking;
+	struct g2_pgm_dump_job jobs[G2_PGM_DUMP_QUEUE_CAP];
+	uint32_t head;
+	uint32_t tail;
+	uint32_t count;
+	uint64_t dropped;
+};
+
+static struct g2_pgm_dump_queue g_pgm_dump = {0};
+static pthread_once_t g_pgm_dump_once = PTHREAD_ONCE_INIT;
+static atomic_uint g_pgm_dump_stride_ctr = ATOMIC_VAR_INIT(0);
+
+static void
+g2_pgm_dump_write_job(struct g2_pgm_dump_job *job)
+{
+	FILE *fp = fopen(job->path, "wb");
+	if (fp != NULL && job->frame != NULL && job->frame->data != NULL) {
+		fprintf(fp, "P5\n%u %u\n255\n", job->frame->width, job->frame->height);
+		for (uint32_t y = 0; y < job->frame->height; y++) {
+			const uint8_t *row = job->frame->data + (size_t)y * job->frame->stride;
+			fwrite(row, 1, job->frame->width, fp);
+		}
+		fclose(fp);
+	}
+	xrt_frame_reference(&job->frame, NULL);
+}
+
+static void *
+g2_pgm_dump_thread(void *ptr)
+{
+	struct g2_pgm_dump_queue *queue = (struct g2_pgm_dump_queue *)ptr;
+
+	for (;;) {
+		struct g2_pgm_dump_job job = {0};
+
+		os_thread_helper_lock(&queue->helper);
+		while (queue->count == 0 && os_thread_helper_is_running_locked(&queue->helper)) {
+			os_thread_helper_wait_locked(&queue->helper);
+		}
+		if (queue->count == 0 && !os_thread_helper_is_running_locked(&queue->helper)) {
+			os_thread_helper_unlock(&queue->helper);
+			break;
+		}
+		job = queue->jobs[queue->head];
+		queue->jobs[queue->head] = (struct g2_pgm_dump_job){0};
+		queue->head = (queue->head + 1) % G2_PGM_DUMP_QUEUE_CAP;
+		queue->count--;
+		os_thread_helper_signal_locked(&queue->helper);
+		os_thread_helper_unlock(&queue->helper);
+
+		g2_pgm_dump_write_job(&job);
+	}
+
+	os_thread_helper_signal_stop(&queue->helper);
+	return NULL;
+}
+
+static void
+g2_pgm_dump_shutdown(void)
+{
+	if (!g_pgm_dump.initialized) {
+		return;
+	}
+	os_thread_helper_destroy(&g_pgm_dump.helper);
+	g_pgm_dump.initialized = false;
+}
+
+static void
+g2_pgm_dump_init_once(void)
+{
+	const char *dump_dir = getenv("G2_DUMP_FRAMES");
+	if (dump_dir == NULL || dump_dir[0] == '\0') {
+		return;
+	}
+
+	g_pgm_dump.enabled = true;
+	g_pgm_dump.blocking = getenv("G2_DUMP_FRAMES_BLOCKING") != NULL;
+	if (os_thread_helper_init(&g_pgm_dump.helper) != 0) {
+		g_pgm_dump.enabled = false;
+		return;
+	}
+	g_pgm_dump.initialized = true;
+	if (os_thread_helper_start(&g_pgm_dump.helper, g2_pgm_dump_thread, &g_pgm_dump) != 0) {
+		os_thread_helper_destroy(&g_pgm_dump.helper);
+		g_pgm_dump.initialized = false;
+		g_pgm_dump.enabled = false;
+		return;
+	}
+	os_thread_helper_name(&g_pgm_dump.helper, "G2 PGM dump");
+	atexit(g2_pgm_dump_shutdown);
+}
+
+static bool
+g2_pgm_dump_enabled(void)
+{
+	pthread_once(&g_pgm_dump_once, g2_pgm_dump_init_once);
+	return g_pgm_dump.enabled && g_pgm_dump.initialized;
+}
+
+static void
+g2_pgm_dump_enqueue(const char *path, struct xrt_frame *frame)
+{
+	if (!g2_pgm_dump_enabled() || frame == NULL || frame->data == NULL || frame->width == 0 ||
+	    frame->height == 0 || frame->stride < frame->width) {
+		return;
+	}
+
+	struct g2_pgm_dump_job job = {0};
+	snprintf(job.path, sizeof(job.path), "%s", path);
+
+	os_thread_helper_lock(&g_pgm_dump.helper);
+	while (g_pgm_dump.blocking && g_pgm_dump.count == G2_PGM_DUMP_QUEUE_CAP &&
+	       os_thread_helper_is_running_locked(&g_pgm_dump.helper)) {
+		os_thread_helper_wait_locked(&g_pgm_dump.helper);
+	}
+	if (g_pgm_dump.count == G2_PGM_DUMP_QUEUE_CAP || !os_thread_helper_is_running_locked(&g_pgm_dump.helper)) {
+		g_pgm_dump.dropped++;
+		if (g_pgm_dump.dropped == 1 || (g_pgm_dump.dropped % 1000) == 0) {
+			g2_telem_event(0, g2_telem_now_ns(), G2_TELEM_EV_FRAME_DUMP_DROPPED,
+			               (float)g_pgm_dump.dropped);
+			U_LOG_W("G2_DUMP_FRAMES async queue full; dropped %" PRIu64
+			        " frame(s). Set G2_DUMP_FRAMES_BLOCKING=1 for lossless capture.",
+			        g_pgm_dump.dropped);
+		}
+		os_thread_helper_unlock(&g_pgm_dump.helper);
+		return;
+	}
+	xrt_frame_reference(&job.frame, frame);
+	g_pgm_dump.jobs[g_pgm_dump.tail] = job;
+	g_pgm_dump.tail = (g_pgm_dump.tail + 1) % G2_PGM_DUMP_QUEUE_CAP;
+	g_pgm_dump.count++;
+	os_thread_helper_signal_locked(&g_pgm_dump.helper);
+	os_thread_helper_unlock(&g_pgm_dump.helper);
+}
 
 struct extent
 {
@@ -195,13 +362,11 @@ blobwatch_new(uint8_t pixel_threshold, uint8_t blob_required_threshold, uint8_t 
 	 * point somewhere, and helps to eliminate generally faint background noise */
 	bw->blob_required_threshold = blob_required_threshold;
 
-	/* Don't store blobs that are too big to be LEDs sensibly
-	 * (arbitrary 35 pixel cut-off. FIXME: revisit this number) */
-	bw->blob_max_wh = 35;
-	bw->blob_min_aspect = 0.30f;
+	bw->blob_max_wh = MAX_BLOB_WH;
+	bw->blob_min_aspect = MIN_BLOB_ASPECT;
 
 	bw->last_observation = NULL;
-	bw->debug = true;
+	bw->debug = false;
 
 	INIT_QUEUE(&bw->observation_q);
 	/* Push all observations into the available queue */
@@ -507,8 +672,10 @@ extent_to_blobs(blobwatch *bw, blobservation *ob, struct extent *e, int y, struc
 	const int max_blobs = MAX_BLOBS_PER_FRAME;
 	struct blob *blobs = ob->blobs;
 
-	/* Don't store unless there was at least one "bright enough" pixel in the blob */
-	if (e->max_pixel < bw->blob_required_threshold) {
+	const uint8_t admission_threshold = bw->pixel_threshold > BLOB_ADMISSION_NOISE_FLOOR
+	                                        ? bw->pixel_threshold
+	                                        : BLOB_ADMISSION_NOISE_FLOOR;
+	if (e->max_pixel <= admission_threshold) {
 		ob->dropped_dark_blobs++;
 		return;
 	}
@@ -528,15 +695,11 @@ extent_to_blobs(blobwatch *bw, blobservation *ob, struct extent *e, int y, struc
 	const uint32_t bb_w = e->right - e->left + 1;
 	const uint32_t bb_h = y - e->top + 1;
 
-	/* Drop tiny specks (sensor noise that survived the adaptive threshold). */
 	if (e->area < MIN_BLOB_AREA) {
 		ob->dropped_shape_blobs++;
 		return;
 	}
 
-	/* Reject non-LED shapes (window edges / reflections / streaks): an LED images as a small, roughly
-	 * round, well-filled, peaked spot. Aspect-ratio rejects elongated streaks/edges; fill-ratio rejects
-	 * sparse blobs; peak-to-mean rejects flat bright patches — before they pollute the matcher. */
 	{
 		const uint32_t lo = (bb_w < bb_h) ? bb_w : bb_h;
 		const uint32_t hi = (bb_w > bb_h) ? bb_w : bb_h;
@@ -549,7 +712,16 @@ extent_to_blobs(blobwatch *bw, blobservation *ob, struct extent *e, int y, struc
 	const float mean = (float)e->intensity_sum / (float)e->area;
 	const float peak_to_mean = (float)e->max_pixel / (mean > 0.0f ? mean : 1.0f);
 	const bool saturated = e->sat_count > 0;
-	if (fill_ratio < MIN_FILL_RATIO || peak_to_mean < MIN_PEAK_TO_MEAN) {
+	float t = ((float)e->max_pixel - (float)bw->pixel_threshold) / (SHAPE_BRIGHT_REF - (float)bw->pixel_threshold);
+	if (t < 0.0f) {
+		t = 0.0f;
+	}
+	if (t > 1.0f) {
+		t = 1.0f;
+	}
+	const float fill_gate = MIN_FILL_FLOOR + (MIN_FILL_BRIGHT - MIN_FILL_FLOOR) * t;
+	const float p2m_gate = 1.0f + (MIN_PEAK_TO_MEAN - 1.0f) * t;
+	if (fill_ratio < fill_gate || peak_to_mean < p2m_gate) {
 		ob->dropped_shape_blobs++; // a shape/quality reject, not a brightness (dark) one
 		return;
 	}
@@ -749,6 +921,239 @@ copy_matching_blob(struct blob *to, struct blob *from)
 	to->age = from->age + 1;
 }
 
+static void
+recover_dim_blobs(blobwatch *bw,
+                  blobservation *ob,
+                  struct xrt_frame *frame,
+                  uint32_t roi_x,
+                  uint32_t roi_y,
+                  uint32_t roi_x_end,
+                  uint32_t roi_y_end)
+{
+	const int w = (int)frame->width, h = (int)frame->height;
+	const int nms = RECOVER_NMS_RADIUS;
+	const int x_lo = (int)roi_x < 2 ? 2 : (int)roi_x;
+	const int y_lo = (int)roi_y < 2 ? 2 : (int)roi_y;
+	const int x_hi = (int)roi_x_end > w - 2 ? w - 2 : (int)roi_x_end;
+	const int y_hi = (int)roi_y_end > h - 2 ? h - 2 : (int)roi_y_end;
+	const int num_blobs_before = ob->num_blobs;
+
+	for (int y = y_lo; y < y_hi; y++) {
+		const uint8_t *row = frame->data + (size_t)frame->stride * y;
+		for (int x = x_lo; x < x_hi; x++) {
+			if (ob->num_blobs >= MAX_BLOBS_PER_FRAME) {
+				goto done;
+			}
+
+			const int peak = row[x];
+			if (peak <= bw->pixel_threshold) {
+				continue;
+			}
+			const int lb = (int)local_bg_mean(bw, x, y, w, h);
+			if (peak - lb < (int)bw->adapt_margin) {
+				continue;
+			}
+
+			bool is_peak = true;
+			for (int dy = -nms; dy <= nms && is_peak; dy++) {
+				const uint8_t *r2 = frame->data + (size_t)frame->stride * (y + dy);
+				for (int dx = -nms; dx <= nms; dx++) {
+					if (dx == 0 && dy == 0) {
+						continue;
+					}
+					const int v = r2[x + dx];
+					if (v > peak || (v == peak && (dy < 0 || (dy == 0 && dx < 0)))) {
+						is_peak = false;
+						break;
+					}
+				}
+			}
+			if (!is_peak) {
+				continue;
+			}
+
+			bool covered = false;
+			for (int i = 0; i < ob->num_blobs && !covered; i++) {
+				const float ddx = ob->blobs[i].x - (float)x;
+				const float ddy = ob->blobs[i].y - (float)y;
+				covered = ddx * ddx + ddy * ddy <= RECOVER_DEDUP_R * RECOVER_DEDUP_R;
+			}
+			if (covered) {
+				continue;
+			}
+
+			double ring_sum = 0.0, ring_sqsum = 0.0;
+			int ring_n = 0;
+			for (int dy = -2; dy <= 2; dy++) {
+				const uint8_t *r2 = frame->data + (size_t)frame->stride * (y + dy);
+				for (int dx = -2; dx <= 2; dx++) {
+					if (dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1) {
+						continue;
+					}
+					const double v = r2[x + dx];
+					ring_sum += v;
+					ring_sqsum += v * v;
+					ring_n++;
+				}
+			}
+			const double ring_mean = ring_sum / ring_n;
+			double ring_var = ring_sqsum / ring_n - ring_mean * ring_mean;
+			if (ring_var < 0.0) {
+				ring_var = 0.0;
+			}
+			const double ring_std = sqrt(ring_var);
+			const double center_above_ring = (double)peak - ring_mean;
+			if (center_above_ring < RECOVER_CENTER_EXCESS) {
+				continue;
+			}
+			const double denom = ring_std > RECOVER_RING_STD_FLOOR ? ring_std : RECOVER_RING_STD_FLOOR;
+			if (center_above_ring / denom < RECOVER_MIN_SNR) {
+				continue;
+			}
+
+			const int half = RECOVER_MAX_WH;
+			const int wx0 = x - half < 0 ? 0 : x - half;
+			const int wy0 = y - half < 0 ? 0 : y - half;
+			const int wx1 = x + half >= w ? w - 1 : x + half;
+			const int wy1 = y + half >= h ? h - 1 : y + half;
+			const int ww = wx1 - wx0 + 1, wh = wy1 - wy0 + 1;
+			bool seen[(2 * RECOVER_MAX_WH + 1) * (2 * RECOVER_MAX_WH + 1)] = {false};
+			int stack[(2 * RECOVER_MAX_WH + 1) * (2 * RECOVER_MAX_WH + 1)];
+			int sp = 0;
+			int area = 0, bb_l = x, bb_r = x, bb_t = y, bb_b = y;
+			double wsum = 0.0, wx = 0.0, wy = 0.0;
+
+			stack[sp++] = (y - wy0) * ww + (x - wx0);
+			seen[(y - wy0) * ww + (x - wx0)] = true;
+			while (sp > 0) {
+				const int idx = stack[--sp];
+				const int lyy = idx / ww, lxx = idx % ww;
+				const int yy = wy0 + lyy, xx = wx0 + lxx;
+				const int v = frame->data[(size_t)frame->stride * yy + xx];
+				area++;
+				if (xx < bb_l) {
+					bb_l = xx;
+				}
+				if (xx > bb_r) {
+					bb_r = xx;
+				}
+				if (yy < bb_t) {
+					bb_t = yy;
+				}
+				if (yy > bb_b) {
+					bb_b = yy;
+				}
+				const int b0 = (int)local_bg_mean(bw, xx, yy, w, h);
+				const double wgt = (double)(v - b0);
+				wsum += wgt;
+				wx += wgt * xx;
+				wy += wgt * yy;
+
+				for (int dy = -1; dy <= 1; dy++) {
+					for (int dx = -1; dx <= 1; dx++) {
+						if (dx == 0 && dy == 0) {
+							continue;
+						}
+						const int nlx = lxx + dx, nly = lyy + dy;
+						if (nlx < 0 || nly < 0 || nlx >= ww || nly >= wh) {
+							continue;
+						}
+						const int nidx = nly * ww + nlx;
+						if (seen[nidx]) {
+							continue;
+						}
+						const int nyy = wy0 + nly, nxx = wx0 + nlx;
+						const int nv = frame->data[(size_t)frame->stride * nyy + nxx];
+						seen[nidx] = true;
+						if (nv <= bw->pixel_threshold) {
+							continue;
+						}
+						const int nb = (int)local_bg_mean(bw, nxx, nyy, w, h);
+						if (nv - nb >= (int)bw->adapt_margin) {
+							stack[sp++] = nidx;
+						}
+					}
+				}
+			}
+			if (area < RECOVER_MIN_AREA) {
+				continue;
+			}
+			if (bb_r - bb_l + 1 > RECOVER_MAX_WH || bb_b - bb_t + 1 > RECOVER_MAX_WH) {
+				continue;
+			}
+
+			static const int ring_dx[16] = {3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1, 0, 1, 2, 3};
+			static const int ring_dy[16] = {0, 1, 2, 3, 3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1};
+			int ring_bright = 0;
+			for (int k = 0; k < 16; k++) {
+				const int rx = x + ring_dx[k], ry = y + ring_dy[k];
+				if (rx < 0 || ry < 0 || rx >= w || ry >= h) {
+					continue;
+				}
+				const int rv = frame->data[(size_t)frame->stride * ry + rx];
+				if (rv - (int)local_bg_mean(bw, rx, ry, w, h) >= (int)bw->adapt_margin) {
+					ring_bright++;
+				}
+			}
+			if (ring_bright >= RECOVER_RIDGE_RING_MAX) {
+				continue;
+			}
+
+			float led_x = wsum > 0.0 ? (float)(wx / wsum) : (float)x;
+			float led_y = wsum > 0.0 ? (float)(wy / wsum) : (float)y;
+			const float c = (float)peak;
+			const float lx = row[x - 1], rx = row[x + 1];
+			const float ux = frame->data[(size_t)frame->stride * (y - 1) + x];
+			const float dx = frame->data[(size_t)frame->stride * (y + 1) + x];
+			const float denx = lx - 2.0f * c + rx;
+			const float deny = ux - 2.0f * c + dx;
+			if (denx < 0.0f) {
+				const float s = 0.5f * (lx - rx) / denx;
+				if (s > -0.5f && s < 0.5f) {
+					led_x = (float)x + s;
+				}
+			}
+			if (deny < 0.0f) {
+				const float s = 0.5f * (ux - dx) / deny;
+				if (s > -0.5f && s < 0.5f) {
+					led_y = (float)y + s;
+				}
+			}
+
+			const float spread = 0.25f * (float)((bb_r - bb_l + 1) + (bb_b - bb_t + 1));
+			float pos_var_px2 = spread * spread;
+			if (pos_var_px2 < 0.25f) {
+				pos_var_px2 = 0.25f;
+			}
+			pos_var_px2 *= DIM_R_INFLATE_MAX;
+
+			struct blob *b = &ob->blobs[ob->num_blobs];
+			b->blob_id = bw->next_blob_id++;
+			b->x = led_x;
+			b->y = led_y;
+			b->pos_var_px2 = pos_var_px2;
+			b->vx = 0;
+			b->vy = 0;
+			b->left = (uint16_t)bb_l;
+			b->top = (uint16_t)bb_t;
+			b->width = (uint16_t)(bb_r - bb_l + 1);
+			b->height = (uint16_t)(bb_b - bb_t + 1);
+			b->area = (uint32_t)area;
+			b->age = 0;
+			b->track_index = -1;
+			b->id_age = 0;
+			b->prev_led_id = b->led_id = LED_INVALID_ID;
+			b->brightness = (uint8_t)peak;
+			ob->num_blobs++;
+		}
+	}
+
+done:
+	if (ob->num_blobs - num_blobs_before > RECOVER_FRAME_MAX) {
+		ob->num_blobs = num_blobs_before;
+	}
+}
+
 /*
  * Predictive-ROI variant of process_frame: scans only rows in [roi_y, roi_y_end) and clips each row
  * scan to columns [roi_x, roi_x_end). Convergent with Oasis driver's PredictiveROI: blob search is
@@ -777,16 +1182,14 @@ process_frame_roi(blobwatch *bw,
 
 	build_integral(bw, frame);
 
-	/* Stride pattern matches the original process_frame: `line` is advanced at the END of each
-	 * loop iteration, so the established gate baseline (which depended on that ordering) is preserved.
-	 *
-	 * Buffer alternation: the original `y & 1 ? &el2 : &el1` pattern works only when roi_y=0 (so the
+	/* Buffer alternation: the original `y & 1 ? &el2 : &el1` pattern works only when roi_y=0 (so the
 	 * first loop iter at y=1 reads from el1 which the prologue just filled). For arbitrary roi_y the
 	 * parity flips and the loop reads UNINITIALIZED stack memory -> segfault. Explicit prev/cur swap
 	 * is correct regardless of roi_y. */
 	uint8_t *line = frame->data + (size_t)roi_y * frame->stride;
 	struct extent_line *prev = &el1, *cur = &el2;
 	process_scanline(line, bw, roi_y, prev, NULL, frame, ob, roi_x, roi_x_end);
+	line += frame->stride;
 
 	for (uint32_t y = roi_y + 1; y < roi_y_end; y++) {
 		process_scanline(line, bw, y, cur, prev, frame, ob, roi_x, roi_x_end);
@@ -804,6 +1207,11 @@ process_frame_roi(blobwatch *bw,
 		for (struct extent *e_iter = prev->extents; e_iter < prev->extents + prev->num; e_iter++) {
 			extent_to_blobs(bw, ob, e_iter, (int)last_y, frame);
 		}
+	}
+
+	const bool is_full_frame = roi_x == 0 && roi_y == 0 && roi_x_end == frame->width && roi_y_end == frame->height;
+	if (!is_full_frame) {
+		recover_dim_blobs(bw, ob, frame, roi_x, roi_y, roi_x_end, roi_y_end);
 	}
 
 	/* Dimness-rank R inflation: identical to process_frame, scoped to the ROI blobs found. */
@@ -904,13 +1312,13 @@ blobwatch_process_roi(blobwatch *bw,
 
 	/* Optional: dump the actual controller-tracking frame (what the constellation tracker sees) as
 	 * PGM — the real short-exposure LED images, which the EuRoC recorder does NOT capture (it taps the
-	 * SLAM-exposure stream). Enabled by G2_DUMP_FRAMES=<dir>. Default dumps EVERY frame (needed for a
-	 * faithful offline VIO replay); set G2_DUMP_FRAMES_STRIDE=N to dump 1-in-N (e.g. 15 for sparse
-	 * inspection, less capture-time I/O). */
+	 * SLAM-exposure stream). Enabled by G2_DUMP_FRAMES=<dir>. Frames are copied into a bounded async writer
+	 * queue so capture I/O cannot stall controller tracking. Default dumps every frame but drops if storage
+	 * cannot keep up; set G2_DUMP_FRAMES_BLOCKING=1 for lossless offline-corpus capture, or
+	 * G2_DUMP_FRAMES_STRIDE=N for sparse visual inspection. */
 	{
 		static const char *dump_dir = NULL;
 		static bool dump_init = false;
-		static uint32_t dump_ctr = 0;
 		static uint32_t dump_stride = 1;
 		if (!dump_init) {
 			dump_dir = getenv("G2_DUMP_FRAMES");
@@ -920,21 +1328,18 @@ blobwatch_process_roi(blobwatch *bw,
 			}
 			dump_init = true;
 		}
-		if (dump_dir != NULL && dump_dir[0] != '\0' && (dump_ctr++ % dump_stride) == 0 &&
-		    frame->data != NULL && frame->width > 0 && frame->stride >= frame->width) {
-			char path[512];
-			// Encode cam, frame timestamp (ns, for IMU alignment in offline replay), exposure (the real
-			// controller exposure the matcher needs), source seq (groups the 4 cams of one frame), blobs.
-			snprintf(path, sizeof(path), "%s/cam%u_t%020lld_e%u_s%010lu_n%u.pgm", dump_dir, bw->cam_id,
-			         (long long)frame->timestamp, (unsigned)exposure,
-			         (unsigned long)frame->source_sequence, (unsigned)ob->num_blobs);
-			FILE *fp = fopen(path, "wb");
-			if (fp != NULL) {
-				fprintf(fp, "P5\n%u %u\n255\n", frame->width, frame->height);
-				for (uint32_t y = 0; y < frame->height; y++) {
-					fwrite(frame->data + (size_t)y * frame->stride, 1, frame->width, fp);
-				}
-				fclose(fp);
+		if (dump_dir != NULL && dump_dir[0] != '\0' && frame->data != NULL && frame->width > 0 &&
+		    frame->stride >= frame->width) {
+			const uint32_t dump_ctr =
+			    atomic_fetch_add_explicit(&g_pgm_dump_stride_ctr, 1, memory_order_relaxed);
+			if ((dump_ctr % dump_stride) == 0) {
+				char path[512];
+				// Encode cam, frame timestamp (ns, for IMU alignment in offline replay), exposure (the real
+				// controller exposure the matcher needs), source seq (groups the 4 cams of one frame), blobs.
+				snprintf(path, sizeof(path), "%s/cam%u_t%020lld_e%u_s%010lu_n%u.pgm", dump_dir,
+				         bw->cam_id, (long long)frame->timestamp, (unsigned)exposure,
+				         (unsigned long)frame->source_sequence, (unsigned)ob->num_blobs);
+				g2_pgm_dump_enqueue(path, frame);
 			}
 		}
 	}

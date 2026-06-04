@@ -17,6 +17,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include <cmath>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -28,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <system_error>
 #include <thread>
 
@@ -52,6 +55,74 @@ namespace {
 namespace fs = std::filesystem;
 
 // ---- small helpers ---------------------------------------------------------
+
+double
+env_ms(const char *name, double fallback)
+{
+	const char *value = getenv(name);
+	if (value == nullptr || value[0] == '\0') {
+		return fallback;
+	}
+	char *end = nullptr;
+	const double parsed = strtod(value, &end);
+	return end != value && std::isfinite(parsed) ? parsed : fallback;
+}
+
+int
+env_int(const char *name, int fallback)
+{
+	const char *value = getenv(name);
+	if (value == nullptr || value[0] == '\0') {
+		return fallback;
+	}
+	char *end = nullptr;
+	const long parsed = strtol(value, &end, 10);
+	return end != value ? (int)parsed : fallback;
+}
+
+uint64_t
+env_u64(const char *name, uint64_t fallback)
+{
+	const char *value = getenv(name);
+	if (value == nullptr || value[0] == '\0') {
+		return fallback;
+	}
+	char *end = nullptr;
+	const unsigned long long parsed = strtoull(value, &end, 10);
+	return end != value ? (uint64_t)parsed : fallback;
+}
+
+uint64_t
+splitmix64(uint64_t x)
+{
+	x += 0x9e3779b97f4a7c15ull;
+	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+	x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+	return x ^ (x >> 31);
+}
+
+double
+unit_hash(uint64_t x)
+{
+	return (double)(splitmix64(x) >> 11) * (1.0 / 9007199254740992.0);
+}
+
+struct DropWindow
+{
+	int64_t start_ns;
+	int64_t end_ns;
+};
+
+bool
+in_drop_windows(const std::vector<DropWindow> &windows, int64_t t_ns)
+{
+	for (const DropWindow &w : windows) {
+		if (t_ns >= w.start_ns && t_ns < w.end_ns) {
+			return true;
+		}
+	}
+	return false;
+}
 
 std::string
 read_file(const std::string &path)
@@ -695,6 +766,10 @@ struct FakeController
 	std::mutex cap_lock;
 	bool opt_valid = false;
 	struct xrt_pose opt_pose {};
+	bool opt_position_valid = false;
+	struct xrt_vec3 opt_position {};
+	int opt_kind = 0; // 0=none, 1=full pose, 2=position-only, 3=LED-fold
+	int opt_led_count = 0;
 	struct FakeHmd *hmd = nullptr; // body-lock reference (mirrors the production wcb->hmd_xdev)
 };
 
@@ -743,6 +818,9 @@ cb_push_pose(struct xrt_device *xdev, timepoint_ns t, const struct xrt_pose *pos
 	std::lock_guard<std::mutex> lk(c->cap_lock);
 	c->opt_valid = true;
 	c->opt_pose = *pose;
+	c->opt_position_valid = true;
+	c->opt_position = pose->position;
+	c->opt_kind = 1;
 }
 void
 cb_push_leds(struct xrt_device *xdev, timepoint_ns t, const struct xrt_pose *P_xrworld_cam,
@@ -766,6 +844,11 @@ cb_push_leds(struct xrt_device *xdev, timepoint_ns t, const struct xrt_pose *P_x
 	struct xrt_pose hp;
 	kalman_fusion_process_led_observations(c->kf, t, obs, m, &view, nullptr, 8.0f, true,
 	                                       ctrl_head_pose(c, t, &hp));
+	std::lock_guard<std::mutex> lk(c->cap_lock);
+	if (c->opt_kind == 0) {
+		c->opt_kind = 3;
+	}
+	c->opt_led_count += (int)m;
 }
 void
 cb_push_position(struct xrt_device *xdev,
@@ -776,6 +859,12 @@ cb_push_position(struct xrt_device *xdev,
 	FakeController *c = reinterpret_cast<FakeController *>(xdev);
 	struct xrt_pose hp;
 	kalman_fusion_process_position(c->kf, t, position, position_variance, ctrl_head_pose(c, t, &hp));
+	std::lock_guard<std::mutex> lk(c->cap_lock);
+	c->opt_position_valid = true;
+	c->opt_position = *position;
+	if (c->opt_kind != 1) {
+		c->opt_kind = 2;
+	}
 }
 bool
 cb_get_unc(struct xrt_device *xdev, double *ps, double *os, double *ys)
@@ -790,7 +879,7 @@ cb_get_predicted_pose(struct xrt_device *xdev, timepoint_ns when_ns, struct xrt_
 	return true;
 }
 bool
-cb_predict_gate(struct xrt_device *xdev, const struct xrt_pose *P_xrworld_cam,
+cb_predict_gate(struct xrt_device *xdev, timepoint_ns frame_mono_ns, const struct xrt_pose *P_xrworld_cam,
                 const struct t_constellation_cam_calib *cc, const struct xrt_vec3 *led_obj, float out_zhat[2],
                 float out_S[4])
 {
@@ -803,7 +892,7 @@ cb_predict_gate(struct xrt_device *xdev, const struct xrt_pose *P_xrworld_cam,
 	                                      P_xrworld_cam->position};
 	struct kalman_led_observation obs = {};
 	obs.led_obj = *led_obj; // observed_px unused by the gate predictor
-	return kalman_fusion_predict_led_gate(c->kf, &obs, &view, out_zhat, out_S);
+	return kalman_fusion_predict_led_gate(c->kf, frame_mono_ns, &obs, &view, out_zhat, out_S);
 }
 void
 cb_noop_frame(struct xrt_device *, uint64_t, uint64_t)
@@ -997,6 +1086,68 @@ main(int argc, char **argv)
 		fprintf(stderr, "no IMU to replay (any device)\n");
 		return 1;
 	}
+	const double drop_after_ms = env_ms("G2_REPLAY_DROP_OPTICAL_AFTER_MS", -1.0);
+	const double drop_period_ms = env_ms("G2_REPLAY_DROP_OPTICAL_PERIOD_MS", 0.0);
+	const double drop_duration_ms = env_ms("G2_REPLAY_DROP_OPTICAL_DURATION_MS", 0.0);
+	const double drop_random_p =
+	    std::min(1.0, std::max(0.0, env_ms("G2_REPLAY_DROP_OPTICAL_RANDOM_P", 0.0)));
+	const uint64_t drop_random_seed = env_u64("G2_REPLAY_DROP_OPTICAL_RANDOM_SEED", 0x475232ull);
+	const int drop_burst_count = std::max(0, env_int("G2_REPLAY_DROP_OPTICAL_BURST_COUNT", 0));
+	double drop_burst_min_ms = std::max(0.0, env_ms("G2_REPLAY_DROP_OPTICAL_BURST_MIN_MS", 0.0));
+	double drop_burst_max_ms = std::max(0.0, env_ms("G2_REPLAY_DROP_OPTICAL_BURST_MAX_MS", 0.0));
+	const uint64_t drop_burst_seed = env_u64("G2_REPLAY_DROP_OPTICAL_BURST_SEED", 0x475242ull);
+	const int64_t replay_start_ns = frames.front().t_ns;
+	const int64_t replay_end_ns = frames.back().t_ns;
+	std::vector<DropWindow> drop_windows;
+	if (drop_burst_count > 0 && drop_burst_max_ms > 0.0 && replay_end_ns > replay_start_ns) {
+		if (drop_burst_max_ms < drop_burst_min_ms) {
+			std::swap(drop_burst_max_ms, drop_burst_min_ms);
+		}
+		const double span_ms = (double)(replay_end_ns - replay_start_ns) / 1e6;
+		std::mt19937_64 rng(drop_burst_seed);
+		std::uniform_real_distribution<double> duration_dist(drop_burst_min_ms, drop_burst_max_ms);
+		for (int i = 0; i < drop_burst_count; i++) {
+			const double duration_ms = std::min(span_ms, std::max(0.0, duration_dist(rng)));
+			if (duration_ms <= 0.0) {
+				continue;
+			}
+			std::uniform_real_distribution<double> start_dist(0.0, std::max(0.0, span_ms - duration_ms));
+			const double start_ms = start_dist(rng);
+			DropWindow w = {};
+			w.start_ns = replay_start_ns + (int64_t)llround(start_ms * 1e6);
+			w.end_ns = std::min(replay_end_ns + 1, w.start_ns + (int64_t)llround(duration_ms * 1e6));
+			if (w.end_ns > w.start_ns) {
+				drop_windows.push_back(w);
+			}
+		}
+		std::sort(drop_windows.begin(), drop_windows.end(), [](const DropWindow &a, const DropWindow &b) {
+			return a.start_ns < b.start_ns;
+		});
+		std::vector<DropWindow> merged;
+		for (const DropWindow &w : drop_windows) {
+			if (merged.empty() || w.start_ns > merged.back().end_ns) {
+				merged.push_back(w);
+			} else {
+				merged.back().end_ns = std::max(merged.back().end_ns, w.end_ns);
+			}
+		}
+		drop_windows.swap(merged);
+	}
+	const bool dropout_enabled =
+	    drop_after_ms >= 0.0 || (drop_period_ms > 0.0 && drop_duration_ms > 0.0) ||
+	    drop_random_p > 0.0 || !drop_windows.empty();
+	if (dropout_enabled) {
+		printf("optical dropout: after_ms=%.3f period_ms=%.3f duration_ms=%.3f random_p=%.6f "
+		       "random_seed=%llu bursts=%zu burst_seed=%llu\n",
+		       drop_after_ms, drop_period_ms, drop_duration_ms, drop_random_p,
+		       (unsigned long long)drop_random_seed, drop_windows.size(),
+		       (unsigned long long)drop_burst_seed);
+		for (size_t i = 0; i < std::min<size_t>(drop_windows.size(), 16); i++) {
+			printf("  burst[%zu]: %.3f..%.3f ms\n", i,
+			       (double)(drop_windows[i].start_ns - replay_start_ns) / 1e6,
+			       (double)(drop_windows[i].end_ns - replay_start_ns) / 1e6);
+		}
+	}
 
 	FakeHmd hmd = {};
 	hmd.base.get_tracked_pose = hmd_get_pose;
@@ -1055,8 +1206,13 @@ main(int argc, char **argv)
 			cs.csv = fopen(path, "w");
 			if (cs.csv != nullptr) {
 				fprintf(cs.csv,
-				        "t_ns,opt_valid,opt_px,opt_py,opt_pz,opt_qx,opt_qy,opt_qz,opt_qw,"
+				        "t_ns,drop_optical,opt_valid,opt_px,opt_py,opt_pz,opt_qx,opt_qy,opt_qz,opt_qw,"
+				        "opt_kind,opt_position_valid,opt_position_px,opt_position_py,opt_position_pz,opt_led_count,"
 				        "pred_px,pred_py,pred_pz,pred_qx,pred_qy,pred_qz,pred_qw,pred_tracked,"
+				        "pred_flags,fusion_state,last_optical_age_ms,"
+				        "oov_dbg_valid,oov_body_valid,oov_raw_px,oov_raw_py,oov_raw_pz,"
+				        "oov_hold_px,oov_hold_py,oov_hold_pz,oov_body_px,oov_body_py,oov_body_pz,"
+				        "oov_inertial_var,oov_body_var,"
 				        "hmd_px,hmd_py,hmd_pz,pred_to_hmd_m\n");
 			} else {
 				fprintf(stderr, "WARN: could not open %s for write\n", path);
@@ -1065,7 +1221,24 @@ main(int argc, char **argv)
 	}
 
 	uint64_t seq = 0;
+	size_t dropped_frame_groups = 0;
 	for (const MosaicFrame &mf : frames) {
+		const double replay_elapsed_ms = (double)(mf.t_ns - replay_start_ns) / 1e6;
+		bool drop_optical = drop_after_ms >= 0.0 && replay_elapsed_ms >= drop_after_ms;
+		if (drop_period_ms > 0.0 && drop_duration_ms > 0.0) {
+			const double phase_ms = std::fmod(std::max(0.0, replay_elapsed_ms), drop_period_ms);
+			if (phase_ms < drop_duration_ms) {
+				drop_optical = true;
+			}
+		}
+		if (drop_random_p > 0.0 && unit_hash(((uint64_t)mf.t_ns) ^ drop_random_seed) < drop_random_p) {
+			drop_optical = true;
+		}
+		if (!drop_windows.empty() && in_drop_windows(drop_windows, mf.t_ns)) {
+			drop_optical = true;
+		}
+		dropped_frame_groups += drop_optical ? 1 : 0;
+
 		// Feed each device's IMU samples up to this frame's time so its matcher prior
 		// (kalman_fusion_get_prediction) is current. Per-device streams advance independently.
 		for (CtrlSession &cs : sessions) {
@@ -1084,28 +1257,34 @@ main(int argc, char **argv)
 			}
 			std::lock_guard<std::mutex> lk(cs.ctrl->cap_lock);
 			cs.ctrl->opt_valid = false;
+			cs.ctrl->opt_position_valid = false;
+			cs.ctrl->opt_position = {};
+			cs.ctrl->opt_kind = 0;
+			cs.ctrl->opt_led_count = 0;
 		}
 
-		struct xrt_frame *f = assemble_mosaic(mf, cams, seq++);
-		// Completion BARRIER (replaces the old fixed 8ms sleep, which was a race: a frame whose
-		// ab-initio search ran past 8ms was read as "no optical pose" -> the yield % became
-		// machine-load-dependent, audit H1). The tracker increments frames_completed exactly once per
-		// frame at every pipeline exit; we drive one frame at a time, so only one is ever in flight.
-		// Spin-wait (with a tiny yield/sleep) until THIS frame is fully processed before reading opt_*.
-		const uint64_t done_before = t_constellation_tracker_debug_frames_completed(tracker);
-		xrt_sink_push_frame(sink, f);
-		{
-			const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-			while (t_constellation_tracker_debug_frames_completed(tracker) < done_before + 1) {
-				if (std::chrono::steady_clock::now() > deadline) {
-					fprintf(stderr, "WARN: frame %lld completion barrier timed out\n",
-					        (long long)mf.t_ns);
-					break;
+		if (!drop_optical) {
+			struct xrt_frame *f = assemble_mosaic(mf, cams, seq++);
+			// Completion BARRIER (replaces the old fixed 8ms sleep, which was a race: a frame whose
+			// ab-initio search ran past 8ms was read as "no optical pose" -> the yield % became
+			// machine-load-dependent, audit H1). The tracker increments frames_completed exactly once per
+			// frame at every pipeline exit; we drive one frame at a time, so only one is ever in flight.
+			// Spin-wait (with a tiny yield/sleep) until THIS frame is fully processed before reading opt_*.
+			const uint64_t done_before = t_constellation_tracker_debug_frames_completed(tracker);
+			xrt_sink_push_frame(sink, f);
+			{
+				const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+				while (t_constellation_tracker_debug_frames_completed(tracker) < done_before + 1) {
+					if (std::chrono::steady_clock::now() > deadline) {
+						fprintf(stderr, "WARN: frame %lld completion barrier timed out\n",
+						        (long long)mf.t_ns);
+						break;
+					}
+					std::this_thread::sleep_for(std::chrono::microseconds(100));
 				}
-				std::this_thread::sleep_for(std::chrono::microseconds(100));
 			}
+			xrt_frame_reference(&f, nullptr); // release after processing
 		}
-		xrt_frame_reference(&f, nullptr); // release after processing
 
 		// Snapshot per-device pose state and write CSVs.
 		for (CtrlSession &cs : sessions) {
@@ -1115,17 +1294,33 @@ main(int argc, char **argv)
 			kalman_fusion_get_prediction(cs.ctrl->kf, mf.t_ns, &fused, hp_pred_ptr);
 			const bool ptracked =
 			    (fused.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
+			const unsigned long long pred_flags = (unsigned long long)fused.relation_flags;
+			const int fusion_state = kalman_fusion_debug_get_fusion_state(cs.ctrl->kf, nullptr, 0);
+			double last_optical_age_ms = 0.0;
+			const bool have_last_optical_age =
+			    kalman_fusion_debug_get_last_optical_age_ms(cs.ctrl->kf, mf.t_ns, &last_optical_age_ms);
+			struct kalman_fusion_oov_debug oov_dbg = {};
+			const bool have_oov_dbg =
+			    kalman_fusion_debug_get_oov_report(cs.ctrl->kf, mf.t_ns, hp_pred_ptr, &oov_dbg);
 			cs.locked += ptracked ? 1 : 0;
 			bool ov;
 			struct xrt_pose op;
+			bool opv;
+			struct xrt_vec3 opt_position;
+			int opt_kind;
+			int opt_led_count;
 			{
 				std::lock_guard<std::mutex> lk(cs.ctrl->cap_lock);
 				ov = cs.ctrl->opt_valid;
 				op = cs.ctrl->opt_pose;
+				opv = cs.ctrl->opt_position_valid;
+				opt_position = cs.ctrl->opt_position;
+				opt_kind = cs.ctrl->opt_kind;
+				opt_led_count = cs.ctrl->opt_led_count;
 			}
 			cs.opt_frames += ov ? 1 : 0;
 			if (cs.csv != nullptr) {
-				fprintf(cs.csv, "%lld,%d,", (long long)mf.t_ns, ov ? 1 : 0);
+				fprintf(cs.csv, "%lld,%d,%d,", (long long)mf.t_ns, drop_optical ? 1 : 0, ov ? 1 : 0);
 				if (ov) {
 					fprintf(cs.csv, "%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,", op.position.x,
 					        op.position.y, op.position.z, op.orientation.x, op.orientation.y,
@@ -1133,10 +1328,38 @@ main(int argc, char **argv)
 				} else {
 					fprintf(cs.csv, "nan,nan,nan,nan,nan,nan,nan,");
 				}
+				if (opv) {
+					fprintf(cs.csv, "%d,1,%.5f,%.5f,%.5f,%d,", opt_kind, opt_position.x,
+					        opt_position.y, opt_position.z, opt_led_count);
+				} else {
+					fprintf(cs.csv, "%d,0,nan,nan,nan,%d,", opt_kind, opt_led_count);
+				}
 				fprintf(cs.csv, "%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,%d,",
 				        fused.pose.position.x, fused.pose.position.y, fused.pose.position.z,
 				        fused.pose.orientation.x, fused.pose.orientation.y, fused.pose.orientation.z,
 				        fused.pose.orientation.w, ptracked ? 1 : 0);
+				fprintf(cs.csv, "%llu,%d,", pred_flags, fusion_state);
+				if (have_last_optical_age) {
+					fprintf(cs.csv, "%.3f,", last_optical_age_ms);
+				} else {
+					fprintf(cs.csv, "nan,");
+				}
+				if (have_oov_dbg && oov_dbg.valid) {
+					fprintf(cs.csv, "%d,%d,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,",
+					        oov_dbg.valid ? 1 : 0, oov_dbg.body_valid ? 1 : 0,
+					        oov_dbg.raw_predicted_position.x, oov_dbg.raw_predicted_position.y,
+					        oov_dbg.raw_predicted_position.z, oov_dbg.optical_hold_position.x,
+					        oov_dbg.optical_hold_position.y, oov_dbg.optical_hold_position.z);
+					if (oov_dbg.body_valid) {
+						fprintf(cs.csv, "%.5f,%.5f,%.5f,", oov_dbg.body_report_position.x,
+						        oov_dbg.body_report_position.y, oov_dbg.body_report_position.z);
+					} else {
+						fprintf(cs.csv, "nan,nan,nan,");
+					}
+					fprintf(cs.csv, "%.6f,%.6f,", oov_dbg.inertial_var, oov_dbg.body_var);
+				} else {
+					fprintf(cs.csv, "0,0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,");
+				}
 				if (hp_pred_ptr != nullptr) {
 					const double dx = fused.pose.position.x - hp_pred_ptr->position.x;
 					const double dy = fused.pose.position.y - hp_pred_ptr->position.y;
@@ -1158,6 +1381,10 @@ main(int argc, char **argv)
 		}
 	}
 	printf("replay done: %zu frames\n", frames.size());
+	if (dropout_enabled) {
+		printf("  optical forced-drop frame groups: %zu (%.1f%%)\n", dropped_frame_groups,
+		       100.0 * (double)dropped_frame_groups / (double)std::max<size_t>(frames.size(), 1));
+	}
 	for (const CtrlSession &cs : sessions) {
 		printf("  device %u: optical pose on %d (%.0f%%) | position-tracked on %d (%.0f%%)\n",
 		       cs.ctrl->device_id, cs.opt_frames, 100.0 * cs.opt_frames / std::max<size_t>(frames.size(), 1),

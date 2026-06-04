@@ -159,6 +159,8 @@ struct wmr_controller_base
 
 	//! Time of last IMU sample, in CPU time.
 	uint64_t last_imu_timestamp_ns;
+	//! Last HMD-pose query used for out-of-view body-anchor fusion.
+	uint64_t last_body_anchor_query_ns;
 	//! Time of last IMU sample, in device time.
 	uint64_t last_imu_device_timestamp_ns;
 	//!< Min-Skew estimator for IMU to monotonic clock. Protected by data_lock
