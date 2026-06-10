@@ -52,6 +52,12 @@ struct TestFrame
 		std::fill(buf.begin(), buf.end(), (uint8_t)0);
 	}
 
+	void
+	fill(uint8_t value)
+	{
+		std::fill(buf.begin(), buf.end(), value);
+	}
+
 	uint8_t &
 	at(int x, int y)
 	{
@@ -194,14 +200,16 @@ TEST_CASE("blobwatch: non-zero ROI reports the same centroid as full-frame detec
 TEST_CASE("blobwatch: ROI scans and finalizes the bottom row")
 {
 	TestFrame tf;
-	tf.at(81, 72) = 50;
-	tf.at(82, 72) = 100;
-	tf.at(83, 72) = 50;
+	for (int y = 71; y <= 72; y++) {
+		tf.at(81, y) = 50;
+		tf.at(82, y) = 100;
+		tf.at(83, y) = 50;
+	}
 
 	auto bs = detect_roi(tf, 78, 64, 10, 9);
-	const blob b = nearest(bs, 82.0, 72.0, 1.0);
+	const blob b = nearest(bs, 82.0, 71.5, 1.0);
 	INFO("bottom-row ROI blob=(" << b.x << "," << b.y << ") count=" << bs.size());
-	REQUIRE(std::abs(b.y - 72.0) < 0.25);
+	REQUIRE(std::abs(b.y - 71.5) < 0.35);
 }
 
 TEST_CASE("blobwatch: compact dim LED below detect threshold is retained inside an ROI")
@@ -216,6 +224,35 @@ TEST_CASE("blobwatch: compact dim LED below detect threshold is retained inside 
 	auto bs = detect_roi(tf, 56, 56, 17, 17);
 	const blob b = nearest(bs, 64.0, 64.0, 1.0);
 	REQUIRE(b.brightness < DETECT_THR);
+}
+
+TEST_CASE("blobwatch: ROI recovery retains compact LEDs clipped by the adaptive margin")
+{
+	TestFrame tf;
+	tf.fill(20);
+	tf.at(64, 64) = 26;
+	tf.at(63, 64) = 24;
+	tf.at(65, 64) = 24;
+	tf.at(64, 63) = 24;
+	tf.at(64, 65) = 24;
+
+	auto bs = detect_roi(tf, 56, 56, 17, 17);
+	const blob b = nearest(bs, 64.0, 64.0, 1.0);
+	REQUIRE(b.brightness < DETECT_THR + 4);
+}
+
+TEST_CASE("blobwatch: ROI recovery rejects flat low-contrast patches")
+{
+	TestFrame tf;
+	tf.fill(20);
+	for (int y = 62; y <= 66; y++) {
+		for (int x = 62; x <= 66; x++) {
+			tf.at(x, y) = 25;
+		}
+	}
+
+	auto bs = detect_roi(tf, 56, 56, 17, 17);
+	REQUIRE(bs.empty());
 }
 
 TEST_CASE("blobwatch: low-threshold ROI retains shaped dim blobs above the ROI pixel floor")

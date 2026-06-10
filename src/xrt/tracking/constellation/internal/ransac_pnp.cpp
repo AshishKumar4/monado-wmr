@@ -15,6 +15,7 @@
  */
 #include "ransac_pnp.h"
 #include "util/u_logging.h"
+#include "math/m_api.h"
 
 #include <opencv2/calib3d/calib3d.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
@@ -72,13 +73,27 @@ rot_angle_between(const cv::Mat &rvec_a, const cv::Mat &rvec_b)
 	return std::acos(std::min(1.0, std::max(-1.0, c)));
 }
 
-//! True if the 3D points are near-coplanar (thin in one dimension) — the configuration that admits the
-//! PnP mirror two-fold ambiguity. Ratio of the smallest to largest singular value of the centred points.
 static bool
-near_coplanar(const std::vector<cv::Point3f> &pts)
+vec3_mat_is_finite(const cv::Mat &v)
+{
+	if (v.empty() || v.total() != 3 || v.depth() != CV_64F) {
+		return false;
+	}
+	for (int r = 0; r < v.rows; r++) {
+		for (int c = 0; c < v.cols; c++) {
+			if (!std::isfinite(v.at<double>(r, c))) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+static double
+coplanarity_ratio(const std::vector<cv::Point3f> &pts)
 {
 	if (pts.size() < 4) {
-		return false;
+		return 1.0;
 	}
 	cv::Point3d c(0, 0, 0);
 	for (const cv::Point3f &p : pts) {
@@ -94,7 +109,16 @@ near_coplanar(const std::vector<cv::Point3f> &pts)
 	cv::Mat w; // singular values, descending
 	cv::SVD::compute(m, w, cv::SVD::NO_UV);
 	const double s0 = w.at<double>(0), s2 = w.at<double>(2);
-	return s0 > 1e-9 && (s2 / s0) < 0.10;
+	return s0 > 1e-9 ? (s2 / s0) : 1.0;
+}
+
+#define MIRROR_TWIN_COPLANAR_RATIO 0.30
+#define TILT_CLAMP_COPLANAR_RATIO 0.10
+
+static bool
+near_coplanar(const std::vector<cv::Point3f> &pts)
+{
+	return coplanarity_ratio(pts) < TILT_CLAMP_COPLANAR_RATIO;
 }
 
 static void
@@ -148,47 +172,307 @@ refine_lm_over_inliers(const std::vector<cv::Point3f> &p3d,
 	return (int)in3d.size();
 }
 
-/* When the inlier set is near-coplanar, recover the second (mirror-twin) pose via IPPE so the caller can
- * disambiguate against the prior. Writes @p twin + sets @p has_twin only if a distinct second solution
- * (> ~20 deg from the primary) is found. Robust to OpenCV throwing on a degenerate planar config. */
+static bool
+analytic_planar_twin(const std::vector<cv::Point3f> &in3d,
+                     const cv::Mat &rvec_primary,
+                     const cv::Mat &tvec_primary,
+                     cv::Mat &rvec_twin,
+                     cv::Mat &tvec_twin)
+{
+	if (in3d.size() < 4) {
+		return false;
+	}
+
+	cv::Mat R_primary;
+	cv::Rodrigues(rvec_primary, R_primary);
+
+	cv::Point3d centroid(0, 0, 0);
+	for (const cv::Point3f &p : in3d) {
+		centroid += cv::Point3d(p.x, p.y, p.z);
+	}
+	centroid *= 1.0 / (double)in3d.size();
+
+	cv::Mat centered((int)in3d.size(), 3, CV_64F);
+	for (size_t i = 0; i < in3d.size(); i++) {
+		centered.at<double>((int)i, 0) = in3d[i].x - centroid.x;
+		centered.at<double>((int)i, 1) = in3d[i].y - centroid.y;
+		centered.at<double>((int)i, 2) = in3d[i].z - centroid.z;
+	}
+
+	cv::Mat w, u, vt;
+	cv::SVD::compute(centered, w, u, vt);
+	cv::Mat n_obj = vt.row(2).t();
+	cv::Mat n_cam = R_primary * n_obj;
+
+	cv::Mat c_obj = (cv::Mat_<double>(3, 1) << centroid.x, centroid.y, centroid.z);
+	cv::Mat c_cam = R_primary * c_obj + tvec_primary;
+	const double c_norm = cv::norm(c_cam);
+	if (!(c_norm > 1e-9)) {
+		return false;
+	}
+	cv::Mat bearing = c_cam / c_norm;
+
+	cv::Mat reflected = 2.0 * bearing.dot(n_cam) * bearing - n_cam;
+	const double reflected_norm = cv::norm(reflected);
+	if (!(reflected_norm > 1e-9)) {
+		return false;
+	}
+	reflected /= reflected_norm;
+
+	cv::Mat axis = n_cam.cross(reflected);
+	const double sin_angle = cv::norm(axis);
+	const double cos_angle = std::max(-1.0, std::min(1.0, n_cam.dot(reflected)));
+	cv::Mat R_align;
+	if (sin_angle < 1e-9) {
+		R_align = cv::Mat::eye(3, 3, CV_64F);
+	} else {
+		cv::Mat unit_axis = axis / sin_angle;
+		cv::Rodrigues(unit_axis * std::atan2(sin_angle, cos_angle), R_align);
+	}
+
+	cv::Mat R_twin = R_align * R_primary;
+	cv::Rodrigues(R_twin, rvec_twin);
+	tvec_twin = c_cam - R_twin * c_obj;
+	return vec3_mat_is_finite(rvec_twin) && vec3_mat_is_finite(tvec_twin) && tvec_twin.at<double>(2) > 0.0;
+}
+
+/* Materialise the mirror pose for near-planar LED sets so the caller can rank both modes against priors. */
 static void
 compute_mirror_twin(const std::vector<cv::Point3f> &in3d,
                     const std::vector<cv::Point2f> &in2d,
                     const cv::Mat &K,
                     const cv::Mat &D,
                     const cv::Mat &rvec_primary,
+                    const cv::Mat &tvec_primary,
                     double thresh,
                     struct xrt_pose *twin,
                     bool *has_twin)
 {
 	*has_twin = false;
-	if (in3d.size() < 4 || !near_coplanar(in3d)) {
+	if (in3d.size() < 4 || coplanarity_ratio(in3d) >= MIRROR_TWIN_COPLANAR_RATIO) {
 		return;
 	}
-	std::vector<cv::Mat> rvecs, tvecs;
+
+	cv::Mat rvec, tvec;
 	try {
-		// IPPE returns up to two solutions for a planar set; it cannot pick between them from one view.
-		cv::solvePnPGeneric(in3d, in2d, K, D, rvecs, tvecs, false, cv::SOLVEPNP_IPPE);
-	} catch (const cv::Exception &) {
-		return; // degenerate planar config — no twin
-	}
-	// Pick the solution rotationally farthest from the primary (the mirror), if it is genuinely distinct.
-	int best = -1;
-	double best_ang = 20.0 * M_PI / 180.0; // require a real second mode, not a near-duplicate
-	for (size_t i = 0; i < rvecs.size(); i++) {
-		const double a = rot_angle_between(rvec_primary, rvecs[i]);
-		if (a > best_ang) {
-			best_ang = a;
-			best = (int)i;
+		if (!analytic_planar_twin(in3d, rvec_primary, tvec_primary, rvec, tvec)) {
+			return;
 		}
-	}
-	if (best < 0) {
+	} catch (const cv::Exception &) {
+		return;
+	} catch (...) {
 		return;
 	}
-	cv::Mat rvec = rvecs[best].clone(), tvec = tvecs[best].clone();
+	if (rot_angle_between(rvec_primary, rvec) <= 20.0 * M_PI / 180.0) {
+		return;
+	}
 	refine_lm_over_inliers(in3d, in2d, K, D, rvec, tvec, thresh); // polish the twin on its own inliers
+	if (!vec3_mat_is_finite(rvec) || !vec3_mat_is_finite(tvec) || tvec.at<double>(2) <= 0.0) {
+		return;
+	}
 	rtvec_to_pose(rvec, tvec, twin);
 	*has_twin = true;
+}
+
+static cv::Mat
+quat_to_R(const struct xrt_quat *q)
+{
+	cv::Mat R(3, 3, CV_64FC1);
+	struct xrt_quat qn = *q;
+	quat_to_3x3(R, &qn);
+	return R;
+}
+
+static bool
+tilt_clamped_pnp(const std::vector<cv::Point3f> &p3d,
+                 const std::vector<cv::Point2f> &p2d,
+                 const struct xrt_quat *q_prior_cam,
+                 const struct xrt_vec3 *up_cam,
+                 const struct xrt_pose *seed,
+                 struct xrt_pose *out,
+                 struct xrt_pose *yaw_twin,
+                 bool *has_yaw_twin)
+{
+	if (has_yaw_twin != nullptr) {
+		*has_yaw_twin = false;
+	}
+	if (p3d.size() < 3) {
+		return false;
+	}
+
+	struct xrt_vec3 up = *up_cam;
+	const double up_len = std::sqrt((double)up.x * up.x + (double)up.y * up.y + (double)up.z * up.z);
+	if (!(up_len > 1e-6)) {
+		return false;
+	}
+	up.x /= (float)up_len;
+	up.y /= (float)up_len;
+	up.z /= (float)up_len;
+
+	auto R_of_theta = [&](double theta) -> cv::Mat {
+		struct xrt_quat ryaw;
+		math_quat_from_angle_vector((float)theta, &up, &ryaw);
+		struct xrt_quat q;
+		math_quat_rotate(&ryaw, q_prior_cam, &q);
+		math_quat_normalize(&q);
+		return quat_to_R(&q);
+	};
+
+	double theta = 0.0;
+	cv::Mat t = (cv::Mat_<double>(3, 1) << seed->position.x, seed->position.y, seed->position.z);
+	const int n = (int)p3d.size();
+	cv::Mat K = cv::Mat::eye(3, 3, CV_64FC1);
+	cv::Mat D = cv::Mat::zeros(4, 1, CV_64FC1);
+
+	auto residuals = [&](double th, const cv::Mat &tt, std::vector<double> &r) {
+		cv::Mat rvec;
+		cv::Rodrigues(R_of_theta(th), rvec);
+		std::vector<cv::Point2f> proj;
+		cv::projectPoints(p3d, rvec, tt, K, D, proj);
+		r.resize(2 * n);
+		for (int i = 0; i < n; i++) {
+			r[2 * i] = proj[i].x - p2d[i].x;
+			r[2 * i + 1] = proj[i].y - p2d[i].y;
+		}
+	};
+
+	{
+		std::vector<double> r;
+		double best_cost = INFINITY;
+		const int steps = 24;
+		for (int i = 0; i < steps; i++) {
+			const double th = (2.0 * M_PI * (double)i) / (double)steps;
+			residuals(th, t, r);
+			double cost = 0.0;
+			for (double v : r) {
+				cost += v * v;
+			}
+			if (cost < best_cost) {
+				best_cost = cost;
+				theta = th;
+			}
+		}
+	}
+
+	std::vector<double> r0(2 * n);
+	double prev_cost = INFINITY;
+	for (int it = 0; it < 12; it++) {
+		residuals(theta, t, r0);
+		double cost = 0.0;
+		for (double v : r0) {
+			cost += v * v;
+		}
+		if (cost > prev_cost * (1.0 - 1e-6) && it > 0) {
+			break;
+		}
+		prev_cost = cost;
+
+		cv::Mat J(2 * n, 4, CV_64FC1);
+		const double dth = 1e-4;
+		const double dt = 1e-4;
+		{
+			std::vector<double> rp, rm;
+			residuals(theta + dth, t, rp);
+			residuals(theta - dth, t, rm);
+			for (int i = 0; i < 2 * n; i++) {
+				J.at<double>(i, 0) = (rp[i] - rm[i]) / (2.0 * dth);
+			}
+		}
+		for (int c = 0; c < 3; c++) {
+			cv::Mat tp = t.clone();
+			cv::Mat tm = t.clone();
+			tp.at<double>(c) += dt;
+			tm.at<double>(c) -= dt;
+			std::vector<double> rp, rm;
+			residuals(theta, tp, rp);
+			residuals(theta, tm, rm);
+			for (int i = 0; i < 2 * n; i++) {
+				J.at<double>(i, 1 + c) = (rp[i] - rm[i]) / (2.0 * dt);
+			}
+		}
+
+		cv::Mat rv(2 * n, 1, CV_64FC1);
+		for (int i = 0; i < 2 * n; i++) {
+			rv.at<double>(i) = r0[i];
+		}
+		cv::Mat JtJ = J.t() * J;
+		JtJ += cv::Mat::eye(4, 4, CV_64FC1) * (1e-9 * cv::trace(JtJ)[0] + 1e-12);
+		cv::Mat dx;
+		if (!cv::solve(JtJ, -(J.t() * rv), dx, cv::DECOMP_CHOLESKY)) {
+			break;
+		}
+		theta += dx.at<double>(0);
+		t.at<double>(0) += dx.at<double>(1);
+		t.at<double>(1) += dx.at<double>(2);
+		t.at<double>(2) += dx.at<double>(3);
+		if (cv::norm(dx) < 1e-9) {
+			break;
+		}
+	}
+
+	if (t.at<double>(2) <= 0.0) {
+		return false;
+	}
+
+	cv::Mat rvec;
+	cv::Rodrigues(R_of_theta(theta), rvec);
+	rtvec_to_pose(rvec, t, out);
+
+	if (yaw_twin != nullptr && has_yaw_twin != nullptr) {
+		double th2 = theta + M_PI;
+		cv::Mat t2 = t.clone();
+		double prev2 = INFINITY;
+		for (int it = 0; it < 8; it++) {
+			std::vector<double> r;
+			residuals(th2, t2, r);
+			double cost = 0.0;
+			for (double v : r) {
+				cost += v * v;
+			}
+			if (cost > prev2 * (1.0 - 1e-6) && it > 0) {
+				break;
+			}
+			prev2 = cost;
+			cv::Mat J(2 * n, 3, CV_64FC1);
+			const double dt = 1e-4;
+			for (int c = 0; c < 3; c++) {
+				cv::Mat tp = t2.clone();
+				cv::Mat tm = t2.clone();
+				tp.at<double>(c) += dt;
+				tm.at<double>(c) -= dt;
+				std::vector<double> rp, rm;
+				residuals(th2, tp, rp);
+				residuals(th2, tm, rm);
+				for (int i = 0; i < 2 * n; i++) {
+					J.at<double>(i, c) = (rp[i] - rm[i]) / (2.0 * dt);
+				}
+			}
+			cv::Mat rv(2 * n, 1, CV_64FC1);
+			for (int i = 0; i < 2 * n; i++) {
+				rv.at<double>(i) = r[i];
+			}
+			cv::Mat JtJ = J.t() * J;
+			JtJ += cv::Mat::eye(3, 3, CV_64FC1) * (1e-9 * cv::trace(JtJ)[0] + 1e-12);
+			cv::Mat dx;
+			if (!cv::solve(JtJ, -(J.t() * rv), dx, cv::DECOMP_CHOLESKY)) {
+				break;
+			}
+			t2.at<double>(0) += dx.at<double>(0);
+			t2.at<double>(1) += dx.at<double>(1);
+			t2.at<double>(2) += dx.at<double>(2);
+			if (cv::norm(dx) < 1e-9) {
+				break;
+			}
+		}
+		if (t2.at<double>(2) > 0.0) {
+			cv::Mat rvec2;
+			cv::Rodrigues(R_of_theta(th2), rvec2);
+			rtvec_to_pose(rvec2, t2, yaw_twin);
+			*has_yaw_twin = true;
+		}
+	}
+
+	return true;
 }
 
 bool
@@ -302,12 +586,54 @@ ransac_pnp_pose_with_twin(struct xrt_pose *pose,
 	rtvec_to_pose(rvec, tvec, pose);
 
 	if (has_twin != nullptr && final_inliers >= 4) {
-		compute_mirror_twin(in3d, in2d, dummyK, dummyD, rvec, reprojectionError, twin, has_twin);
+		compute_mirror_twin(in3d, in2d, dummyK, dummyD, rvec, tvec, reprojectionError, twin, has_twin);
 	}
 
 	U_LOG_T("Got PnP pose quat %f %f %f %f  pos %f %f %f%s", pose->orientation.x, pose->orientation.y,
 	        pose->orientation.z, pose->orientation.w, pose->position.x, pose->position.y, pose->position.z,
 	        (has_twin != nullptr && *has_twin) ? " (+mirror twin)" : "");
+	return true;
+}
+
+bool
+ransac_pnp_tilt_clamp(const struct xrt_pose *pose,
+                      const struct xrt_vec3 *obj_pts,
+                      const struct xrt_vec2 *img_pts,
+                      int n,
+                      struct camera_model *calib,
+                      const struct xrt_pose *prior_cam,
+                      const struct xrt_vec3 *up_cam,
+                      bool require_coplanar,
+                      struct xrt_pose *out,
+                      struct xrt_pose *yaw_twin,
+                      bool *has_yaw_twin)
+{
+	if (has_yaw_twin != nullptr) {
+		*has_yaw_twin = false;
+	}
+	if (n < 4 || pose == nullptr || obj_pts == nullptr || img_pts == nullptr || calib == nullptr ||
+	    prior_cam == nullptr || up_cam == nullptr || out == nullptr) {
+		return false;
+	}
+
+	std::vector<cv::Point3f> p3d(n);
+	std::vector<cv::Point2f> p2d_dist(n);
+	std::vector<cv::Point2f> p2d(n);
+	for (int i = 0; i < n; i++) {
+		p3d[i] = cv::Point3f(obj_pts[i].x, obj_pts[i].y, obj_pts[i].z);
+		p2d_dist[i] = cv::Point2f(img_pts[i].x, img_pts[i].y);
+	}
+	if (require_coplanar && !near_coplanar(p3d)) {
+		return false;
+	}
+
+	undistort_blob_points(p2d_dist, p2d, calib);
+	struct xrt_pose clamped;
+	if (!tilt_clamped_pnp(p3d, p2d, &prior_cam->orientation, up_cam, pose, &clamped, yaw_twin,
+	                      has_yaw_twin)) {
+		return false;
+	}
+	*out = clamped;
 	return true;
 }
 

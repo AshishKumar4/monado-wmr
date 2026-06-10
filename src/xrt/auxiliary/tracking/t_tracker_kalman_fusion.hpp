@@ -74,7 +74,18 @@ public:
 	process_position(const timepoint_ns timestamp_ns,
 	                 const struct xrt_vec3 *position,
 	                 const struct xrt_vec3 *position_variance_optional,
-	                 const struct xrt_pose *hmd_world_pose) = 0;
+	                 const struct xrt_pose *hmd_world_pose,
+	                 bool refresh_optical_anchor) = 0;
+
+	/*!
+	 * Cache-only PnP candidate for per-LED divergence recovery. This updates only the guarded re-anchor
+	 * target used by process_led_observations; it does not adopt the pose, change optical freshness, or
+	 * report tracking.
+	 */
+	virtual void
+	cache_pnp_pose_candidate(const timepoint_ns timestamp_ns,
+	                         const struct xrt_pose *pose,
+	                         const struct xrt_pose *hmd_world_pose) = 0;
 
 	/*!
 	 * Tightly-coupled optical update: fold each matched LED's reprojection
@@ -202,6 +213,19 @@ public:
 		(void)position_std;
 		(void)orientation_std;
 		(void)yaw_std;
+		return false;
+	}
+
+	/*!
+	 * Gravity-tilt-corrected held orientation (world<-body): current orientation with tilt snapped to
+	 * accelerometer gravity and yaw preserved. @p out_excess_m_s2 is |||f|| - g|; small means low linear
+	 * acceleration. Returns false until tracking and a finite IMU gravity reference exist.
+	 */
+	virtual bool
+	get_gravity_tilt_reference(struct xrt_quat *out_gravity_corrected_q, double *out_excess_m_s2)
+	{
+		(void)out_gravity_corrected_q;
+		(void)out_excess_m_s2;
 		return false;
 	}
 

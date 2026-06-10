@@ -13,6 +13,7 @@
 #include "catch_amalgamated.hpp"
 
 #include "internal/ransac_pnp.h"
+#include "internal/joint_contention.h"
 #include "internal/joint_pnp.h"
 #include "internal/pose_metrics.h"
 #include "internal/correspondence_search.h"
@@ -24,6 +25,7 @@
 #include <opencv2/calib3d.hpp>
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <vector>
 
 namespace {
@@ -1150,4 +1152,81 @@ TEST_CASE("ab-initio prune: skips flipped hypotheses without changing the accept
 	correspondence_search_free(cs_cold);
 	correspondence_search_free(cs);
 	t_constellation_search_model_free(smodel);
+}
+
+namespace {
+
+double
+brute_augmented_permanent(const std::vector<std::vector<double>> &L, const std::vector<double> &L_clutter)
+{
+	const int m = (int)L.size();
+	const int n = m > 0 ? (int)L[0].size() : 0;
+	std::vector<int> used(n + m, 0);
+	double sum = 0.0;
+
+	std::function<void(int, double)> rec = [&](int row, double acc) {
+		if (row == m) {
+			sum += acc;
+			return;
+		}
+		for (int col = 0; col < n; col++) {
+			if (!used[col] && L[row][col] > 0.0) {
+				used[col] = 1;
+				rec(row + 1, acc * L[row][col]);
+				used[col] = 0;
+			}
+		}
+		const int private_col = n + row;
+		used[private_col] = 1;
+		rec(row + 1, acc * L_clutter[row]);
+		used[private_col] = 0;
+	};
+	rec(0, 1.0);
+	return sum;
+}
+
+} // namespace
+
+TEST_CASE("joint contention: augmented permanent matches explicit private-clutter expansion")
+{
+	const std::vector<std::vector<double>> L = {
+	    {0.8, 0.1, 0.0},
+	    {0.3, 0.7, 0.2},
+	    {0.0, 0.4, 0.9},
+	};
+	const std::vector<double> L_clutter = {0.05, 0.07, 0.11};
+	double flat[PKF_MAX_CLUSTER * PKF_MAX_CLUSTER] = {0};
+	double clutter[PKF_MAX_CLUSTER] = {0};
+	for (int i = 0; i < (int)L.size(); i++) {
+		clutter[i] = L_clutter[i];
+		for (int j = 0; j < (int)L[i].size(); j++) {
+			flat[i * (int)L[i].size() + j] = L[i][j];
+		}
+	}
+	const double folded = pose_metrics_pkf_permanent_augmented(flat, clutter, (int)L.size(), (int)L[0].size());
+	CHECK(folded == Catch::Approx(brute_augmented_permanent(L, L_clutter)).epsilon(1e-12));
+}
+
+TEST_CASE("joint contention: split is bounded and favours the better-fitting owner")
+{
+	struct joint_contention_cluster c = {};
+	c.n_rows = 2;
+	c.n_cols = 1;
+	c.row_device[0] = 0;
+	c.row_device[1] = 1;
+	c.row_rho[0] = 0.25;
+	c.row_rho[1] = 2.0;
+	c.row_logodds[0] = 0.0;
+	c.row_logodds[1] = 0.0;
+	c.L[0] = exp(-0.25);
+	c.L[1] = exp(-2.0);
+	c.L_clutter[0] = 0.02;
+	c.L_clutter[1] = 0.02;
+
+	const struct joint_contention_result r = joint_contention_split(&c, 1);
+	REQUIRE(r.valid);
+	CHECK(joint_contention_blob_owner(&c, 0) == 0);
+	CHECK(r.dev_marginal[0] <= r.dev_hard_rho[0] + 1e-12);
+	CHECK(r.dev_marginal[1] <= r.dev_hard_rho[1] + 1e-12);
+	CHECK(r.dev_marginal[0] < r.dev_marginal[1]);
 }

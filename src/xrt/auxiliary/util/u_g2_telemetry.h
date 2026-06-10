@@ -85,6 +85,8 @@ enum g2_telem_event_type
 	G2_TELEM_EV_TRACKER_BLOB_MS = 18,
 	G2_TELEM_EV_TRACKER_FAST_MS = 19,
 	G2_TELEM_EV_FRAME_DUMP_DROPPED = 20,
+	G2_TELEM_EV_CAMERA_SOURCE_DELTA = 21,
+	G2_TELEM_EV_ASSOC_RAW_EPIPOLAR_POSITION = 22,
 };
 
 /* ---- Stream emit functions (POD rows; lock-free; safe from any single producer) ---- */
@@ -144,12 +146,29 @@ g2_telem_candidate(uint8_t device_id,
                    float yaw_err_rad,
                    const float prior_pos_err[3],
                    const float prior_rot_err[3],
+                   float blob_var_mean_px2,
+                   float blob_brightness_mean,
+                   float blob_area_mean,
                    const float pose[7]);
 
 /*! Correspondence long-search diagnostics. This is emitted once per search pass,
  * including failed passes, so visible-controller dropouts are not silent. @p result:
  * 0=success, 1=no_searchable_anchors, 2=no_anchor_with_3_neighbours, 3=no_p3p_trials,
- * 4=no_pose_checks, 5=all_pose_checks_pruned, 6=best_not_good, 7=no_good_candidate. */
+ * 4=no_pose_checks, 5=all_pose_checks_pruned, 6=best_not_good, 7=no_good_candidate.
+ * 8-14 are prior-ROI skip reasons emitted before full-frame fallback. */
+enum g2_telem_search_bng_reason
+{
+	G2_SEARCH_BNG_MATCHED_LT3 = 1u << 0,
+	G2_SEARCH_BNG_PRIOR_POSITION_FAIL = 1u << 1,
+	G2_SEARCH_BNG_PRIOR_ORIENT_FAIL = 1u << 2,
+	G2_SEARCH_BNG_LED_IDS_FAIL = 1u << 3,
+	G2_SEARCH_BNG_REPROJ_FAIL = 1u << 4,
+	G2_SEARCH_BNG_CLEAN_CLUSTER_FAIL = 1u << 5,
+	G2_SEARCH_BNG_VISIBLE_COVER_FAIL = 1u << 6,
+	G2_SEARCH_BNG_MINIMAL_PRIOR_FAIL = 1u << 7,
+	G2_SEARCH_BNG_PRIORLESS_LARGE_FAIL = 1u << 8,
+};
+
 void
 g2_telem_search(uint8_t device_id,
                 uint8_t cam_id,
@@ -175,7 +194,11 @@ g2_telem_search(uint8_t device_id,
                 uint8_t leds_visible,
                 uint8_t blobs_matched,
                 uint8_t unmatched_blobs,
-                float reproj_err_px);
+                float reproj_err_px,
+                uint32_t bng_reason_flags,
+                float reproj_err_per_match,
+                float unmatched_per_match,
+                float matched_visible_ratio);
 
 /*! Fusion step: optical observation vs IMU-predicted state -> residual (the SLAM<->IMU
  *  drift). @p outcome: 0=rejected,1=accepted,2=reset. Poses are [px,py,pz,qx,qy,qz,qw]. */

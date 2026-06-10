@@ -9,16 +9,13 @@
  * @author Jan Schmidt <jan@centricular.com>
  * @ingroup constellation
  */
-#ifndef _GNU_SOURCE // For qsort_r FIXME to use qsort
-#define _GNU_SOURCE
-#endif
-
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <assert.h>
 #include <math.h>
+#include <limits.h>
 
 #include "math/m_vec3.h"
 #include "os/os_time.h"
@@ -33,7 +30,8 @@
 #define DUMP_TIMING 0
 #define CHECK_ALL_PROJECTIONS 0
 
-#define MAX_LED_SEARCH_DEPTH 8
+#define MAX_LED_SEARCH_DEPTH 6
+#define BOUNDED_SEARCH_MAX_TRIALS 512
 
 /* This file implements a brute-force correspondence search between LED models and observed IR LED blobs.
  *
@@ -103,14 +101,36 @@ correspondence_search_new(struct camera_model *camera_calib)
 #define LOG(s, ...)
 #endif
 
-static int
-compare_blobs_distance(const void *elem1, const void *elem2, void *arg);
-
 static void
 undistort_blob_points(struct blob *blobs, int num_blobs, struct xrt_vec2 *out_points, struct camera_model *calib)
 {
 	for (int i = 0; i < num_blobs; i++) {
 		t_camera_models_undistort(&calib->calib, blobs[i].x, blobs[i].y, &out_points[i].x, &out_points[i].y);
+	}
+}
+
+static inline double
+blob_distance_sq(const struct cs_image_point *point, const struct cs_image_point *anchor)
+{
+	const double dy = (double)point->blob->y - anchor->blob->y;
+	const double dx = (double)point->blob->x - anchor->blob->x;
+	return dy * dy + dx * dx;
+}
+
+static void
+sort_blobs_by_distance(struct cs_image_point **points, int num_points, const struct cs_image_point *anchor)
+{
+	for (int i = 1; i < num_points; i++) {
+		struct cs_image_point *point = points[i];
+		const double distance = blob_distance_sq(point, anchor);
+		int j = i - 1;
+
+		while (j >= 0 && blob_distance_sq(points[j], anchor) > distance) {
+			points[j + 1] = points[j];
+			j--;
+		}
+
+		points[j + 1] = point;
 	}
 }
 
@@ -136,10 +156,12 @@ correspondence_search_set_blobs(struct correspondence_search *cs, struct blob *b
 
 	assert(num_blobs <= MAX_BLOBS_PER_FRAME);
 
-	if (cs->points != NULL)
-		free(cs->points);
-
-	cs->points = calloc(num_blobs, sizeof(struct cs_image_point));
+	if (num_blobs > cs->points_capacity) {
+		struct cs_image_point *points = realloc(cs->points, num_blobs * sizeof(struct cs_image_point));
+		assert(points != NULL);
+		cs->points = points;
+		cs->points_capacity = num_blobs;
+	}
 	cs->num_points = num_blobs;
 	cs->blobs = blobs;
 
@@ -179,7 +201,7 @@ correspondence_search_set_blobs(struct correspondence_search *cs, struct blob *b
 		struct cs_image_point *anchor = cs->points + i;
 
 		/* Sort the blobs by proximity to anchor blob */
-		qsort_r(blob_list, cs->num_points, sizeof(struct cs_image_point *), compare_blobs_distance, anchor);
+		sort_blobs_by_distance(blob_list, cs->num_points, anchor);
 		memcpy(cs->blob_neighbours[i], blob_list, cs->num_points * sizeof(struct cs_image_point *));
 	}
 }
@@ -190,27 +212,6 @@ correspondence_search_free(struct correspondence_search *cs)
 	if (cs->points)
 		free(cs->points);
 	free(cs);
-}
-
-static int
-compare_blobs_distance(const void *elem1, const void *elem2, void *arg)
-{
-	const struct cs_image_point *b1 = *(const struct cs_image_point **)elem1;
-	const struct cs_image_point *b2 = *(const struct cs_image_point **)elem2;
-	struct cs_image_point *anchor = arg;
-	double dist1, dist2;
-
-	dist1 = (b1->blob->y - anchor->blob->y) * (b1->blob->y - anchor->blob->y) +
-	        (b1->blob->x - anchor->blob->x) * (b1->blob->x - anchor->blob->x);
-	dist2 = (b2->blob->y - anchor->blob->y) * (b2->blob->y - anchor->blob->y) +
-	        (b2->blob->x - anchor->blob->x) * (b2->blob->x - anchor->blob->x);
-
-	if (dist1 > dist2)
-		return 1;
-	if (dist1 < dist2)
-		return -1;
-
-	return 0;
 }
 
 #if DUMP_SCENE
@@ -341,6 +342,37 @@ search_result_better(const struct correspondence_search_result *old_result,
 	struct pose_metrics old_score = old_result->score;
 	struct pose_metrics score = *new_score;
 	return pose_metrics_score_is_better_pose_prior(&old_score, old_prior_cost, &score, new_prior_cost);
+}
+
+static bool
+best_partial_result_usable(const struct pose_metrics *score)
+{
+	if (score == NULL || POSE_HAS_FLAGS(score, POSE_MATCH_GOOD) || score->matched_blobs < 4) {
+		return false;
+	}
+	if (!POSE_HAS_FLAGS(score, POSE_MATCH_LED_IDS)) {
+		return false;
+	}
+	const double reproj_per_match =
+	    score->matched_blobs > 0 ? score->reprojection_error / (double)score->matched_blobs : INFINITY;
+	if (!isfinite(reproj_per_match) || reproj_per_match > 3.0) {
+		return false;
+	}
+	return true;
+}
+
+static void
+append_best_partial_result(struct cs_model_info *mi)
+{
+	if (mi == NULL || (mi->search_flags & CS_FLAG_RETURN_BEST_PARTIAL) == 0 || mi->result_count > 0 ||
+	    !best_partial_result_usable(&mi->best_any_score)) {
+		return;
+	}
+
+	mi->results[0].pose = mi->best_any_pose;
+	mi->results[0].score = mi->best_any_score;
+	mi->result_prior_cost[0] = 0.0;
+	mi->result_count = 1;
 }
 
 static void
@@ -578,6 +610,9 @@ check_led_against_model_subset(struct correspondence_search *cs,
 	y2 = blobs[1]->point_homog;
 	y3 = blobs[2]->point_homog;
 
+	if (cs->num_trials >= mi->max_trials) {
+		return;
+	}
 	cs->num_trials++;
 
 	for (i = 0; i < 3; i++) {
@@ -712,7 +747,7 @@ check_led_against_model_subset(struct correspondence_search *cs,
 #endif
 		/* Check that the 4th point projected to within its blob */
 		if (distance <= blobs[3]->max_dist) {
-			if (correspondence_search_project_pose(cs, model, &pose, mi, depth) || 1) {
+			correspondence_search_project_pose(cs, model, &pose, mi, depth);
 #if 0
           printf ("  P4P points %f,%f,%f -> %f %f\n"
                   "         %f,%f,%f -> %f %f\n"
@@ -728,7 +763,6 @@ check_led_against_model_subset(struct correspondence_search *cs,
                 checkblob.x,
                 checkblob.y);
 #endif
-			}
 		}
 	}
 }
@@ -765,6 +799,8 @@ select_k_blobs_from_n(struct correspondence_search *cs,
 
 	/* Short circuit if we found a strong pose match already */
 	if ((mi->match_flags & POSE_MATCH_STRONG) && (mi->search_flags & CS_FLAG_STOP_FOR_STRONG_MATCH))
+		return;
+	if (cs->num_trials >= mi->max_trials)
 		return;
 
 	if (n > k)
@@ -814,6 +850,9 @@ check_led_match(struct correspondence_search *cs,
 	mi->led_depth = depth;
 
 	for (b = 0; b < cs->num_points; b++) {
+		if (cs->num_trials >= mi->max_trials) {
+			return;
+		}
 		struct cs_image_point *anchor = cs->points + b;
 		mi->blob_index = b;
 		check_leds_against_anchor(cs, mi, model_leds, anchor);
@@ -841,6 +880,8 @@ select_k_leds_from_n(struct correspondence_search *cs,
 		/* Short circuit if we found a strong pose match already */
 		if ((mi->match_flags & POSE_MATCH_STRONG) && (mi->search_flags & CS_FLAG_STOP_FOR_STRONG_MATCH))
 			return;
+		if (cs->num_trials >= mi->max_trials)
+			return;
 
 		/* Check the other orientation of blob 2/3, without
 		 * affecting result_list that needs to stay intact
@@ -867,6 +908,8 @@ select_k_leds_from_n(struct correspondence_search *cs,
 
 	/* Short circuit if we found a strong pose match already */
 	if ((mi->match_flags & POSE_MATCH_STRONG) && (mi->search_flags & CS_FLAG_STOP_FOR_STRONG_MATCH))
+		return;
+	if (cs->num_trials >= mi->max_trials)
 		return;
 
 	if (n > k)
@@ -1060,6 +1103,7 @@ correspondence_search_find_one_pose(struct correspondence_search *cs,
 	mi.model = model;
 	mi.search_flags = search_flags;
 	mi.match_flags = 0;
+	mi.max_trials = (search_flags & CS_FLAG_BOUNDED_SEARCH) ? BOUNDED_SEARCH_MAX_TRIALS : UINT_MAX;
 
 	if (search_flags & CS_FLAG_HAVE_POSE_PRIOR) {
 		assert(pos_error_thresh != NULL);
@@ -1137,6 +1181,7 @@ correspondence_search_find_pose_candidates(struct correspondence_search *cs,
 	mi.model = model;
 	mi.search_flags = search_flags;
 	mi.match_flags = 0;
+	mi.max_trials = (search_flags & CS_FLAG_BOUNDED_SEARCH) ? BOUNDED_SEARCH_MAX_TRIALS : UINT_MAX;
 
 	if (search_flags & CS_FLAG_HAVE_POSE_PRIOR) {
 		assert(pos_error_thresh != NULL);
@@ -1157,6 +1202,7 @@ correspondence_search_find_pose_candidates(struct correspondence_search *cs,
 	}
 
 	search_pose_for_model(cs, &mi);
+	append_best_partial_result(&mi);
 	finish_search_diagnostics(cs, &mi);
 	const int n = mi.result_count < max_results ? mi.result_count : max_results;
 	for (int i = 0; i < n; i++) {

@@ -159,6 +159,24 @@ pose_metrics_match_pose_to_blobs(struct xrt_pose *pose,
                                  struct camera_model *calib,
                                  struct pose_metrics_blob_match_info *match_info);
 
+#define PKF_MAX_CLUSTER 8
+#define PKF_TAU_AMBIG 0.5
+
+double
+pose_metrics_pkf_permanent(const double *Q, int m, int n);
+
+double
+pose_metrics_pkf_permanent_augmented(const double *L, const double *L_clutter, int m, int n);
+
+double
+pose_metrics_pkf_pair_nll(double sqerror_px2, double p_i);
+
+double
+pose_metrics_pkf_detection_prob(double facing_dot);
+
+double
+pose_metrics_pkf_clutter_likelihood(void);
+
 /* As above, but size each LED's blob-match gate from the prior's per-axis
  * position/rotation uncertainty (anisotropic Mahalanobis ellipse) instead of a
  * fixed radius. NULL thresholds => the fixed-radius (isotropic) behaviour. */

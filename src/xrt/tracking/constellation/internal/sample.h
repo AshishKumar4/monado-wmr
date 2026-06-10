@@ -40,10 +40,17 @@ struct tracking_sample_device_state
 	 * DRIFTLESS gravity-anchored prior TILT is a valid reference even through an optical dropout (the
 	 * gyro-blind snap-back case). False at cold start, where the search runs on reprojection alone. */
 	bool prior_tilt_trusted;
+	bool prior_optical_stale;
+	bool prior_position_tracked;
+	bool prior_orientation_tracked;
 	/* Live fusion yaw (orientation) 1-sigma uncertainty, in radians, for the soft mirror-flip cost's
 	 * anisotropic yaw scale. Tight when the yaw prior is fresh (the prior term picks the prior-consistent
 	 * twin); large after a long dropout / cold start (the yaw term vanishes, reprojection decides). */
 	float prior_yaw_sigma_rad;
+
+	bool gravity_ref_valid;
+	bool gravity_ref_clean;
+	struct xrt_pose P_world_obj_gravity;
 
 	/* Last observed pose, in world space */
 	bool have_last_seen_pose;

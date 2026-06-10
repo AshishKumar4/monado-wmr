@@ -1324,6 +1324,19 @@ wmr_controller_base_get_pose_uncertainty(struct xrt_device *xdev,
 }
 
 static bool
+wmr_controller_base_get_gravity_tilt_reference(struct xrt_device *xdev,
+                                               struct xrt_quat *out_gravity_corrected_q,
+                                               double *out_excess_m_s2)
+{
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
+	if (wcb->kalman_fusion == NULL) {
+		return false;
+	}
+	return kalman_fusion_get_gravity_tilt_reference(wcb->kalman_fusion, out_gravity_corrected_q,
+	                                                out_excess_m_s2);
+}
+
+static bool
 wmr_controller_base_get_predicted_pose(struct xrt_device *xdev,
                                        timepoint_ns when_ns,
                                        struct xrt_space_relation *out_relation)
@@ -1480,7 +1493,9 @@ wmr_controller_base_predict_led_gate(struct xrt_device *xdev,
 }
 
 static void
-wmr_controller_base_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame_mono_ns, const struct xrt_pose *pose)
+wmr_controller_base_push_observed_pose(struct xrt_device *xdev,
+                                       timepoint_ns frame_mono_ns,
+                                       const struct xrt_pose *pose)
 {
 	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
 
@@ -1588,7 +1603,8 @@ static void
 wmr_controller_base_push_observed_position(struct xrt_device *xdev,
                                            timepoint_ns frame_mono_ns,
                                            const struct xrt_vec3 *position,
-                                           const struct xrt_vec3 *position_variance)
+                                           const struct xrt_vec3 *position_variance,
+                                           bool refresh_optical_anchor)
 {
 	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
 	if (wcb->kalman_fusion == NULL || position == NULL) {
@@ -1601,7 +1617,26 @@ wmr_controller_base_push_observed_position(struct xrt_device *xdev,
 
 	os_mutex_lock(&wcb->data_lock);
 	kalman_fusion_process_position(wcb->kalman_fusion, fusion_ts, position, position_variance,
-	                               hmd_world_pose);
+	                               hmd_world_pose, refresh_optical_anchor);
+	os_mutex_unlock(&wcb->data_lock);
+}
+
+static void
+wmr_controller_base_cache_pnp_pose_candidate(struct xrt_device *xdev,
+                                             timepoint_ns frame_mono_ns,
+                                             const struct xrt_pose *pose)
+{
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
+	if (wcb->kalman_fusion == NULL || pose == NULL) {
+		return;
+	}
+
+	struct xrt_pose hmd_pose;
+	const struct xrt_pose *hmd_world_pose = wmr_controller_query_hmd_pose(wcb, frame_mono_ns, &hmd_pose);
+	const timepoint_ns fusion_ts = frame_mono_ns + wcb->ctrl_optical_td_ns;
+
+	os_mutex_lock(&wcb->data_lock);
+	kalman_fusion_cache_pnp_pose_candidate(wcb->kalman_fusion, fusion_ts, pose, hmd_world_pose);
 	os_mutex_unlock(&wcb->data_lock);
 }
 
@@ -1610,12 +1645,14 @@ static struct t_constellation_tracked_device_callbacks tracking_callbacks = {
     .notify_frame_received = wmr_controller_base_notify_frame,
     .push_observed_pose = wmr_controller_base_push_observed_pose,
     .push_observed_position = wmr_controller_base_push_observed_position,
-    .push_observed_leds = wmr_controller_base_push_observed_leds,
-    .push_brightness_update = wmr_controller_base_push_brightness_update,
+	.push_observed_leds = wmr_controller_base_push_observed_leds,
+	.push_brightness_update = wmr_controller_base_push_brightness_update,
 	.get_pose_uncertainty = wmr_controller_base_get_pose_uncertainty,
+	.get_gravity_tilt_reference = wmr_controller_base_get_gravity_tilt_reference,
 	.get_predicted_pose = wmr_controller_base_get_predicted_pose,
 	.get_last_optical_age_ms = wmr_controller_base_get_last_optical_age_ms,
 	.predict_led_gate = wmr_controller_base_predict_led_gate,
+	.cache_pnp_pose_candidate = wmr_controller_base_cache_pnp_pose_candidate,
 };
 
 void

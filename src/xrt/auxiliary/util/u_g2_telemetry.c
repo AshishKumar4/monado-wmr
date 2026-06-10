@@ -128,6 +128,9 @@ struct g2_telem_candidate
 	float yaw_err_rad;
 	float prior_pos_err_x, prior_pos_err_y, prior_pos_err_z;
 	float prior_rot_err_x, prior_rot_err_y, prior_rot_err_z;
+	float blob_var_mean_px2;
+	float blob_brightness_mean;
+	float blob_area_mean;
 	float px, py, pz;
 	float qx, qy, qz, qw;
 } G2_PACKED;
@@ -161,6 +164,10 @@ struct g2_telem_search
 	uint8_t blobs_matched;
 	uint8_t unmatched_blobs;
 	float reproj_err_px;
+	uint32_t bng_reason_flags;
+	float reproj_err_per_match;
+	float unmatched_per_match;
+	float matched_visible_ratio;
 } G2_PACKED;
 
 //! fusion stream row. Pose components are stored as named scalar f32 fields (not
@@ -284,6 +291,9 @@ static const struct g2_field candidate_fields[] = {
     F(g2_telem_candidate, prior_pos_err_z, "f32"),
     F(g2_telem_candidate, prior_rot_err_x, "f32"), F(g2_telem_candidate, prior_rot_err_y, "f32"),
     F(g2_telem_candidate, prior_rot_err_z, "f32"),
+    F(g2_telem_candidate, blob_var_mean_px2, "f32"),
+    F(g2_telem_candidate, blob_brightness_mean, "f32"),
+    F(g2_telem_candidate, blob_area_mean, "f32"),
     F(g2_telem_candidate, px, "f32"), F(g2_telem_candidate, py, "f32"), F(g2_telem_candidate, pz, "f32"),
     F(g2_telem_candidate, qx, "f32"), F(g2_telem_candidate, qy, "f32"), F(g2_telem_candidate, qz, "f32"),
     F(g2_telem_candidate, qw, "f32"),
@@ -303,6 +313,8 @@ static const struct g2_field search_fields[] = {
     F(g2_telem_search, best_led_depth, "u8"), F(g2_telem_search, match_flags, "u32"),
     F(g2_telem_search, leds_visible, "u8"), F(g2_telem_search, blobs_matched, "u8"),
     F(g2_telem_search, unmatched_blobs, "u8"), F(g2_telem_search, reproj_err_px, "f32"),
+    F(g2_telem_search, bng_reason_flags, "u32"), F(g2_telem_search, reproj_err_per_match, "f32"),
+    F(g2_telem_search, unmatched_per_match, "f32"), F(g2_telem_search, matched_visible_ratio, "f32"),
 };
 
 static const struct g2_field fusion_fields[] = {
@@ -345,7 +357,7 @@ static const struct g2_stream_desc g2_descs[G2_TELEM_STREAM_COUNT] = {
                                 NF(search_fields)},
     [G2_TELEM_STREAM_FUSION] = {"fusion", "fusion.bin", sizeof(struct g2_telem_fusion), 65536, fusion_fields,
                                 NF(fusion_fields)},
-    [G2_TELEM_STREAM_EVENT] = {"event", "event.bin", sizeof(struct g2_telem_event), 8192, event_fields,
+    [G2_TELEM_STREAM_EVENT] = {"event", "event.bin", sizeof(struct g2_telem_event), 65536, event_fields,
                                NF(event_fields)},
     [G2_TELEM_STREAM_HEAD_POSE] = {"head_pose", "head_pose.bin", sizeof(struct g2_telem_head_pose), 32768,
                                    head_pose_fields, NF(head_pose_fields)},
@@ -967,6 +979,9 @@ g2_telem_candidate(uint8_t device_id,
                    float yaw_err_rad,
                    const float prior_pos_err[3],
                    const float prior_rot_err[3],
+                   float blob_var_mean_px2,
+                   float blob_brightness_mean,
+                   float blob_area_mean,
                    const float pose[7])
 {
 	if (!g2_telem_enabled()) {
@@ -1004,6 +1019,9 @@ g2_telem_candidate(uint8_t device_id,
 		row.prior_rot_err_y = prior_rot_err[1];
 		row.prior_rot_err_z = prior_rot_err[2];
 	}
+	row.blob_var_mean_px2 = blob_var_mean_px2;
+	row.blob_brightness_mean = blob_brightness_mean;
+	row.blob_area_mean = blob_area_mean;
 	if (pose != NULL) {
 		row.px = pose[0];
 		row.py = pose[1];
@@ -1041,7 +1059,11 @@ g2_telem_search(uint8_t device_id,
                 uint8_t leds_visible,
                 uint8_t blobs_matched,
                 uint8_t unmatched_blobs,
-                float reproj_err_px)
+                float reproj_err_px,
+                uint32_t bng_reason_flags,
+                float reproj_err_per_match,
+                float unmatched_per_match,
+                float matched_visible_ratio)
 {
 	if (!g2_telem_enabled()) {
 		return;
@@ -1073,6 +1095,10 @@ g2_telem_search(uint8_t device_id,
 	row.blobs_matched = blobs_matched;
 	row.unmatched_blobs = unmatched_blobs;
 	row.reproj_err_px = reproj_err_px;
+	row.bng_reason_flags = bng_reason_flags;
+	row.reproj_err_per_match = reproj_err_per_match;
+	row.unmatched_per_match = unmatched_per_match;
+	row.matched_visible_ratio = matched_visible_ratio;
 	(void)ring_emit(&g_telem.rings[G2_TELEM_STREAM_SEARCH], &row);
 }
 

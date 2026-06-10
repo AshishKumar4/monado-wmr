@@ -126,6 +126,11 @@ struct t_constellation_tracked_device_callbacks
 	//! then falls back to its fixed default bounds.
 	bool (*get_pose_uncertainty)(struct xrt_device *xdev, double *position_std, double *orientation_std,
 	                             double *yaw_std);
+	//! Gravity-tilt-corrected held orientation (world<-body) for the matcher's absolute tilt reference.
+	//! @p out_excess_m_s2 is |||f|| - g|; small means low linear acceleration.
+	bool (*get_gravity_tilt_reference)(struct xrt_device *xdev,
+	                                   struct xrt_quat *out_gravity_corrected_q,
+	                                   double *out_excess_m_s2);
 	//! Raw predicted (prior) pose for the matcher — the fusion's HONEST estimate, with NO body-lock / reach /
 	//! re-entry reporting transforms, so the out-of-view visual ride never feeds back to mislead the matcher's
 	//! gate + flip cost. @p out receives the pose (identity / untracked flags until the fusion is tracking).
@@ -148,10 +153,17 @@ struct t_constellation_tracked_device_callbacks
 	                         const struct xrt_vec3 *led_obj,
 	                         float out_zhat[2], float out_S[4]);
 	//! Position-only visual observation for frames where LED correspondences constrain translation but not
-	//! orientation. Optional — callers still use push_observed_pose for full 6DoF locks.
+	//! orientation. refresh_optical_anchor is true only for independent visual positions that may reset optical
+	//! freshness, body-lock, and optical velocity; weak single-view prior-supported positions must pass false.
 	void (*push_observed_position)(struct xrt_device *xdev, timepoint_ns frame_mono_ns,
 	                               const struct xrt_vec3 *position,
-	                               const struct xrt_vec3 *position_variance);
+	                               const struct xrt_vec3 *position_variance,
+	                               bool refresh_optical_anchor);
+	//! Cache-only PnP pose candidate for per-LED divergence recovery. Optional; callers use it before
+	//! ambiguous LED folds so the fusion can re-anchor to a guarded same-frame PnP solution if many LEDs
+	//! are seen but the stale prior gates them out.
+	void (*cache_pnp_pose_candidate)(struct xrt_device *xdev, timepoint_ns frame_mono_ns,
+	                                 const struct xrt_pose *pose);
 };
 
 struct t_constellation_tracked_device_connection *

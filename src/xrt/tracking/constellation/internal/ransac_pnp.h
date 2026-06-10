@@ -38,10 +38,10 @@ ransac_pnp_pose(struct xrt_pose *pose,
                 int *num_inliers);
 
 /*!
- * As ransac_pnp_pose, but when the inlier LED set is near-coplanar (the few-LED, edge-on geometry that
+ * As ransac_pnp_pose, but when the inlier LED set is near-planar (the few-LED, edge-on geometry that
  * causes the PnP mirror two-fold ambiguity), also returns the second (mirror-twin) pose so the caller can
- * pick the one consistent with the IMU/fusion prior instead of silently committing one. @p twin receives
- * the twin and @p has_twin is set true only when a distinct second solution exists; otherwise @p has_twin
+ * pick the one consistent with the IMU/fusion prior instead of silently committing one. @p twin receives the
+ * analytic twin and @p has_twin is set true only when a distinct second solution exists; otherwise @p has_twin
  * is false and @p twin is untouched. @p pose is always the primary (RANSAC + LM) solution on success.
  */
 bool
@@ -54,6 +54,19 @@ ransac_pnp_pose_with_twin(struct xrt_pose *pose,
                           int *num_inliers,
                           struct xrt_pose *twin,
                           bool *has_twin);
+
+bool
+ransac_pnp_tilt_clamp(const struct xrt_pose *pose,
+                      const struct xrt_vec3 *obj_pts,
+                      const struct xrt_vec2 *img_pts,
+                      int n,
+                      struct camera_model *calib,
+                      const struct xrt_pose *prior_cam,
+                      const struct xrt_vec3 *up_cam,
+                      bool require_coplanar,
+                      struct xrt_pose *out,
+                      struct xrt_pose *yaw_twin,
+                      bool *has_yaw_twin);
 
 int
 pnp_solve_p3p(struct blob *blobs,
@@ -104,6 +117,35 @@ ransac_pnp_pose_with_twin(struct xrt_pose *pose,
 	(void)twin;
 	if (has_twin != NULL) {
 		*has_twin = false;
+	}
+	return false;
+}
+
+static inline bool
+ransac_pnp_tilt_clamp(const struct xrt_pose *pose,
+                      const struct xrt_vec3 *obj_pts,
+                      const struct xrt_vec2 *img_pts,
+                      int n,
+                      struct camera_model *calib,
+                      const struct xrt_pose *prior_cam,
+                      const struct xrt_vec3 *up_cam,
+                      bool require_coplanar,
+                      struct xrt_pose *out,
+                      struct xrt_pose *yaw_twin,
+                      bool *has_yaw_twin)
+{
+	(void)pose;
+	(void)obj_pts;
+	(void)img_pts;
+	(void)n;
+	(void)calib;
+	(void)prior_cam;
+	(void)up_cam;
+	(void)require_coplanar;
+	(void)out;
+	(void)yaw_twin;
+	if (has_yaw_twin != NULL) {
+		*has_yaw_twin = false;
 	}
 	return false;
 }

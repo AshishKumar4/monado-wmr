@@ -418,6 +418,24 @@ TEST_CASE("kalman: tracks constant-velocity motion and estimates velocity")
 	CHECK(std::abs(rel.linear_velocity.z) < 0.25);
 }
 
+TEST_CASE("kalman: snap re-anchor preserves fresh optical velocity for immediate OOV coast")
+{
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+
+	int64_t t = 1000000;
+	feed_pose(kf.get(), t, ZERO_VEC, IDENTITY_QUAT);
+
+	t += 80000000; // 80 ms: a 55 cm optical move is plausible hand motion but crosses the snap threshold.
+	const xrt_vec3 shifted = {0.55f, 0.0f, 0.0f};
+	feed_pose(kf.get(), t, shifted, IDENTITY_QUAT);
+
+	xrt_space_relation rel{};
+	kf->get_prediction(t + 20000000, &rel, nullptr);
+	CHECK(rel.linear_velocity.x > 2.0f);
+	CHECK(rel.pose.position.x > shifted.x);
+}
+
 TEST_CASE("kalman: dead-reckons constant acceleration through optical dropout")
 {
 	// Anchor at rest, then apply a known constant world acceleration with
@@ -710,6 +728,49 @@ TEST_CASE("kalman: rejects a divergent optical pose that jumps implausibly far")
 	CHECK(after.pose.position.z == Approx(home.z).margin(0.05));
 }
 
+TEST_CASE("kalman: rejects a same-window optical jump before it becomes an OOV anchor")
+{
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+
+	int64_t t = 1000000;
+	const xrt_pose hmd = pose_at(ZERO_VEC);
+	const xrt_vec3 home = {0.30f, -0.10f, -0.55f};
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+
+	for (int i = 0; i < 160; i++) {
+		feed_pose_hmd(kf.get(), t, home, IDENTITY_QUAT, hmd);
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+
+	xrt_space_relation before{};
+	kf->get_prediction(t, &before, &hmd);
+	REQUIRE((before.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0);
+	REQUIRE(norm(before.pose.position - home) < 0.05f);
+
+	const xrt_vec3 impossible = {home.x + 0.35f, home.y, home.z};
+	feed_pose_hmd(kf.get(), t, impossible, IDENTITY_QUAT, hmd);
+	feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+	t += DT_NS;
+
+	xrt_space_relation after_bad_optical{};
+	kf->get_prediction(t, &after_bad_optical, &hmd);
+	CHECK(norm(after_bad_optical.pose.position - home) < 0.08f);
+	CHECK(norm(after_bad_optical.pose.position - impossible) > 0.20f);
+
+	for (int i = 0; i < 220; i++) {
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		kf->update_body_anchor(&hmd);
+		t += DT_NS;
+	}
+
+	xrt_space_relation stale{};
+	kf->get_prediction(t, &stale, &hmd);
+	CHECK(norm(stale.pose.position - home) < 0.12f);
+	CHECK(norm(stale.pose.position - impossible) > 0.20f);
+}
+
 TEST_CASE("kalman: rejects a stale-recovery per-LED fold that jumps implausibly far")
 {
 	auto kf = KalmanFusionInterface::create();
@@ -979,8 +1040,14 @@ TEST_CASE("kalman: a weak same-frame LED fold does not suppress a PnP position r
 
 	int64_t t = 1000000;
 	const xrt_vec3 start = {0.0f, 0.0f, 1.0f};
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
 	for (int i = 0; i < 30; i++) {
 		feed_pose(kf.get(), t, start, IDENTITY_QUAT);
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+	for (int i = 0; i < 200; i++) {
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
 		t += DT_NS;
 	}
 
@@ -1005,6 +1072,150 @@ TEST_CASE("kalman: a weak same-frame LED fold does not suppress a PnP position r
 	kf->get_prediction(t, &rel, nullptr);
 	CHECK(rel.pose.position.x > 0.05f);
 	CHECK(rel.pose.position.x == Approx(shifted.x).margin(0.35));
+}
+
+TEST_CASE("kalman: cache-only PnP seeds divergent LED re-anchor without adopting state")
+{
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+
+	int64_t t = 1000000;
+	const xrt_vec3 start = {0.0f, 0.0f, 1.0f};
+	const xrt_vec3 shifted = {0.35f, 0.0f, 1.0f};
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	for (int i = 0; i < 60; i++) {
+		feed_pose(kf.get(), t, start, IDENTITY_QUAT);
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+	for (int i = 0; i < 200; i++) {
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+
+	xrt_space_relation before{};
+	kf->get_prediction(t, &before, nullptr);
+	REQUIRE(before.pose.position.x == Approx(start.x).margin(0.03));
+
+	xrt_pose pnp = pose_at(shifted);
+	kf->cache_pnp_pose_candidate(t, &pnp, nullptr);
+
+	xrt_space_relation after_cache{};
+	kf->get_prediction(t, &after_cache, nullptr);
+	CHECK(after_cache.pose.position.x == Approx(before.pose.position.x).margin(0.01));
+
+	LEDCameraView view{};
+	view.fx = 400.0f;
+	view.fy = 400.0f;
+	view.cx = 320.0f;
+	view.cy = 240.0f;
+	view.cam_world_orient = IDENTITY_QUAT;
+	view.cam_world_pos = ZERO_VEC;
+
+	const std::array<xrt_vec3, 4> leds = {
+	    xrt_vec3{-0.04f, 0.0f, 0.0f},
+	    xrt_vec3{0.04f, 0.0f, 0.0f},
+	    xrt_vec3{0.0f, 0.04f, 0.0f},
+	    xrt_vec3{0.0f, -0.04f, 0.0f},
+	};
+	std::vector<LEDObservation> obs;
+	for (const xrt_vec3 &led : leds) {
+		const xrt_vec3 world_led = shifted + led;
+		LEDObservation o{};
+		o.led_obj = led;
+		o.observed_px = {
+		    (float)(view.fx * (world_led.x / world_led.z) + view.cx),
+		    (float)(view.fy * (world_led.y / world_led.z) + view.cy),
+		};
+		obs.push_back(o);
+	}
+
+	REQUIRE(kf->process_led_observations(t, obs, view, nullptr, 8.0f, true, nullptr) >= 4.0f);
+
+	xrt_space_relation after_fold{};
+	kf->get_prediction(t, &after_fold, nullptr);
+	CHECK(after_fold.pose.position.x == Approx(shifted.x).margin(0.08));
+	CHECK(after_fold.pose.position.z == Approx(shifted.z).margin(0.08));
+}
+
+TEST_CASE("kalman: stale recovery LED fold clears stale velocity correlations")
+{
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+
+	int64_t t = 1000000;
+	const xrt_vec3 start = {0.0f, 0.0f, 1.0f};
+	const xrt_vec3 shifted = {0.28f, 0.0f, 1.0f};
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	for (int i = 0; i < 120; i++) {
+		feed_pose(kf.get(), t, start, IDENTITY_QUAT);
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+	for (int i = 0; i < 20; i++) {
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+
+	const xrt_vec3 accel_push = make_accel_body(IDENTITY_QUAT, {2.0f, 0.0f, 0.0f});
+	for (int i = 0; i < 420; i++) {
+		feed_imu(kf.get(), t, accel_push, ZERO_VEC);
+		t += DT_NS;
+	}
+
+	kalman_fusion_oov_debug stale{};
+	REQUIRE(kf->debug_get_oov_report(t, nullptr, &stale));
+	REQUIRE(std::abs(stale.raw_velocity.x) > 0.5f);
+
+	for (int i = 0; i < 40; i++) {
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+
+	kalman_fusion_oov_debug rested_stale{};
+	REQUIRE(kf->debug_get_oov_report(t, nullptr, &rested_stale));
+	REQUIRE(std::abs(rested_stale.raw_velocity.x) > 0.5f);
+	double optical_age_ms = 0.0;
+	REQUIRE(kf->debug_get_last_optical_age_ms(t, &optical_age_ms));
+	REQUIRE(optical_age_ms > 500.0);
+
+	LEDCameraView view{};
+	view.fx = 400.0f;
+	view.fy = 400.0f;
+	view.cx = 320.0f;
+	view.cy = 240.0f;
+	view.cam_world_orient = IDENTITY_QUAT;
+	view.cam_world_pos = ZERO_VEC;
+
+	const std::array<xrt_vec3, 6> leds = {
+	    xrt_vec3{-0.05f, 0.0f, 0.0f},
+	    xrt_vec3{0.05f, 0.0f, 0.0f},
+	    xrt_vec3{0.0f, -0.05f, 0.0f},
+	    xrt_vec3{0.0f, 0.05f, 0.0f},
+	    xrt_vec3{0.035f, 0.035f, 0.0f},
+	    xrt_vec3{-0.035f, -0.035f, 0.0f},
+	};
+	std::vector<LEDObservation> obs;
+	for (const xrt_vec3 &led : leds) {
+		const xrt_vec3 world_led = shifted + led;
+		LEDObservation o{};
+		o.led_obj = led;
+		o.observed_px = {
+		    (float)(view.fx * (world_led.x / world_led.z) + view.cx),
+		    (float)(view.fy * (world_led.y / world_led.z) + view.cy),
+		};
+		obs.push_back(o);
+	}
+
+	REQUIRE(kf->process_led_observations(t, obs, view, nullptr, 1000.0f, true, nullptr) >= 4.0f);
+
+	xrt_space_relation reacquired{};
+	kf->get_prediction(t, &reacquired, nullptr);
+	kalman_fusion_oov_debug recovered{};
+	REQUIRE(kf->debug_get_oov_report(t, nullptr, &recovered));
+	CHECK(reacquired.pose.position.x == Approx(shifted.x).margin(0.08));
+	CHECK(reacquired.pose.position.z == Approx(shifted.z).margin(0.08));
+	CHECK(norm(recovered.raw_velocity) < 0.20f);
 }
 
 TEST_CASE("kalman: applies an optical pose that lags the filter clock")
@@ -1133,15 +1344,15 @@ TEST_CASE("kalman: the body-anchor fold keeps an out-of-view controller body-pla
 {
 	// A controller leaving camera view must stay body-plausible, not dead-reckon away. The fix folds a soft,
 	// rigid-HMD-relative body anchor into the ESKF while out of view: the Kalman blend keeps the state bounded
-	// near the body-plausible point (within an arm of the head). Long stale reports remain valid for visual
-	// continuity but are no longer POSITION_TRACKED after the OOV confidence horizon.
+	// near the body-plausible point (within an arm of the head). Long stale body-anchored reports remain
+	// finite for visual continuity, but POSITION_TRACKED is cleared once the accuracy contract expires.
 	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
 	const xrt_pose hmd = pose_at(ZERO_VEC);          // head fixed at origin (the in-reach physical case)
 	const xrt_vec3 ctrl_pos = {0.3f, -0.2f, -0.5f};  // ~0.62 m: a real arm's-reach pose
 
 	// Lock (capturing the head-frame body offset) then coast with no optical; @p fold drives the body-anchor
 	// fold each coast sample (the driver path) or not. Returns the worst stale-window dist-to-head, world pos,
-	// and whether ANY stale frame was reported untracked.
+	// and whether ANY long-stale frame was reported untracked.
 	auto lock_then_coast = [&](bool fold) {
 		auto kf = KalmanFusionInterface::create();
 		REQUIRE(kf != nullptr);
@@ -1176,8 +1387,8 @@ TEST_CASE("kalman: the body-anchor fold keeps an out-of-view controller body-pla
 	(void)world_nofold;
 	(void)dist_nofold;
 
-	// WITH the fold: stays within ~an arm of the head and never flies to metres. It remains visually valid
-	// through a sustained coast, but drops POSITION_TRACKED after the short OOV confidence horizon.
+	// WITH the fold: stays within ~an arm of the head and never flies to metres. The long-stale report is
+	// correctly not promised as a tracked/accurate position.
 	CHECK(dist_fold < 0.85f);
 	CHECK(world_fold < 1.5f);
 	CHECK(untracked_fold);
@@ -1185,15 +1396,85 @@ TEST_CASE("kalman: the body-anchor fold keeps an out-of-view controller body-pla
 	CHECK(untracked_nofold);
 }
 
+TEST_CASE("kalman: early OOV body-anchor confidence does not fold raw EKF before freeze")
+{
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	const xrt_pose hmd = pose_at(ZERO_VEC);
+	const xrt_vec3 ctrl_pos = {0.3f, -0.2f, -0.5f};
+
+	auto locked_filter = [&]() {
+		auto kf = KalmanFusionInterface::create();
+		REQUIRE(kf != nullptr);
+		int64_t t = 1000000;
+		for (int i = 0; i < 200; i++) {
+			feed_pose_hmd(kf.get(), t, ctrl_pos, IDENTITY_QUAT, hmd);
+			feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+			t += DT_NS;
+		}
+		return std::make_pair(std::move(kf), t);
+	};
+
+	auto [plain, t_plain] = locked_filter();
+	auto [anchored, t_anchor] = locked_filter();
+
+	for (int i = 0; i < 150; i++) { // 300 ms: after OOV report starts, before the 500 ms EKF body fold.
+		feed_imu(plain.get(), t_plain, accel_rest, ZERO_VEC);
+		t_plain += DT_NS;
+
+		feed_imu(anchored.get(), t_anchor, accel_rest, ZERO_VEC);
+		anchored->update_body_anchor(&hmd);
+		t_anchor += DT_NS;
+	}
+
+	xrt_space_relation plain_raw{}, anchored_raw{};
+	plain->get_predicted_pose(t_plain, &plain_raw);
+	anchored->get_predicted_pose(t_anchor, &anchored_raw);
+	REQUIRE(std::isfinite(plain_raw.pose.position.x));
+	REQUIRE(std::isfinite(anchored_raw.pose.position.x));
+	CHECK(norm(plain_raw.pose.position - anchored_raw.pose.position) < 0.005f);
+}
+
+TEST_CASE("kalman: body-lock report carries bounded inertial velocity while optical is stale")
+{
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+
+	const xrt_pose hmd = pose_at(ZERO_VEC);
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	int64_t t = 1000000;
+	float x = 0.1f;
+
+	for (int i = 0; i < 400; i++) {
+		const xrt_vec3 ctrl_pos = {x, -0.2f, -0.5f};
+		feed_pose_hmd(kf.get(), t, ctrl_pos, IDENTITY_QUAT, hmd);
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		x += 1.0f * (float)DT_S;
+		t += DT_NS;
+	}
+
+	const xrt_vec3 gyro_not_rest = {0.0f, 0.2f, 0.0f};
+	for (int i = 0; i < 300; i++) {
+		feed_imu(kf.get(), t, accel_rest, gyro_not_rest);
+		kf->update_body_anchor(&hmd);
+		t += DT_NS;
+	}
+
+	xrt_space_relation rel{};
+	kf->get_prediction(t, &rel, &hmd);
+	CHECK((rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0);
+	REQUIRE((rel.relation_flags & XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT) != 0);
+	CHECK(norm(rel.pose.position - hmd.position) < 1.2f);
+	const float speed = norm(rel.linear_velocity);
+	CHECK(speed > 0.05f);
+	CHECK(speed <= 2.001f);
+}
+
 TEST_CASE("kalman: an abandoned (set-down) controller drops to UNTRACKED after a sustained body-lock hold")
 {
-	// The body-lock hold rides BRIEF occlusion (a controller out of view at arm's reach during fast play
-	// MUST keep tracking — fix, don't reject). But a genuinely set-down controller, out of view for a long
-	// time, must be reported LOST rather than dragged at the head forever (the graceful-degrade endpoint).
+	// Body-anchored optical misses keep a finite report, but POSITION_TRACKED is an accuracy contract:
+	// brief misses remain tracked, long stale reports are visual continuity until optical returns.
 	// This drives the WMR reporting path (get_prediction with a live HMD pose, the only seam where it can be
-	// detected — unlike PSMV there is no per-frame "lost the object" callback). Proves: (1) a short burst of
-	// out-of-view at arm's reach stays TRACKED (rides the hold), (2) a sustained loss drops to UNTRACKED, and
-	// (3) re-acquiring optical restores TRACKED.
+	// detected — unlike PSMV there is no per-frame "lost the object" callback).
 	auto kf = KalmanFusionInterface::create();
 	REQUIRE(kf != nullptr);
 
@@ -1226,8 +1507,25 @@ TEST_CASE("kalman: an abandoned (set-down) controller drops to UNTRACKED after a
 	REQUIRE(std::isfinite(short_hold.pose.position.x));
 	CHECK(is_tracked(short_hold));
 
-	// (2) Past the OOV confidence horizon the pose remains valid for visual continuity, but is not a trusted
-	// tracked position until optical returns.
+	for (int i = 0; i < 20; i++) { // 140 ms total: finite continuity, but past tracked-confidence
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		kf->update_body_anchor(&hmd);
+		t += DT_NS;
+	}
+	const xrt_space_relation short_body_hold = predict_now(t);
+	REQUIRE(std::isfinite(short_body_hold.pose.position.x));
+	CHECK_FALSE(is_tracked(short_body_hold));
+
+	for (int i = 0; i < 250; i++) { // 640 ms total: past the short-occlusion confidence window
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		kf->update_body_anchor(&hmd);
+		t += DT_NS;
+	}
+	const xrt_space_relation stale_hold = predict_now(t);
+	REQUIRE(std::isfinite(stale_hold.pose.position.x));
+	CHECK_FALSE(is_tracked(stale_hold));
+
+	// (2) A sustained, body-anchored coast inside the abandon horizon remains finite but untracked.
 	for (int i = 0; i < 700; i++) { // total ~1.5 s, optical dropped
 		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
 		kf->update_body_anchor(&hmd);
@@ -1256,6 +1554,37 @@ TEST_CASE("kalman: an abandoned (set-down) controller drops to UNTRACKED after a
 	}
 	const xrt_space_relation reacquired = predict_now(t);
 	CHECK(is_tracked(reacquired)); // re-acquire after a drop restores tracking
+}
+
+TEST_CASE("kalman: position-only snap preserves fresh optical velocity")
+{
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+
+	int64_t t = 1000000;
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	const xrt_vec3 start = {0.0f, 0.0f, 0.0f};
+	for (int i = 0; i < 120; i++) {
+		feed_pose(kf.get(), t, start, IDENTITY_QUAT);
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		t += DT_NS;
+	}
+
+	t += 100000000;
+	const xrt_vec3 observed = {0.7f, 0.0f, 0.0f};
+	const xrt_vec3 variance = {0.0004f, 0.0004f, 0.0004f};
+	kf->process_position(t, &observed, &variance, nullptr, true);
+
+	xrt_space_relation at_sample{};
+	kf->get_prediction(t, &at_sample, nullptr);
+	CHECK(at_sample.pose.position.x == Approx(observed.x).margin(0.03f));
+	CHECK(at_sample.linear_velocity.x > 5.0f);
+
+	const int64_t future = t + 50000000;
+	xrt_space_relation coast{};
+	kf->get_prediction(future, &coast, nullptr);
+	CHECK(coast.pose.position.x > observed.x + 0.20f);
+	CHECK(coast.linear_velocity.x > 5.0f);
 }
 
 namespace {
@@ -1338,8 +1667,12 @@ TEST_CASE("kalman: re-entry blend eases a body-lock->fresh discontinuity (capped
 			const float step = norm(p - prev);
 			max_step = std::max(max_step, step);
 			const float dist = norm(p - target);
+			const bool tracked = (rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
 			if (dist > prev_dist + 1e-3f) {
 				monotone = false; // moved AWAY from the target -> overshoot / non-monotone
+			}
+			if (dist > 0.05f + 1e-3f) {
+				CHECK_FALSE(tracked);
 			}
 			prev_dist = dist;
 			prev = p;
@@ -1349,6 +1682,9 @@ TEST_CASE("kalman: re-entry blend eases a body-lock->fresh discontinuity (capped
 		CHECK(max_step <= 0.05f + 1e-3f); // never jumps more than the per-frame cap
 		CHECK(monotone);                  // first-order: converges without overshoot
 		CHECK(end_err < 0.02f);           // reaches the fresh fold by the end of the window
+		xrt_space_relation final_rel{};
+		kf->get_prediction(t, &final_rel, &hmd);
+		CHECK((final_rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0);
 	}
 
 	SECTION("a sub-threshold (2 cm) discontinuity passes through un-blended")
@@ -1455,8 +1791,8 @@ TEST_CASE("kalman: FSM report-regime is consistent with the reported relation fl
 		CHECK_FALSE(is_pos_tracked(rel)); // out of view: reported but not tracked
 	}
 
-	// Now the driver folds the body anchor each sample -> BodyLocked. It is body-plausible but not
-	// POSITION_TRACKED because the OOV confidence horizon has already expired.
+	// Now the driver folds the body anchor each sample -> BodyLocked, finite, but no tracked promise once
+	// the stale accuracy contract has expired.
 	for (int i = 0; i < 400; i++) {
 		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
 		kf->update_body_anchor(&hmd);
@@ -2610,6 +2946,36 @@ eskf_bootstrap(KalmanFusionInterface *kf, int64_t &ts, double t)
 		feed_pose(kf, ts, to_xrt_vec3(g.p), to_xrt_quat(g.q));
 		ts += 1000000;
 	}
+}
+
+TEST_CASE("kalman: previous-frame LED fold does not suppress the next optical pose")
+{
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+
+	const LedModel led = make_led_model();
+	const Cam cam[2] = {make_cam(-0.06), make_cam(+0.06)};
+	const LEDCameraView view[2] = {make_view(cam[0]), make_view(cam[1])};
+	std::mt19937 rng(0x51eed);
+
+	int64_t ts = 1000000;
+	GTPose g0{{0.0, 0.0, 1.45}, {1.0, 0.0, 0.0, 0.0}};
+	for (int i = 0; i < 20; i++) {
+		feed_pose(kf.get(), ts, to_xrt_vec3(g0.p), to_xrt_quat(g0.q));
+		ts += DT_NS;
+	}
+
+	const int folded_source_leds = eskf_feed_leds(kf.get(), ts, g0, led, cam, view, rng, 0.0, 0);
+	REQUIRE(folded_source_leds >= 8);
+
+	ts += 40000000; // within the old 80 ms recency window, but a distinct optical sample.
+	GTPose g1 = g0;
+	g1.p.x = 0.08;
+	feed_pose(kf.get(), ts, to_xrt_vec3(g1.p), to_xrt_quat(g1.q));
+
+	xrt_space_relation rel{};
+	kf->get_prediction(ts, &rel, nullptr);
+	CHECK(rel.pose.position.x > 0.04f);
 }
 
 //! Position error of the filter's reported pose vs GT at time t.
@@ -3922,6 +4288,17 @@ TEST_CASE("kalman: get_imu_intrinsics round-trips a seeded gyro+accel correction
 		kf->set_imu_intrinsics(bad, ident);
 		double rmg[9], rta[9];
 		CHECK(kf->get_imu_intrinsics(rmg, rta) == false); // rejected -> nothing applied
+	}
+	SECTION("over-wide accel ellipsoid seed is ignored") {
+		auto kf = KalmanFusionInterface::create();
+		const double bad_ta[9] = {
+		    1.1763899, -0.0570579961, -0.0339109427,
+		    -0.0570579961, 1.00306104, 0.042938601,
+		    -0.0339109427, 0.042938601, 0.998657386,
+		};
+		kf->set_imu_intrinsics(ident, bad_ta);
+		double rmg[9], rta[9];
+		CHECK(kf->get_imu_intrinsics(rmg, rta) == false);
 	}
 	SECTION("implausible (out-of-band) seed falls back to identity") {
 		// A corrupt external calibration whose scaling is wildly out of the plausible band (here a 3x

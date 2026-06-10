@@ -173,6 +173,17 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 	add_test(NAME tests_multicam_triangulate COMMAND tests_multicam_triangulate --success --allow-running-no-tests)
 	set_target_properties(tests_multicam_triangulate PROPERTIES FOLDER monado_tests)
 
+	# Decoupled unit tests for the kept-alive 2-mode yaw belief.
+	add_executable(tests_yaw_belief tests_yaw_belief.cpp)
+	target_link_libraries(
+		tests_yaw_belief PRIVATE xrt-external-catch2 constellation_tracker aux_math aux_util
+								 xrt-interfaces ${OpenCV_LIBRARIES})
+	target_include_directories(
+		tests_yaw_belief PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/tracking/constellation
+								 ${OpenCV_INCLUDE_DIRS})
+	add_test(NAME tests_yaw_belief COMMAND tests_yaw_belief --success --allow-running-no-tests)
+	set_target_properties(tests_yaw_belief PROPERTIES FOLDER monado_tests)
+
 	# Decoupled, adversarial unit tests for the blob-detection layer (saturated-centroid recovery,
 	# per-blob R, reflection rejection). Synthetic frames, known truth.
 	add_executable(tests_blobwatch tests_blobwatch.cpp)

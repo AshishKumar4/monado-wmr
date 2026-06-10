@@ -36,6 +36,9 @@ enum association_hypothesis_flags
 	ASSOC_HYP_IS_TWIN = 0x4,
 	ASSOC_HYP_PARTIAL_ONLY = 0x8,
 	ASSOC_HYP_JOINT = 0x10,
+	ASSOC_HYP_STALE_PRIOR = 0x20,
+	ASSOC_HYP_IGNORE_PRIOR = 0x40,
+	ASSOC_HYP_PRIOR_POSITION_UNTRACKED = 0x100,
 };
 
 enum association_state
@@ -65,6 +68,7 @@ struct association_cost_terms
 	float body_state_nll;
 	float orientation_consensus_nll;
 	float temporal_nll;
+	float joint_contention_delta_nll;
 	float total_nll;
 };
 
@@ -78,8 +82,12 @@ struct association_pose_hypothesis
 	uint8_t matched_count;
 	uint8_t visible_count;
 	uint8_t unmatched_count;
+	uint8_t blob_quality_count;
 	struct association_blob_ref matched_blobs[ASSOCIATION_MAX_BLOBS_PER_HYPOTHESIS];
 	int16_t matched_led_ids[ASSOCIATION_MAX_BLOBS_PER_HYPOTHESIS];
+	float blob_var_mean_px2;
+	float blob_brightness_mean;
+	float blob_area_mean;
 
 	float tilt_error_rad;
 	bool tilt_valid;

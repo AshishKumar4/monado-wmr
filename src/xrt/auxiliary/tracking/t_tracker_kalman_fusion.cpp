@@ -88,6 +88,7 @@ namespace {
 	constexpr int ET = 6;  //!< delta orientation (world-frame rotation vector)
 	constexpr int EBA = 9; //!< delta accel bias (body)
 	constexpr int EBG = 12; //!< delta gyro bias (body)
+	constexpr int OPT_VEL_HISTORY_SAMPLES = 4;
 
 	//! Compile-time unit helpers: each tuning constant below is written as the meaningful quantity
 	//! (a std, an angle in degrees, a time in ms) instead of a pre-squared / pre-radian / pre-scaled
@@ -109,22 +110,30 @@ namespace {
 		return m;
 	}
 
+	inline void
+	reset_covariance_block(Mat15 &P, int block, double variance)
+	{
+		P.block<3, 15>(block, 0).setZero();
+		P.block<15, 3>(0, block).setZero();
+		P.block<3, 3>(block, block) = Mat3::Identity() * variance;
+	}
+
 	//! Re-entry ease: on re-acquisition, slide the reported position to the fresh fold over this window; only
 	//! a jump >= REENTRY_MIN_SNAP_M is eased (smaller ones pass through).
 	constexpr int64_t REENTRY_WINDOW_NS = ms_to_ns(120);
 	constexpr double REENTRY_MAX_STEP_M = 0.05; //!< per-frame position cap during the ease (rate floor)
 	//! Time-scaled re-entry slide cap: the per-step position cap is max(REENTRY_MAX_STEP_M,
-	//! REENTRY_MAX_SPEED_M_S·dt). A FIXED per-frame cap stalls the ease at a low render/replay rate
-	//! (large dt) — the report then lags the fresh fold for several frames and the lag itself reads as
-	//! a snap when it finally catches up. Scaling by dt keeps the slide a bounded VELOCITY (≤4 m/s,
-	//! hand-plausible) regardless of call rate, so the ease completes in ~constant wall-time and never
-	//! degenerates into a delayed jump. Convergent with the g2-codex-global-reconciled re-entry fix.
+	//! REENTRY_MAX_SPEED_M_S·dt). A fixed per-frame cap stalls the ease at low replay/report rates and turns
+	//! the lag itself into a measured tracking error. Scaling by dt keeps the slide a bounded velocity while
+	//! retaining the 5 cm cap at 90 Hz render cadence.
 	constexpr double REENTRY_MAX_SPEED_M_S = 4.0;
 	constexpr double REENTRY_MIN_SNAP_M = 0.05; //!< only ease jumps at/above this
+	constexpr double REENTRY_TRACKED_MAX_LAG_M = 0.05; //!< farther lag is valid for continuity, not tracked
 	//! Same ease applied to orientation on the manifold (SLERP from the last reported orient to the fresh
 	//! fold orient). MAX_STEP_RAD = ~5.7°/frame caps the angular slide; MIN_SNAP_RAD ~5° matches the
 	//! position threshold's spirit (small re-acq deltas pass through; meaningful angular snaps are eased).
 	constexpr double REENTRY_MAX_STEP_RAD = 0.10; //!< per-frame angular cap during the ease (~5.7°)
+	constexpr double REENTRY_MAX_ORIENT_SPEED_RAD_S = 9.0; //!< same cap, scaled for low-rate report callers
 	constexpr double REENTRY_MIN_SNAP_RAD = 0.087; //!< only ease angular jumps >= ~5°
 
 	//! Precomputed per-view geometry+intrinsics for the per-LED reprojection (built once per frame).
@@ -167,10 +176,11 @@ namespace {
 
 	//! Plausible-scaling band for an IMU-intrinsics correction (the online accel-ellipsoid fit T, and the
 	//! offline-persisted M_g / T_a loaded at the trust boundary). A physical correction is a SMALL scaling —
-	//! per-axis scale a few %, misalignment a few deg — so every singular value lies near 1. These generous
-	//! bounds (-20%/+25%) sit far outside any genuine correction yet reject a garbage/corrupt matrix.
-	constexpr double INTRINSICS_SV_MIN = 0.8;
-	constexpr double INTRINSICS_SV_MAX = 1.25;
+	//! per-axis scale a few %, misalignment a few deg — so every singular value lies near 1. These bounds
+	//! are wider than the scalar accel-scale cache (±10%) but still reject stale/bad ellipsoid fits that
+	//! would turn gravity into centimetres of OOV drift.
+	constexpr double INTRINSICS_SV_MIN = 0.88;
+	constexpr double INTRINSICS_SV_MAX = 1.12;
 
 	//! Full accelerometer ellipsoid calibration: given bias-corrected at-rest samples @p v that span
 	//! orientations, find the symmetric correction T (per-axis scale + misalignment) such that the
@@ -475,6 +485,8 @@ namespace {
 		double orientation_var_max;  //!< largest eigenvalue of P[ET,ET] (rad^2): worst-direction orientation variance
 		double orientation_yaw_var;  //!< up'·P[ET,ET]·up: the world-up (yaw) DoF variance alone (rad^2)
 		double acceleration_var_max; //!< largest eigenvalue of P[EBA,EBA] ((m/s^2)^2): dominant render-accel uncertainty
+		double gravity_corrected_q[4];
+		double gravity_excess_m_s2;
 		timepoint_ns reentry_start_ns;
 		timepoint_ns filter_time_ns;
 		timepoint_ns last_optical_ns;
@@ -485,7 +497,8 @@ namespace {
 		bool orientation_valid;
 		bool orientation_tracked;
 		bool body_lock_valid;
-		bool body_anchored;  //!< weak body-position prior is active for out-of-view tracking/reporting
+		bool body_anchored;  //!< a weak body-position prior has been folded during this optical gap
+		bool gravity_valid;
 		bool optical_velocity_valid;
 		bool reentry_active; //!< a recent re-acquisition edge (get_prediction eases the report jump)
 	};
@@ -505,6 +518,8 @@ namespace {
 		Vector3d angvel_world{0, 0, 0};
 		Vector3d last_good_position{0, 0, 0};
 		Vector3d optical_velocity_world{0, 0, 0};
+		Vector3d optical_pos_history[OPT_VEL_HISTORY_SAMPLES]{};
+		double optical_pos_var_history[OPT_VEL_HISTORY_SAMPLES]{};
 		Vector3d body_offset_world{0, 0, 0}; //!< controller-minus-head WORLD offset at the last fold
 		timepoint_ns filter_time_ns{0};
 		timepoint_ns last_imu_ns{0};
@@ -513,6 +528,7 @@ namespace {
 		timepoint_ns last_led_fold_ns{0};
 		timepoint_ns last_position_led_fold_ns{0};
 		timepoint_ns optical_velocity_ns{0};
+		timepoint_ns optical_pos_history_ns[OPT_VEL_HISTORY_SAMPLES]{};
 		timepoint_ns prev_capture_optical_ns{0};
 		timepoint_ns last_body_anchor_ns{0};
 		TrackingInfo orientation_state;
@@ -522,6 +538,7 @@ namespace {
 		bool body_lock_valid{false};
 		bool body_anchored{false};
 		bool optical_velocity_valid{false};
+		int optical_pos_history_count{0};
 	};
 
 	//! One buffered IMU sample retained for out-of-sequence replay.
@@ -530,13 +547,13 @@ namespace {
 		xrt_imu_sample sample;
 	};
 
-		//! Raw extrapolation of the published snapshot to a render time — the filter's honest belief, with NO
+	//! Raw extrapolation of the published snapshot to a render time — the filter's honest belief, with NO
 	//! body-lock / reach / re-entry transforms (those are the reporting layer get_prediction adds on top).
 	//! Shared by get_prediction (the compositor report) and get_predicted_pose (the matcher's estimation
 	//! prior) so the front-end gates against the estimate, never the visual ride, from ONE snapshot read.
 	struct PredictedEstimate
 	{
-			Vector3d position;       //!< weak-body-aided when anchored; frozen at last_good only without a body anchor
+		Vector3d position;       //!< weak-body-aided when anchored; frozen at last_good only without a body anchor
 		Quaterniond orientation; //!< gyro-advanced
 		Vector3d velocity;       //!< Wiener-damped linear velocity
 		bool optical_stale;
@@ -573,10 +590,16 @@ namespace {
 		             const float residual_limit,
 		             const struct xrt_pose *hmd_world_pose) override;
 		void
-		process_position(const timepoint_ns timestamp_ns,
-		                 const struct xrt_vec3 *position,
-		                 const struct xrt_vec3 *position_variance_optional,
-		                 const struct xrt_pose *hmd_world_pose) override;
+			process_position(const timepoint_ns timestamp_ns,
+			                 const struct xrt_vec3 *position,
+			                 const struct xrt_vec3 *position_variance_optional,
+			                 const struct xrt_pose *hmd_world_pose,
+			                 bool refresh_optical_anchor) override;
+
+		void
+		cache_pnp_pose_candidate(const timepoint_ns timestamp_ns,
+		                         const struct xrt_pose *pose,
+		                         const struct xrt_pose *hmd_world_pose) override;
 
 		float
 		process_led_observations(const timepoint_ns timestamp_ns,
@@ -634,6 +657,23 @@ namespace {
 			// dropout — tilt (gravity-anchored, observable) never widens the yaw scale.
 			if (yaw_std != nullptr) {
 				*yaw_std = std::sqrt(std::max(0.0, snap.orientation_yaw_var));
+			}
+			return true;
+		}
+
+		bool
+		get_gravity_tilt_reference(struct xrt_quat *out_gravity_corrected_q, double *out_excess_m_s2) override
+		{
+			const FilterSnapshot snap = read_snapshot();
+			if (!snap.tracked || !snap.gravity_valid) {
+				return false;
+			}
+			if (out_gravity_corrected_q != nullptr) {
+				const Eigen::Map<const Quaterniond> q{snap.gravity_corrected_q};
+				map_quat(*out_gravity_corrected_q) = q.cast<float>();
+			}
+			if (out_excess_m_s2 != nullptr) {
+				*out_excess_m_s2 = snap.gravity_excess_m_s2;
 			}
 			return true;
 		}
@@ -796,6 +836,10 @@ namespace {
 			    std::min(BODY_ANCHOR_VAR + sq(BODY_OFFSET_DRIFT_M_S * age_s), BODY_ANCHOR_VAR_MAX);
 			map_vec3(out_debug->raw_predicted_position) = est.position.cast<float>();
 			map_vec3(out_debug->optical_hold_position) = hold.cast<float>();
+			map_vec3(out_debug->raw_velocity) = est.velocity.cast<float>();
+			map_vec3(out_debug->raw_acceleration) = Eigen::Map<const Vector3d>{snap.acceleration}.cast<float>();
+			map_vec3(out_debug->angular_velocity) = Eigen::Map<const Vector3d>{snap.angular_velocity}.cast<float>();
+			out_debug->gravity_excess_m_s2 = snap.gravity_valid ? snap.gravity_excess_m_s2 : NAN;
 			if (snap.body_lock_valid && hmd_world_pose != nullptr) {
 				const Vector3d body = map_vec3(hmd_world_pose->position).cast<double>() +
 				                     Eigen::Map<const Vector3d>{snap.body_offset_world};
@@ -939,6 +983,10 @@ namespace {
 		static constexpr double OPT_VEL_MAX_M_S = 8.0;
 		static constexpr double OPT_VEL_MIN_DT_S = 0.015;
 		static constexpr double OPT_VEL_MAX_DT_S = 0.35;
+		static constexpr double OPT_VEL_FIT_MIN_SPAN_S = 0.025;
+		static constexpr double OPT_VEL_FIT_MAX_AGE_S = 0.08;
+		static constexpr double OPT_VEL_FIT_VAR_FLOOR = sq(0.8);
+		static constexpr double OPT_VEL_FIT_MAX_RMS_M = 0.015;
 		//! Max horizon get_prediction extrapolates the snapshot forward. Bounds pathological large-dt
 		//! extrapolation; never clips normal use (render queries are within a frame of the latest IMU).
 		static constexpr double MAX_PREDICT_AHEAD_S = 0.1;
@@ -953,6 +1001,7 @@ namespace {
 		//! Optical jump plausibility gate on the PnP re-anchor candidate.
 		static constexpr double OPTICAL_MAX_SPEED_M_S = 12.0;
 		static constexpr double OPTICAL_JUMP_SLACK_M = 0.5;
+		static constexpr int64_t OPTICAL_SAME_WINDOW_GATE_NS = ms_to_ns(25);
 		//! A PnP pose this far from the prediction means the filter has diverged (per-LED can't fix a
 		//! large reprojection error — too nonlinear); snap-re-anchor to the PnP pose instead of a slow
 		//! EKF nudge. Below it, apply the pose as a normal absolute EKF update.
@@ -985,9 +1034,12 @@ namespace {
 		//! After this optical gap, raw IMU dead-reckon is no longer trusted blindly for the rendered report.
 		//! The report blends toward the last position-observable optical anchor as inertial covariance grows.
 		static constexpr int64_t OOV_REPORT_BLEND_NS = ms_to_ns(120);
-		//! Position remains TRACKED only through brief optical misses. Replay evidence shows the stale
-		//! accuracy contract breaks well before the visual freeze horizon on fast hand motion.
-		static constexpr int64_t OOV_TRACKED_NS = ms_to_ns(180);
+		//! POSITION_TRACKED is an accuracy contract, not a continuity signal. Past this short miss window,
+		//! keep a finite report for rendering but clear TRACKED until optical position evidence returns.
+		static constexpr int64_t OOV_TRACKED_NS = ms_to_ns(120);
+		static constexpr int64_t OOV_CONFIDENT_TRACK_NS = ms_to_ns(500);
+		static constexpr double OOV_CONFIDENT_POS_STD_M = 0.15;
+		static constexpr double OOV_BODY_REPORT_MAX_CORRECTION_M = 0.05;
 		static constexpr int64_t BODY_LOCK_ABANDON_NS = ms_to_ns(2000);
 		//! Hard physical sanity bound on the controller-to-HMD distance. An LED-constellation-tracked
 		//! controller is within the head cameras' range — physically a head-relative arm's reach — so a
@@ -1032,11 +1084,6 @@ namespace {
 		//! from every prior one by at least this, so the accumulated set spans orientations (the fit needs
 		//! a 3D spread, and >=9 directions, to identify the 6-parameter shape matrix).
 		static constexpr double ACCEL_CAL_DIR_SEP = deg2rad(15.0);
-		//! If a per-LED fold happened within this window, process_pose is reference-only (bootstrap +
-		//! re-anchor candidate) — folding the PnP pose too would double-count the same LEDs. With no
-		//! recent per-LED fold (a pose-only caller), process_pose applies the pose as an absolute
-		//! measurement, so the filter is robust to either input mode.
-		static constexpr int64_t PER_LED_RECENT_NS = ms_to_ns(80);
 		static constexpr int POSITION_OBSERVABLE_MIN_LEDS = 4;
 		//! Cap on the out-of-sequence IMU replay buffer.
 		static constexpr size_t IMU_LOG_CAP = 512;
@@ -1046,6 +1093,9 @@ namespace {
 		Mat15 m_P{Mat15::Identity()}; //!< error-state covariance
 		Vector3d m_accel_world{0, 0, 0};  //!< last world-frame acceleration (incl. gravity), for prediction
 		Vector3d m_angvel_world{0, 0, 0}; //!< last world-frame angular velocity, for prediction
+		Quaterniond m_gravity_corrected_q{1.0, 0.0, 0.0, 0.0};
+		double m_gravity_excess_m_s2{1e9};
+		bool m_gravity_valid{false};
 
 		timepoint_ns filter_time_ns{0};
 		//! Timestamp of the last IMU sample that actually propagated. Lets propagate_to tell a tiny
@@ -1072,6 +1122,10 @@ namespace {
 		Vector3d m_optical_velocity_world{0, 0, 0};
 		timepoint_ns m_optical_velocity_ns{0};
 		bool m_optical_velocity_valid{false};
+		Vector3d m_optical_pos_history[OPT_VEL_HISTORY_SAMPLES]{};
+		double m_optical_pos_var_history[OPT_VEL_HISTORY_SAMPLES]{};
+		timepoint_ns m_optical_pos_history_ns[OPT_VEL_HISTORY_SAMPLES]{};
+		int m_optical_pos_history_count{0};
 
 		//! Body-anchor out-of-view tracking: weakly folds toward the body-plausible point — the controller's
 		//! WORLD offset from the head captured at the last fold, carried with the live
@@ -1082,7 +1136,7 @@ namespace {
 		//! stale arm offset.
 		bool m_body_lock_valid{false};         //!< a fold with a live HMD pose has captured the body offset
 		Vector3d m_body_offset_world{0, 0, 0}; //!< controller-minus-head WORLD offset at the last fold (translation-rigid)
-		bool m_body_anchored{false};          //!< weak body-position prior is active this coast
+		bool m_body_anchored{false};          //!< weak body-position prior has been folded this coast
 		timepoint_ns m_last_body_anchor_ns{0};
 		//! Live HMD pose at the last optical op, set under m_filter_lock by set_op_hmd_pose for the reach gate.
 		//! Cleared (invalid) when no HMD pose is supplied.
@@ -1148,10 +1202,7 @@ namespace {
 
 		//! Gyro INTRINSIC correction M_g: corrected body rate = M_g·(gyro_meas - bg). One 3x3 carrying gyro
 		//! scale (singular values) AND gyro->device misalignment (orthogonal part) — exactly the M the
-		//! offline tool (imu_calib_from_optical.py) fits from phi_optical = M·∫gyro dt (single source of
-		//! truth). Identity until set_imu_intrinsics seeds the persisted offline calibration (no online
-		//! estimator: the measured scale is ~1.0 and there is no well-conditioned online misalignment
-		//! signal — the robust path is offline-compute + persist + apply). Identity => gyro uncorrected.
+		//! offline tool (imu_calib_from_optical.py) fits from phi_optical = M·∫gyro dt.
 		Mat3 m_gyro_M{Mat3::Identity()};
 		bool m_gyro_M_valid{false};
 
@@ -1190,6 +1241,8 @@ namespace {
 		reset_filter_and_imu();
 		void
 		bootstrap_from_pose(const xrt_pose &pose);
+		Vector3d
+		fresh_optical_velocity_or_zero() const;
 		void
 		reanchor(const Vector3d &p, const Quaterniond &q);
 		//! The gyro flip-veto DECISION (single source of truth for every flip-arbitration site). Returns true
@@ -1219,7 +1272,7 @@ namespace {
 		//! gyro directly observes the gyro bias (all three axes incl. yaw). Caller holds m_filter_lock.
 		void
 		fold_zaru(const Vector3d &gyro_measured);
-			//! Weak body-position fold while out of view. @p hmd_pose is the live head pose.
+		//! Weak body-position fold while out of view. @p hmd_pose is the live head pose.
 		bool
 		fold_body_anchor(const struct xrt_pose *hmd_pose);
 		void
@@ -1247,8 +1300,16 @@ namespace {
 		                             double *out_var) const;
 		bool
 		fold_optical_velocity_measurement(const Vector3d &pos, const Vector3d &pos_variance);
+		void
+		clear_optical_position_history();
+		void
+		record_optical_position_sample(const Vector3d &pos, const Vector3d &pos_variance);
+		void
+		seed_optical_position_history(const Vector3d &pos, const Vector3d &pos_variance);
 		bool
-		integrate_position_measurement(const Vector3d &pos, const Vector3d &pos_variance);
+		integrate_position_measurement(const Vector3d &pos,
+		                               const Vector3d &pos_variance,
+		                               bool refresh_optical_anchor);
 		int
 		fold_led_observations(const std::vector<LEDObservation> &obs,
 		                      const LEDCameraView &view,
@@ -1313,6 +1374,23 @@ namespace {
 			return !tracked || last_optical_ns == 0 ||
 			       (world_pos - last_good_position).norm() <= optical_motion_limit_m(t_pose);
 		}
+		bool
+		optical_adoption_motion_plausible(const Vector3d &world_pos, timepoint_ns t_pose) const
+		{
+			if (!tracked || last_optical_ns == 0) {
+				return true;
+			}
+			const int64_t dt_ns = t_pose > last_optical_ns ? t_pose - last_optical_ns : 0;
+			if (dt_ns <= OPTICAL_SAME_WINDOW_GATE_NS) {
+				return optical_motion_plausible(world_pos, t_pose);
+			}
+			double dt = time_ns_to_s(dt_ns);
+			if (dt < 0.0) {
+				dt = 0.0;
+			}
+			const double max_jump = OPTICAL_MAX_SPEED_M_S * dt + OPTICAL_JUMP_SLACK_M;
+			return (world_pos - last_good_position).norm() <= max_jump;
+		}
 		//! On a position-observable fold, capture the controller's head-frame offset (the body-anchor target)
 		//! and signal a re-entry edge if we just re-acquired after a coast. No-op without a live HMD pose.
 		void
@@ -1321,13 +1399,14 @@ namespace {
 			if (!m_hmd_pos_valid) {
 				return;
 			}
+			const Vector3d new_offset = m_x.p - m_hmd_pos;
 			if (m_body_lock_valid && m_prev_capture_optical_ns != 0 &&
 			    (filter_time_ns - m_prev_capture_optical_ns) > OPTICAL_FREEZE_NS) {
 				m_reentry_active = true; // re-acquired: get_prediction eases the report jump from its last value
 				m_reentry_start_ns = filter_time_ns;
 			}
 			m_prev_capture_optical_ns = filter_time_ns;
-			m_body_offset_world = m_x.p - m_hmd_pos; // controller-minus-head, WORLD frame (carried with head position)
+			m_body_offset_world = new_offset; // controller-minus-head, WORLD frame (carried with head position)
 			m_last_body_anchor_ns = filter_time_ns;
 			m_body_anchored = false; // fresh optical: coast anchor inactive until the next coast
 			m_body_lock_valid = true;
@@ -1413,6 +1492,9 @@ namespace {
 		m_P.block<3, 3>(EBG, EBG) = Mat3::Identity() * P0_BG;
 		m_accel_world.setZero();
 		m_angvel_world.setZero();
+		m_gravity_corrected_q = Quaterniond::Identity();
+		m_gravity_excess_m_s2 = 1e9;
+		m_gravity_valid = false;
 		tracked = false;
 		position_state = TrackingInfo{};
 		m_body_lock_valid = false; // a lost track invalidates the head-relative offset; re-captured on re-lock
@@ -1424,6 +1506,7 @@ namespace {
 		m_optical_velocity_world.setZero();
 		m_optical_velocity_ns = 0;
 		m_optical_velocity_valid = false;
+		clear_optical_position_history();
 	}
 
 	void
@@ -1466,10 +1549,14 @@ namespace {
 		tracked = true;
 		position_state.valid = position_state.tracked = true;
 		orientation_state.valid = orientation_state.tracked = true;
+		last_optical_ns = filter_time_ns;
+		m_last_position_led_fold_ns = filter_time_ns;
 		last_good_position = m_x.p;
 		m_optical_velocity_world.setZero();
 		m_optical_velocity_ns = 0;
 		m_optical_velocity_valid = false;
+		seed_optical_position_history(m_x.p, Vector3d::Constant(P0_POS));
+		capture_body_lock();
 	}
 
 	//! Snap pose to the PnP estimate, keep velocity + biases, inflate P so the chi-square gate widens
@@ -1479,19 +1566,26 @@ namespace {
 	{
 		m_x.p = p;
 		m_x.q = q.normalized();
-		// A runaway velocity is what diverged us; drop it and re-open its uncertainty so the per-LED
-		// folds rebuild it cleanly, rather than re-injecting the bad value.
-		m_x.v.setZero();
+		// A runaway velocity is often what diverged us, but a fresh optical-velocity measurement taken from
+		// the same accepted optical position is exactly the coast seed needed for an immediate OOV gap.
+		// Preserve only that gated same-timestamp velocity; otherwise drop velocity and let folds rebuild it.
+		m_x.v = fresh_optical_velocity_or_zero();
 		// Inflate position/orientation/velocity uncertainty; clear their cross-covariances so the
 		// inflated blocks are not fought by stale correlations.
-		for (int b : {EP, EV, ET}) {
-			m_P.block<3, 15>(b, 0).setZero();
-			m_P.block<15, 3>(0, b).setZero();
-		}
-		m_P.block<3, 3>(EP, EP) = Mat3::Identity() * REANCHOR_POS_VAR;
-		m_P.block<3, 3>(EV, EV) = Mat3::Identity() * P0_VEL;
-		m_P.block<3, 3>(ET, ET) = Mat3::Identity() * REANCHOR_ORI_VAR;
+		reset_covariance_block(m_P, EP, REANCHOR_POS_VAR);
+		reset_covariance_block(m_P, EV, P0_VEL);
+		reset_covariance_block(m_P, ET, REANCHOR_ORI_VAR);
 		last_good_position = p;
+		seed_optical_position_history(p, Vector3d::Constant(REANCHOR_POS_VAR));
+	}
+
+	Vector3d
+	EskfFusion::fresh_optical_velocity_or_zero() const
+	{
+		const bool have_fresh_optical_velocity =
+		    m_optical_velocity_valid && m_optical_velocity_ns == filter_time_ns &&
+		    m_optical_velocity_world.allFinite() && m_optical_velocity_world.norm() <= OPT_VEL_MAX_M_S;
+		return have_fresh_optical_velocity ? m_optical_velocity_world : Vector3d::Zero();
 	}
 
 	bool
@@ -1586,24 +1680,30 @@ namespace {
 			return false;
 		}
 		// Out of view only — with optical live this would fight the observed position.
-		if (last_optical_ns != 0 && (filter_time_ns - last_optical_ns) <= OPTICAL_FREEZE_NS) {
+		const int64_t optical_age_ns = last_optical_ns != 0 ? filter_time_ns - last_optical_ns : 0;
+		if (last_optical_ns != 0 && optical_age_ns <= OOV_REPORT_BLEND_NS) {
 			return false;
-			}
-			m_body_anchored = true;
-			if ((filter_time_ns - m_last_body_anchor_ns) >= BODY_ANCHOR_PERIOD_NS) {
-				m_last_body_anchor_ns = filter_time_ns;
-				MatX H = MatX::Zero(3, 15);
-				H.block<3, 3>(0, EP) = Mat3::Identity();
-				const VecX r = (map_vec3(hmd_pose->position).cast<double>() + m_body_offset_world) - m_x.p;
-				const double coast_s =
-				    (last_optical_ns != 0) ? (double)(filter_time_ns - last_optical_ns) / 1e9 : 0.0;
-				const double var =
-				    std::min(BODY_ANCHOR_VAR + sq(BODY_OFFSET_DRIFT_M_S * coast_s), BODY_ANCHOR_VAR_MAX);
-				const MatX Rp = Mat3::Identity() * var;
-				(void)ekf_update(H, r, Rp);
-			}
+		}
+		m_body_anchored = true;
+		if (last_optical_ns != 0 && optical_age_ns <= OPTICAL_FREEZE_NS) {
 			return true;
 		}
+		if ((filter_time_ns - m_last_body_anchor_ns) >= BODY_ANCHOR_PERIOD_NS) {
+			MatX H = MatX::Zero(3, 15);
+			H.block<3, 3>(0, EP) = Mat3::Identity();
+			const VecX r = (map_vec3(hmd_pose->position).cast<double>() + m_body_offset_world) - m_x.p;
+			const double coast_s =
+			    (last_optical_ns != 0) ? (double)(filter_time_ns - last_optical_ns) / 1e9 : 0.0;
+			const double var =
+			    std::min(BODY_ANCHOR_VAR + sq(BODY_OFFSET_DRIFT_M_S * coast_s), BODY_ANCHOR_VAR_MAX);
+			const MatX Rp = Mat3::Identity() * var;
+			if (ekf_update(H, r, Rp)) {
+				m_last_body_anchor_ns = filter_time_ns;
+				m_body_anchored = true;
+			}
+		}
+		return true;
+	}
 
 	FilterCheckpoint
 	EskfFusion::capture_checkpoint() const
@@ -1615,6 +1715,11 @@ namespace {
 		c.angvel_world = m_angvel_world;
 		c.last_good_position = last_good_position;
 		c.optical_velocity_world = m_optical_velocity_world;
+		for (int i = 0; i < OPT_VEL_HISTORY_SAMPLES; i++) {
+			c.optical_pos_history[i] = m_optical_pos_history[i];
+			c.optical_pos_var_history[i] = m_optical_pos_var_history[i];
+			c.optical_pos_history_ns[i] = m_optical_pos_history_ns[i];
+		}
 		c.body_offset_world = m_body_offset_world;
 		c.filter_time_ns = filter_time_ns;
 		c.last_imu_ns = m_last_imu_ns;
@@ -1632,6 +1737,7 @@ namespace {
 		c.body_lock_valid = m_body_lock_valid;
 		c.body_anchored = m_body_anchored;
 		c.optical_velocity_valid = m_optical_velocity_valid;
+		c.optical_pos_history_count = m_optical_pos_history_count;
 		return c;
 	}
 
@@ -1644,6 +1750,11 @@ namespace {
 		m_angvel_world = c.angvel_world;
 		last_good_position = c.last_good_position;
 		m_optical_velocity_world = c.optical_velocity_world;
+		for (int i = 0; i < OPT_VEL_HISTORY_SAMPLES; i++) {
+			m_optical_pos_history[i] = c.optical_pos_history[i];
+			m_optical_pos_var_history[i] = c.optical_pos_var_history[i];
+			m_optical_pos_history_ns[i] = c.optical_pos_history_ns[i];
+		}
 		m_body_offset_world = c.body_offset_world;
 		filter_time_ns = c.filter_time_ns;
 		m_last_imu_ns = c.last_imu_ns;
@@ -1661,6 +1772,7 @@ namespace {
 		m_body_lock_valid = c.body_lock_valid;
 		m_body_anchored = c.body_anchored;
 		m_optical_velocity_valid = c.optical_velocity_valid;
+		m_optical_pos_history_count = c.optical_pos_history_count;
 	}
 
 	void
@@ -1704,6 +1816,9 @@ namespace {
 		    Eigen::SelfAdjointEigenSolver<Mat3>(m_P.block<3, 3>(EBA, EBA), Eigen::EigenvaluesOnly)
 		        .eigenvalues()
 		        .maxCoeff();
+		Eigen::Map<Quaterniond>{s.gravity_corrected_q} = m_gravity_corrected_q;
+		s.gravity_excess_m_s2 = m_gravity_excess_m_s2;
+		s.gravity_valid = m_gravity_valid;
 		s.filter_time_ns = filter_time_ns;
 		s.last_optical_ns = last_optical_ns;
 		s.optical_velocity_ns = m_optical_velocity_ns;
@@ -1910,6 +2025,15 @@ namespace {
 
 		m_accel_world = a_world;
 		m_angvel_world = R * w;
+		const double fmag = f.norm();
+		if (std::isfinite(fmag) && fmag > 1.0) {
+			const Vector3d up_meas_w = (m_x.q.toRotationMatrix() * f).normalized();
+			const Vector3d up_w(0.0, 1.0, 0.0);
+			const Quaterniond q_fix = Quaterniond::FromTwoVectors(up_meas_w, up_w);
+			m_gravity_corrected_q = (q_fix * m_x.q).normalized();
+			m_gravity_excess_m_s2 = std::abs(fmag - MATH_GRAVITY_M_S2);
+			m_gravity_valid = true;
+		}
 
 		// Accel gravity-tilt anchor: when this sample shows low linear acceleration, fold the gravity
 		// direction to pin roll+pitch absolutely (covers optical-sparse / flip stretches; see GRAV_BAND).
@@ -2088,8 +2212,8 @@ namespace {
 		const bool recovery_gate = position_gap_stale && !recent_led_evidence;
 		Mat15 gate_P = m_P;
 		if (recovery_gate) {
-			gate_P.block<3, 3>(EV, EV) = Mat3::Identity() * P0_VEL;
 			gate_P.block<3, 3>(EP, EP) = Mat3::Identity() * LOST_POS_VAR;
+			gate_P.block<3, 3>(EV, EV) = Mat3::Identity() * P0_VEL;
 			gate_P.block<3, 3>(ET, ET) = Mat3::Identity() * LOST_ORI_VAR;
 		}
 
@@ -2156,8 +2280,10 @@ namespace {
 			return 0;
 		}
 
-		if (recovery_gate && k >= POSITION_OBSERVABLE_MIN_LEDS) {
-			m_x.v.setZero();
+		const bool position_recovery = recovery_gate && k >= POSITION_OBSERVABLE_MIN_LEDS;
+		const bool stationary_recovery = position_recovery && m_rest_count >= ZUPT_MIN_REST;
+		const Vector3d recovery_prior_velocity = m_x.v;
+		if (position_recovery) {
 			m_P = gate_P;
 		}
 
@@ -2336,21 +2462,30 @@ namespace {
 		// Only if the fold actually CONSTRAINED position: a depth-blind 1-3 LED fold of a controller leaving
 		// view barely pins depth-along-ray, so it must NOT reset the position-freshness clock or move the
 		// body-lock hold-point. Require enough independent LEDs plus honest posterior covariance.
-		if (pos_observable) {
-			const Vector3d pos_var_diag{
-			    m_P(EP + 0, EP + 0),
-			    m_P(EP + 1, EP + 1),
-			    m_P(EP + 2, EP + 2),
-			};
-			if (!fold_optical_velocity_measurement(m_x.p, pos_var_diag)) {
-				return 0;
+			if (pos_observable) {
+				const Vector3d pos_var_diag{
+				    m_P(EP + 0, EP + 0),
+				    m_P(EP + 1, EP + 1),
+				    m_P(EP + 2, EP + 2),
+				};
+				if (position_recovery) {
+					m_x.v = stationary_recovery ? Vector3d::Zero() : recovery_prior_velocity;
+					reset_covariance_block(m_P, EV, P0_VEL);
+					m_optical_velocity_world.setZero();
+					m_optical_velocity_ns = 0;
+					m_optical_velocity_valid = false;
+					seed_optical_position_history(m_x.p, pos_var_diag);
+				} else if (!fold_optical_velocity_measurement(m_x.p, pos_var_diag)) {
+					return 0;
+				} else {
+					record_optical_position_sample(m_x.p, pos_var_diag);
+				}
+				position_state.valid = position_state.tracked = true;
+				last_optical_ns = filter_time_ns;
+				m_last_position_led_fold_ns = filter_time_ns;
+				last_good_position = m_x.p;
+				capture_body_lock();
 			}
-			position_state.valid = position_state.tracked = true;
-			last_optical_ns = filter_time_ns;
-			m_last_position_led_fold_ns = filter_time_ns;
-			last_good_position = m_x.p;
-			capture_body_lock();
-		}
 		return k;
 	}
 
@@ -2458,6 +2593,54 @@ namespace {
 		return n;
 	}
 
+	void
+	EskfFusion::clear_optical_position_history()
+	{
+		m_optical_pos_history_count = 0;
+		for (int i = 0; i < OPT_VEL_HISTORY_SAMPLES; i++) {
+			m_optical_pos_history[i].setZero();
+			m_optical_pos_var_history[i] = 0.0;
+			m_optical_pos_history_ns[i] = 0;
+		}
+	}
+
+	void
+	EskfFusion::record_optical_position_sample(const Vector3d &pos, const Vector3d &pos_variance)
+	{
+		if (!pos.allFinite() || filter_time_ns == 0) {
+			return;
+		}
+		double pos_var = pos_variance.maxCoeff();
+		if (!std::isfinite(pos_var) || pos_var < 0.0) {
+			pos_var = OPT_POS_STD * OPT_POS_STD;
+		}
+		if (m_optical_pos_history_count > 0 &&
+		    m_optical_pos_history_ns[m_optical_pos_history_count - 1] == filter_time_ns) {
+			m_optical_pos_history[m_optical_pos_history_count - 1] = pos;
+			m_optical_pos_var_history[m_optical_pos_history_count - 1] = pos_var;
+			return;
+		}
+		if (m_optical_pos_history_count == OPT_VEL_HISTORY_SAMPLES) {
+			for (int i = 1; i < OPT_VEL_HISTORY_SAMPLES; i++) {
+				m_optical_pos_history[i - 1] = m_optical_pos_history[i];
+				m_optical_pos_var_history[i - 1] = m_optical_pos_var_history[i];
+				m_optical_pos_history_ns[i - 1] = m_optical_pos_history_ns[i];
+			}
+			m_optical_pos_history_count--;
+		}
+		const int slot = m_optical_pos_history_count++;
+		m_optical_pos_history[slot] = pos;
+		m_optical_pos_var_history[slot] = pos_var;
+		m_optical_pos_history_ns[slot] = filter_time_ns;
+	}
+
+	void
+	EskfFusion::seed_optical_position_history(const Vector3d &pos, const Vector3d &pos_variance)
+	{
+		clear_optical_position_history();
+		record_optical_position_sample(pos, pos_variance);
+	}
+
 	bool
 	EskfFusion::optical_velocity_measurement(const Vector3d &pos,
 	                                         const Vector3d &pos_variance,
@@ -2471,7 +2654,7 @@ namespace {
 		if (dt < OPT_VEL_MIN_DT_S || dt > OPT_VEL_MAX_DT_S) {
 			return false;
 		}
-		const Vector3d vel = (pos - last_good_position) / dt;
+		Vector3d vel = (pos - last_good_position) / dt;
 		if (!vel.allFinite() || vel.norm() > OPT_VEL_MAX_M_S) {
 			return false;
 		}
@@ -2480,7 +2663,80 @@ namespace {
 			pos_var = OPT_POS_STD * OPT_POS_STD;
 		}
 		double vel_var = 2.0 * pos_var / (dt * dt) + OPT_VEL_VAR_FLOOR;
-		vel_var = std::min(std::max(vel_var, OPT_VEL_VAR_FLOOR), OPT_VEL_VAR_MAX);
+		bool used_fit = false;
+
+		struct OpticalVelocitySample
+		{
+			double t_s;
+			Vector3d pos;
+			double var;
+		};
+
+		OpticalVelocitySample samples[OPT_VEL_HISTORY_SAMPLES + 1]{};
+		int sample_count = 0;
+		samples[sample_count++] = {0.0, pos, pos_var};
+		for (int i = m_optical_pos_history_count - 1; i >= 0 && sample_count < OPT_VEL_HISTORY_SAMPLES + 1; i--) {
+			const timepoint_ns sample_ns = m_optical_pos_history_ns[i];
+			if (sample_ns == 0 || sample_ns >= filter_time_ns || !m_optical_pos_history[i].allFinite()) {
+				continue;
+			}
+			const double age_s = time_ns_to_s(filter_time_ns - sample_ns);
+			if (age_s < OPT_VEL_MIN_DT_S || age_s > OPT_VEL_FIT_MAX_AGE_S) {
+				continue;
+			}
+			double sample_var = m_optical_pos_var_history[i];
+			if (!std::isfinite(sample_var) || sample_var < 0.0) {
+				sample_var = OPT_POS_STD * OPT_POS_STD;
+			}
+			samples[sample_count++] = {-age_s, m_optical_pos_history[i], sample_var};
+		}
+
+		if (sample_count >= 3) {
+			double t_min = 0.0;
+			double t_max = 0.0;
+			double w_sum = 0.0;
+			double wt_sum = 0.0;
+			Vector3d wp_sum = Vector3d::Zero();
+			for (int i = 0; i < sample_count; i++) {
+				t_min = std::min(t_min, samples[i].t_s);
+				t_max = std::max(t_max, samples[i].t_s);
+				const double w = 1.0 / std::max(samples[i].var, OPT_POS_STD * OPT_POS_STD);
+				w_sum += w;
+				wt_sum += w * samples[i].t_s;
+				wp_sum += w * samples[i].pos;
+			}
+			const double span_s = t_max - t_min;
+			if (span_s >= OPT_VEL_FIT_MIN_SPAN_S && w_sum > 0.0) {
+				const double t_mean = wt_sum / w_sum;
+				const Vector3d p_mean = wp_sum / w_sum;
+				double denom = 0.0;
+				Vector3d numer = Vector3d::Zero();
+				for (int i = 0; i < sample_count; i++) {
+					const double w = 1.0 / std::max(samples[i].var, OPT_POS_STD * OPT_POS_STD);
+					const double centered_t = samples[i].t_s - t_mean;
+					denom += w * centered_t * centered_t;
+					numer += w * centered_t * (samples[i].pos - p_mean);
+				}
+				if (denom > 1e-9) {
+					const Vector3d fit_vel = numer / denom;
+					double residual_sum = 0.0;
+					for (int i = 0; i < sample_count; i++) {
+						const Vector3d predicted = p_mean + fit_vel * (samples[i].t_s - t_mean);
+						residual_sum += (samples[i].pos - predicted).squaredNorm();
+					}
+					const double rms_m = std::sqrt(residual_sum / (double)sample_count);
+					if (fit_vel.allFinite() && fit_vel.norm() <= OPT_VEL_MAX_M_S &&
+					    std::isfinite(rms_m) && rms_m <= OPT_VEL_FIT_MAX_RMS_M) {
+						vel = fit_vel;
+						vel_var = 1.0 / denom + OPT_VEL_FIT_VAR_FLOOR;
+						used_fit = true;
+					}
+				}
+			}
+		}
+
+		const double vel_var_floor = used_fit ? OPT_VEL_FIT_VAR_FLOOR : OPT_VEL_VAR_FLOOR;
+		vel_var = std::min(std::max(vel_var, vel_var_floor), OPT_VEL_VAR_MAX);
 		if (out_vel != nullptr) {
 			*out_vel = vel;
 		}
@@ -2501,8 +2757,12 @@ namespace {
 		m_optical_velocity_world = vel;
 		m_optical_velocity_ns = filter_time_ns;
 		m_optical_velocity_valid = true;
-		(void)vel_var;
-		return true;
+
+		MatX H = MatX::Zero(3, 15);
+		H.block<3, 3>(0, EV) = Mat3::Identity();
+		const VecX r = vel - m_x.v;
+		const MatX R = MatX((Vector3d::Constant(vel_var)).asDiagonal());
+		return ekf_update(H, r, R);
 	}
 
 	bool
@@ -2521,18 +2781,12 @@ namespace {
 			return true; // a constellation controller is never this far from the head; degenerate solve
 		}
 
-		// Jump plausibility gate: reject (don't apply) a candidate that moved further from the last
-		// optically-anchored position than a controller could physically travel in the elapsed time.
-		if (tracked && last_optical_ns != 0) {
-			double dt = time_ns_to_s(filter_time_ns - last_optical_ns);
-			if (dt < 0.0) {
-				dt = 0.0;
-			}
-			const double max_jump = OPTICAL_MAX_SPEED_M_S * dt + OPTICAL_JUMP_SLACK_M;
-			if ((pos - last_good_position).norm() > max_jump) {
-				U_LOG_W("Optical pose jumped implausibly far - rejecting candidate");
-				return true;
-			}
+		// Jump plausibility gate: the same covariance-and-time-scaled reachability bound used for the
+		// re-anchor cache also gates measurement adoption. A discontinuous few-blob solve must not refresh
+		// last_optical_ns/last_good_position and become the stale/body-lock anchor.
+		if (!optical_adoption_motion_plausible(pos, filter_time_ns)) {
+			U_LOG_W("Optical pose jumped implausibly far - rejecting candidate");
+			return true;
 		}
 
 		// Divergence: the prediction is far from the PnP pose. Per-LED folding cannot fix a large
@@ -2601,12 +2855,15 @@ namespace {
 		orientation_state.valid = orientation_state.tracked = true;
 		last_optical_ns = filter_time_ns;
 		last_good_position = m_x.p;
+		record_optical_position_sample(m_x.p, pos_variance);
 		capture_body_lock();
 		return true;
 	}
 
 	bool
-	EskfFusion::integrate_position_measurement(const Vector3d &pos, const Vector3d &pos_variance)
+	EskfFusion::integrate_position_measurement(const Vector3d &pos,
+	                                           const Vector3d &pos_variance,
+	                                           bool refresh_optical_anchor)
 	{
 		if (!pos.allFinite()) {
 			return true;
@@ -2616,23 +2873,19 @@ namespace {
 			return true;
 		}
 
-		if (tracked && last_optical_ns != 0) {
-			double dt = time_ns_to_s(filter_time_ns - last_optical_ns);
-			if (dt < 0.0) {
-				dt = 0.0;
-			}
-			const double max_jump = OPTICAL_MAX_SPEED_M_S * dt + OPTICAL_JUMP_SLACK_M;
-			if ((pos - last_good_position).norm() > max_jump) {
-				U_LOG_W("Optical position jumped implausibly far - rejecting candidate");
-				return true;
-			}
+		if (!optical_adoption_motion_plausible(pos, filter_time_ns)) {
+			U_LOG_W("Optical position jumped implausibly far - rejecting candidate");
+			return true;
 		}
 
 		const double resid = (pos - m_x.p).norm();
 		if (resid > REANCHOR_SNAP_M) {
+			if (!refresh_optical_anchor) {
+				return false;
+			}
 			(void)fold_optical_velocity_measurement(pos, pos_variance);
 			m_x.p = pos;
-			m_x.v.setZero();
+			m_x.v = fresh_optical_velocity_or_zero();
 			m_P.block<3, 15>(EP, 0).setZero();
 			m_P.block<15, 3>(0, EP).setZero();
 			m_P.block<3, 15>(EV, 0).setZero();
@@ -2643,6 +2896,7 @@ namespace {
 			position_state.valid = position_state.tracked = true;
 			last_optical_ns = filter_time_ns;
 			last_good_position = m_x.p;
+			seed_optical_position_history(m_x.p, pos_variance);
 			capture_body_lock();
 			return true;
 		}
@@ -2652,35 +2906,45 @@ namespace {
 		const VecX r = pos - m_x.p;
 		const MatX R = MatX(pos_variance.asDiagonal());
 		if (!ekf_update(H, r, R)) {
+			if (!refresh_optical_anchor) {
+				return false;
+			}
+			(void)fold_optical_velocity_measurement(pos, pos_variance);
 			m_x.p = pos;
-			m_x.v.setZero();
+			m_x.v = fresh_optical_velocity_or_zero();
 			m_P.block<3, 3>(EP, EP) = Mat3::Identity() * REANCHOR_POS_VAR;
 			m_P.block<3, 3>(EV, EV) = Mat3::Identity() * P0_VEL;
 			tracked = true;
 			position_state.valid = position_state.tracked = true;
 			last_optical_ns = filter_time_ns;
 			last_good_position = m_x.p;
+			seed_optical_position_history(m_x.p, pos_variance);
 			capture_body_lock();
 			return false;
 		}
-		if (!fold_optical_velocity_measurement(pos, pos_variance)) {
+		if (refresh_optical_anchor && !fold_optical_velocity_measurement(pos, pos_variance)) {
 			m_x.p = pos;
-			m_x.v.setZero();
+			m_x.v = fresh_optical_velocity_or_zero();
 			m_P.block<3, 3>(EP, EP) = Mat3::Identity() * REANCHOR_POS_VAR;
 			m_P.block<3, 3>(EV, EV) = Mat3::Identity() * P0_VEL;
 			tracked = true;
 			position_state.valid = position_state.tracked = true;
 			last_optical_ns = filter_time_ns;
 			last_good_position = m_x.p;
+			seed_optical_position_history(m_x.p, pos_variance);
 			capture_body_lock();
 			return false;
 		}
 
 		tracked = true;
-		position_state.valid = position_state.tracked = true;
-		last_optical_ns = filter_time_ns;
-		last_good_position = m_x.p;
-		capture_body_lock();
+		position_state.valid = true;
+		if (refresh_optical_anchor) {
+			position_state.tracked = true;
+			last_optical_ns = filter_time_ns;
+			last_good_position = m_x.p;
+			record_optical_position_sample(m_x.p, pos_variance);
+			capture_body_lock();
+		}
 		return true;
 	}
 
@@ -2791,6 +3055,34 @@ namespace {
 	}
 
 	void
+	EskfFusion::cache_pnp_pose_candidate(const timepoint_ns timestamp_ns,
+	                                     const struct xrt_pose *pose,
+	                                     const struct xrt_pose *hmd_world_pose)
+	{
+		if (pose == nullptr) {
+			return;
+		}
+		const Vector3d pos = map_vec3(pose->position).cast<double>();
+		const Quaterniond orient = map_quat(pose->orientation).cast<double>().normalized();
+		if (!pos.allFinite() || !std::isfinite(orient.norm())) {
+			return;
+		}
+
+		std::lock_guard<std::mutex> lock(m_filter_lock);
+		set_op_hmd_pose(hmd_world_pose);
+		const bool gyro_fresh = tracked && last_optical_ns != 0 && (timestamp_ns - last_optical_ns) < FLIP_GUARD_TRUST_NS;
+		const bool pnp_flipped =
+		    gyro_fresh && log_quat(orient * m_x.q.normalized().conjugate()).norm() > FLIP_REJECT_RAD;
+		if (pnp_flipped || !optical_motion_plausible(pos, timestamp_ns) || !position_plausible(pos)) {
+			return;
+		}
+
+		m_pnp_pose = *pose;
+		m_pnp_ns = timestamp_ns;
+		m_pnp_valid = true;
+	}
+
+	void
 	EskfFusion::process_pose(const struct xrt_pose_sample *sample,
 	                         const struct xrt_vec3 *position_variance_optional,
 	                         const struct xrt_vec3 *orientation_variance_optional,
@@ -2832,11 +3124,11 @@ namespace {
 				// cache — that is the snap target a per-LED divergence will jump onto. The bound
 				// self-widens through dropouts so a real re-acquisition still refreshes the cache.
 				const bool pnp_motion_plausible = optical_motion_plausible(pos, sample->timestamp_ns);
-				if (!pnp_flipped && pnp_motion_plausible && position_plausible(pos)) {
-					m_pnp_pose = sample->pose;
-					m_pnp_ns = sample->timestamp_ns;
-					m_pnp_valid = true;
-				}
+					if (!pnp_flipped && pnp_motion_plausible && position_plausible(pos)) {
+						m_pnp_pose = sample->pose;
+						m_pnp_ns = sample->timestamp_ns;
+						m_pnp_valid = true;
+					}
 
 				if (!tracked) {
 					// Bootstrap only from a PLAUSIBLE pose. A constellation-tracked controller is within
@@ -2854,26 +3146,25 @@ namespace {
 				} else if (m_imu_only && sample->timestamp_ns > m_imu_only_until_ns) {
 					// Pure-inertial diagnostic: bootstrap window elapsed -> ignore optical entirely.
 				} else {
-					// Dual mode: with per-LED actively folding (live G2 path), the per-LED update IS the
-					// measurement — feeding the PnP pose too would double-count. With no recent per-LED
-					// fold (a pose-only caller), apply the pose as an absolute EKF measurement so the
-					// filter tracks either input mode.
-					const bool per_led_active =
-					    m_last_led_fold_ns != 0 &&
-					    (sample->timestamp_ns - m_last_led_fold_ns) < PER_LED_RECENT_NS;
-					const bool position_led_active =
+					// Dual mode: suppress the PnP pose only when this exact optical sample has
+					// already been folded through per-LED observations. A previous-frame fold is not
+					// the same measurement; using a recency window here drops real optical pose and
+					// velocity evidence just before an OOV coast.
+					const bool per_led_same_sample =
+					    m_last_led_fold_ns != 0 && sample->timestamp_ns == m_last_led_fold_ns;
+					const bool position_led_same_sample =
 					    m_last_position_led_fold_ns != 0 &&
-					    (sample->timestamp_ns - m_last_position_led_fold_ns) < PER_LED_RECENT_NS;
-					if (!per_led_active) {
+					    sample->timestamp_ns == m_last_position_led_fold_ns;
+					if (!per_led_same_sample) {
 						apply_optical_at(sample->timestamp_ns, [&]() {
-							integrate_pose_measurement(sample->pose, pos_var, ori_var,
-							                           residual_limit);
-						});
-					} else if (!position_led_active) {
-						apply_optical_at(sample->timestamp_ns, [&]() {
-							integrate_position_measurement(pos, pos_var);
-						});
-					}
+										integrate_pose_measurement(sample->pose, pos_var, ori_var,
+										                           residual_limit);
+									});
+						} else if (!position_led_same_sample) {
+							apply_optical_at(sample->timestamp_ns, [&]() {
+								integrate_position_measurement(pos, pos_var, true);
+							});
+						}
 				}
 			}
 			publish_snapshot();
@@ -2884,10 +3175,11 @@ namespace {
 	}
 
 	void
-	EskfFusion::process_position(const timepoint_ns timestamp_ns,
-	                             const struct xrt_vec3 *position,
-	                             const struct xrt_vec3 *position_variance_optional,
-	                             const struct xrt_pose *hmd_world_pose)
+		EskfFusion::process_position(const timepoint_ns timestamp_ns,
+		                             const struct xrt_vec3 *position,
+		                             const struct xrt_vec3 *position_variance_optional,
+		                             const struct xrt_pose *hmd_world_pose,
+		                             bool refresh_optical_anchor)
 	{
 		if (position == nullptr) {
 			return;
@@ -2905,10 +3197,12 @@ namespace {
 				publish_snapshot();
 				return;
 			}
-			apply_optical_at(timestamp_ns, [&]() { integrate_position_measurement(pos, pos_var); });
-			publish_snapshot();
+				apply_optical_at(timestamp_ns, [&]() {
+					integrate_position_measurement(pos, pos_var, refresh_optical_anchor);
+				});
+				publish_snapshot();
+			}
 		}
-	}
 
 	float
 	EskfFusion::process_led_observations(const timepoint_ns timestamp_ns,
@@ -2973,13 +3267,16 @@ namespace {
 						reanchor(pnp_pos, flip_guard(map_quat(m_pnp_pose.orientation).cast<double>()));
 					} else {
 						// No fresh PnP: the filter is lost. Inflate P large so the gate admits the
-						// drifted LEDs and the re-fold re-solves the pose from them; drop the runaway
-						// velocity so it cannot fight the correction.
-						m_x.v.setZero();
-						m_P.block<3, 3>(EP, EP) = Mat3::Identity() * LOST_POS_VAR;
-						m_P.block<3, 3>(ET, ET) = Mat3::Identity() * LOST_ORI_VAR;
-						m_P.block<3, 3>(EV, EV) = Mat3::Identity() * P0_VEL;
-					}
+						// drifted LEDs and the re-fold re-solves the pose from them. Position evidence
+						// does not observe velocity: keep active-motion IMU velocity, but zero it under
+						// confirmed rest so a stationary controller cannot coast away.
+							if (m_rest_count >= ZUPT_MIN_REST) {
+								m_x.v.setZero();
+							}
+							m_P.block<3, 3>(EP, EP) = Mat3::Identity() * LOST_POS_VAR;
+							m_P.block<3, 3>(EV, EV) = Mat3::Identity() * P0_VEL;
+							m_P.block<3, 3>(ET, ET) = Mat3::Identity() * LOST_ORI_VAR;
+						}
 					int seen2 = 0;
 					const float recovery_max_innov_px =
 					    max_innov_px > 0.0f ? std::max(max_innov_px, REANCHOR_MAX_INNOV_PX) : max_innov_px;
@@ -3026,8 +3323,8 @@ namespace {
 		    (snap.last_optical_ns == 0 || (when_ns - snap.last_optical_ns) > OPTICAL_FREEZE_NS);
 
 		PredictedEstimate est;
-			// With no body anchor, freeze a stale optical position at last_good rather than dead-reckon away.
-			// With body_anchored=true, the state has only a weak body prior, so keep extrapolating it.
+		// With no body anchor, freeze a stale optical position at last_good rather than dead-reckon away.
+		// With body_anchored=true, the state has only a weak body prior, so keep extrapolating it.
 		est.position = (optical_stale && !snap.body_anchored)
 		                   ? Eigen::Map<const Vector3d>{snap.last_good_position}
 		                   : Vector3d(s_pos + s_lvel * dt + 0.5 * a_eff * dt * dt);
@@ -3093,61 +3390,85 @@ namespace {
 		const Vector3d vel = est.velocity;
 		// Abandoned (set-down) controller: body-lock covers brief optical loss, but a sustained loss should
 		// degrade to a visual hold without POSITION_TRACKED instead of dragging a set-down controller forever.
+		const bool report_stale =
+		    !m_imu_only && snap.last_optical_ns != 0 &&
+		    (when_ns - snap.last_optical_ns) > OOV_REPORT_BLEND_NS;
 		const bool body_lock_abandoned =
 		    !m_imu_only && snap.last_optical_ns != 0 &&
 		    (when_ns - snap.last_optical_ns) > BODY_LOCK_ABANDON_NS;
 		const bool stale_tracked_expired =
 		    !m_imu_only && snap.last_optical_ns != 0 &&
 		    (when_ns - snap.last_optical_ns) > OOV_TRACKED_NS;
-
+		const int64_t optical_age_ns = snap.last_optical_ns != 0 ? when_ns - snap.last_optical_ns : 0;
 		const bool have_hmd = hmd_world_pose != nullptr;
 		const Vector3d hmd_pos =
 		    have_hmd ? Vector3d(map_vec3(hmd_world_pose->position).cast<double>()) : Vector3d::Zero();
 
 		map_vec3(out_relation->angular_velocity) = s_avel.cast<float>();
 
-		// Report the EKF estimate directly. Out of view with a body anchor, the state already has the weak
-		// head-relative prior folded into it, so a second report-time head+offset blend would duplicate the
-		// body model and can produce visible snap/jitter.
+		// Report the single EKF estimate. Out of view, the body anchor is already folded as a weak prior; a
+		// second report-time blend/override duplicates that model and makes real hand motion stick to a stale
+		// arm offset. The body offset is used only for confidence/reach sanity below.
 		bool moving = !optical_stale || (optical_stale && snap.body_anchored);
 		Vector3d report = est.position;
 		bool position_trackable = snap.position_tracked && (!optical_stale || snap.body_anchored);
-		if (!m_imu_only && snap.last_optical_ns != 0 &&
-		    (when_ns - snap.last_optical_ns) > OOV_REPORT_BLEND_NS) {
-			const double age_s = std::max(0.0, time_ns_to_s(when_ns - snap.last_optical_ns));
-			const double inertial_pos_std = 0.5 * PROC_ACCEL_CV * age_s * age_s;
-			const double inertial_var = std::max(0.0, snap.position_var_max) + sq(inertial_pos_std);
-			const double hold_var =
-			    std::min(BODY_ANCHOR_VAR + sq(BODY_OFFSET_DRIFT_M_S * age_s), BODY_ANCHOR_VAR_MAX);
-			const double denom = inertial_var + hold_var;
-			const double hold_w = denom > 0.0 ? std::min(1.0, std::max(0.0, inertial_var / denom)) : 0.0;
-			const Vector3d hold = Eigen::Map<const Vector3d>{snap.last_good_position};
-			if (hold.allFinite()) {
-				report = (1.0 - hold_w) * report + hold_w * hold;
-				if (hold_w > 0.5) {
-					moving = false;
-				}
+		bool reentry_lagged = false;
+		bool stale_confident_tracked = false;
+		if (report_stale) {
+			moving = false;
+			if (snap.body_anchored && vel.norm() > 1e-4) {
+				moving = true;
 			}
+			const double age_s = time_ns_to_s(optical_age_ns);
+			const double inertial_pos_std = 0.5 * PROC_ACCEL_CV * age_s * age_s;
+			const double report_var = std::max(0.0, snap.position_var_max) + sq(inertial_pos_std);
+			stale_confident_tracked = have_hmd && snap.body_lock_valid && snap.body_anchored &&
+			                          optical_age_ns <= OOV_CONFIDENT_TRACK_NS && std::isfinite(report_var) &&
+			                          report_var >= 0.0 &&
+			                          std::sqrt(report_var) <= OOV_CONFIDENT_POS_STD_M;
 		}
 		if (optical_stale && !snap.body_anchored) {
 			moving = false;
 		}
 
-		// Reach safety: a report beyond MAX_CONTROLLER_REACH_M of the head is a runaway artefact (fresh optical
-		// never reaches it) — clamp + drop tracked. Out of view, a tighter arm-reach clamp first holds the
-		// dead-reckon drift body-plausible (kept tracked).
-		if (have_hmd) {
+		auto apply_reach_safety = [&]() {
+			if (!have_hmd) {
+				return;
+			}
 			const Vector3d rel = report - hmd_pos;
 			const double n = rel.norm();
 			if (n > MAX_CONTROLLER_REACH_M) {
 				report = hmd_pos + rel * (MAX_CONTROLLER_REACH_M / n);
 				moving = false;
 				position_trackable = false;
-			} else if (optical_stale && snap.body_anchored && n > BODY_REACH_M) {
+			} else if (report_stale && snap.body_lock_valid && n > BODY_REACH_M) {
 				report = hmd_pos + rel * (BODY_REACH_M / n);
 			}
+		};
+
+		// Reach safety: a report beyond MAX_CONTROLLER_REACH_M of the head is a runaway artefact (fresh optical
+		// never reaches it) — clamp + drop tracked. Out of view, a tighter arm-reach clamp first holds the
+		// dead-reckon drift body-plausible.
+		apply_reach_safety();
+		if (report_stale && have_hmd && snap.body_lock_valid &&
+		    optical_age_ns >= ms_to_ns(320)) {
+			const Eigen::Map<const Vector3d> snap_acc{snap.acceleration};
+			const bool low_motion = vel.norm() <= 0.8 && snap_acc.norm() <= 5.0;
+			const bool clean_gravity = snap.gravity_valid && snap.gravity_excess_m_s2 <= 2.0;
+			if (low_motion && clean_gravity) {
+				const Vector3d body_report = hmd_pos + Eigen::Map<const Vector3d>{snap.body_offset_world};
+				const Vector3d body_delta = body_report - report;
+				const double body_delta_norm = body_delta.norm();
+				if (body_delta_norm > 1e-9) {
+					report += body_delta * std::min(1.0, OOV_BODY_REPORT_MAX_CORRECTION_M / body_delta_norm);
+				}
+			}
+			apply_reach_safety();
 		}
-		if (stale_tracked_expired || body_lock_abandoned) {
+		if (stale_tracked_expired && !stale_confident_tracked) {
+			position_trackable = false;
+		}
+		if (body_lock_abandoned) {
 			position_trackable = false;
 			moving = false;
 		}
@@ -3156,7 +3477,7 @@ namespace {
 		// position AND orientation toward it over ~REENTRY_WINDOW_NS (time-based, call-rate-independent) so
 		// it slides, not teleports. m_reentry_cur_{pos,orient} track the live report under a leaf lock (never
 		// the filter lock); orientation is SLERPed on the manifold (capped at REENTRY_MAX_STEP_RAD/frame).
-		{
+		if (have_hmd) {
 			std::lock_guard<std::mutex> lk(m_reentry_render_lock);
 			const bool edge = snap.reentry_active && snap.reentry_start_ns != 0 &&
 			                  time_ns_to_s(when_ns - snap.reentry_start_ns) < 4.0 * time_ns_to_s(REENTRY_WINDOW_NS);
@@ -3172,6 +3493,7 @@ namespace {
 			const double tau = time_ns_to_s(REENTRY_WINDOW_NS) / 3.0;
 			const double alpha = std::min(1.0, tau > 0.0 ? dt / tau : 1.0);
 			if (edge && m_reentry_epoch_blends) {
+				const Vector3d target_report = report;
 				Vector3d step = alpha * (report - m_reentry_cur_pos);
 				const double max_step = std::max(REENTRY_MAX_STEP_M, REENTRY_MAX_SPEED_M_S * dt);
 				if (step.norm() > max_step) {
@@ -3179,11 +3501,29 @@ namespace {
 				}
 				m_reentry_cur_pos += step;
 				report = m_reentry_cur_pos;
+				reentry_lagged = (report - target_report).norm() > REENTRY_TRACKED_MAX_LAG_M;
 			} else {
 				m_reentry_cur_pos = report;
 			}
-			m_reentry_cur_orient = orient;
+			Quaterniond orient_target = orient;
+			if (m_reentry_cur_orient.dot(orient_target) < 0.0) {
+				orient_target.coeffs() *= -1.0;
+			}
+			const double q_dot = std::abs(m_reentry_cur_orient.dot(orient_target));
+			const double gap_rad = 2.0 * std::acos(std::min(1.0, q_dot));
+			if (edge && m_reentry_epoch_blends_orient) {
+				const double max_angle = std::max(REENTRY_MAX_STEP_RAD, REENTRY_MAX_ORIENT_SPEED_RAD_S * dt);
+				const double frac = gap_rad > 1e-9 ? std::min(1.0, max_angle / gap_rad) : 1.0;
+				m_reentry_cur_orient = m_reentry_cur_orient.slerp(frac, orient_target).normalized();
+				orient = m_reentry_cur_orient;
+			} else {
+				m_reentry_cur_orient = orient_target.normalized();
+				orient = m_reentry_cur_orient;
+			}
 			m_reentry_last_render_ns = when_ns;
+		}
+		if (reentry_lagged) {
+			position_trackable = false;
 		}
 
 		map_quat(out_relation->pose.orientation) = orient.cast<float>();
@@ -3218,7 +3558,7 @@ namespace {
 		// Name the resolved report regime (informational): out of view = BodyLocked (body-anchor holding) or
 		// WorldLocked (no anchor); a runaway clamp = ConfusedPosition; else fresh, split fast/visual.
 		FusionState fstate;
-		if (optical_stale) {
+		if (report_stale) {
 			fstate = snap.body_lock_valid ? FusionState::BodyLocked : FusionState::WorldLocked;
 		} else if (!position_trackable) {
 			fstate = FusionState::ConfusedPosition;

@@ -41,6 +41,11 @@ enum correspondence_search_flags
 	             of the candidate orientation from the prior (TILT scaled by the tight driftless sigma, YAW by
 	             the live fusion sigma), Huber-robustified. Requires CS_FLAG_HAVE_POSE_PRIOR + an up_vector
 	             (the world-up in camera frame). */
+	CS_FLAG_BOUNDED_SEARCH =
+	    0x40, /* Bound trial count for pathological no-prior clutter frames without pre-pruning blobs. */
+	CS_FLAG_RETURN_BEST_PARTIAL =
+	    0x80, /* If no GOOD pose was found, return the best tight non-GOOD candidate so callers can use its
+	             matched LED evidence for partial/position-only fusion without accepting a full pose lock. */
 };
 
 struct cs_image_point
@@ -94,6 +99,7 @@ struct cs_model_info
 
 	/* Search parameters */
 	double search_start_time;
+	unsigned int max_trials;
 	int led_depth;
 	int led_index;
 	int blob_index;
@@ -148,6 +154,7 @@ struct correspondence_search_diagnostics
 struct correspondence_search
 {
 	int num_points;
+	int points_capacity;
 	struct cs_image_point *points;
 	struct blob *blobs; /* Original blobs structs [num_points] */
 

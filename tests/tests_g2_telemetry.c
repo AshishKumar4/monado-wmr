@@ -111,6 +111,9 @@ struct g2_telem_candidate
 	float yaw_err_rad;
 	float prior_pos_err_x, prior_pos_err_y, prior_pos_err_z;
 	float prior_rot_err_x, prior_rot_err_y, prior_rot_err_z;
+	float blob_var_mean_px2;
+	float blob_brightness_mean;
+	float blob_area_mean;
 	float px, py, pz;
 	float qx, qy, qz, qw;
 } G2_PACKED;
@@ -143,6 +146,10 @@ struct g2_telem_search
 	uint8_t blobs_matched;
 	uint8_t unmatched_blobs;
 	float reproj_err_px;
+	uint32_t bng_reason_flags;
+	float reproj_err_per_match;
+	float unmatched_per_match;
+	float matched_visible_ratio;
 } G2_PACKED;
 
 struct g2_telem_fusion
@@ -365,9 +372,9 @@ test_peak(const char *dir)
 	for (long i = 0; i < N_POSE; i++) {
 		g2_telem_pose_attempt(0, 0, (uint64_t)i, 10, 8, 7, 0.5f, pose, 1);
 		g2_telem_candidate(0, 0, (uint64_t)i, 3, 0, 1, 1, 1, 0x31, 10, 8, 2, 7, 0.5f, 1.0f, 1.5f, 1,
-		                  0.2f, 0.1f, 0.15f, err3, err3, pose);
+		                  0.2f, 0.1f, 0.15f, err3, err3, 0.1f, 120.0f, 4.0f, pose);
 		g2_telem_search(0, 0, (uint64_t)i, 1, 6, 0x35, 1, 12, 8, 4, 6, 32, 100, 50, 2, 1, 8, 5, 4, 7,
-		               0x31, 10, 8, 2, 0.5f);
+		               0x31, 10, 8, 2, 0.5f, G2_SEARCH_BNG_REPROJ_FAIL, 0.0625f, 0.25f, 0.8f);
 		if ((i % CHUNK) == (CHUNK - 1)) {
 			pace();
 		}
@@ -537,6 +544,8 @@ test_offsets(const char *dir)
 	CHKOFF("search", g2_telem_search, num_pose_checks_pruned);
 	CHKOFF("search", g2_telem_search, best_led_depth);
 	CHKOFF("search", g2_telem_search, reproj_err_px);
+	CHKOFF("search", g2_telem_search, bng_reason_flags);
+	CHKOFF("search", g2_telem_search, matched_visible_ratio);
 	CHKOFF("fusion", g2_telem_fusion, pos_residual_m);
 	CHKOFF("fusion", g2_telem_fusion, opt_px);
 	CHKOFF("fusion", g2_telem_fusion, opt_qw);

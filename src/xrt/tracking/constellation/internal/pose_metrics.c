@@ -205,8 +205,30 @@ gate_candidate_cmp(const void *a, const void *b)
 	return (ga->led_idx < gb->led_idx) ? -1 : (ga->led_idx > gb->led_idx) ? 1 : 0;
 }
 
+static void
+sort_gate_candidates(struct gate_candidate *cands, int ncand)
+{
+	if (ncand <= 1) {
+		return;
+	}
+	if (ncand <= 32) {
+		for (int i = 1; i < ncand; i++) {
+			struct gate_candidate cur = cands[i];
+			int j = i;
+			while (j > 0 && gate_candidate_cmp(cands + j - 1, &cur) > 0) {
+				cands[j] = cands[j - 1];
+				j--;
+			}
+			cands[j] = cur;
+		}
+		return;
+	}
+	qsort(cands, ncand, sizeof(cands[0]), gate_candidate_cmp);
+}
+
 /* Bound LED detection odds: even a straight-on LED can be missed, and a grazing LED can still be detected. */
 #define DATA_NLL_P_MIN 0.05
+#define ASSOC_CLUTTER_MATCH_CAP_NLL 14.3
 
 static double
 led_visibility_weight(double facing_dot)
@@ -218,6 +240,124 @@ led_visibility_weight(double facing_dot)
 	if (w > 1.0)
 		w = 1.0;
 	return w;
+}
+
+double
+pose_metrics_pkf_detection_prob(double facing_dot)
+{
+	double p = DATA_NLL_P_MIN + (1.0 - DATA_NLL_P_MIN) * led_visibility_weight(facing_dot);
+	if (p > 1.0 - DATA_NLL_P_MIN) {
+		p = 1.0 - DATA_NLL_P_MIN;
+	}
+	if (p < DATA_NLL_P_MIN) {
+		p = DATA_NLL_P_MIN;
+	}
+	return p;
+}
+
+double
+pose_metrics_pkf_pair_nll(double sqerror_px2, double p_i)
+{
+	if (p_i < DATA_NLL_P_MIN) {
+		p_i = DATA_NLL_P_MIN;
+	}
+	if (p_i > 1.0 - DATA_NLL_P_MIN) {
+		p_i = 1.0 - DATA_NLL_P_MIN;
+	}
+	return sqerror_px2 + (-log(p_i) + log(1.0 - p_i));
+}
+
+double
+pose_metrics_pkf_clutter_likelihood(void)
+{
+	return exp(-ASSOC_CLUTTER_MATCH_CAP_NLL);
+}
+
+double
+pose_metrics_pkf_permanent(const double *Q, int m, int n)
+{
+	assert(m >= 0 && m <= PKF_MAX_CLUSTER);
+	assert(n >= 0 && n <= PKF_MAX_CLUSTER);
+	assert(m <= n);
+	if (m == 0) {
+		return 1.0;
+	}
+
+	double dp[1 << PKF_MAX_CLUSTER] = {0};
+	double next[1 << PKF_MAX_CLUSTER] = {0};
+	const int nmask = 1 << n;
+	dp[0] = 1.0;
+
+	for (int i = 0; i < m; i++) {
+		for (int mask = 0; mask < nmask; mask++) {
+			next[mask] = 0.0;
+		}
+		for (int mask = 0; mask < nmask; mask++) {
+			if (dp[mask] == 0.0) {
+				continue;
+			}
+			for (int j = 0; j < n; j++) {
+				if ((mask & (1 << j)) != 0) {
+					continue;
+				}
+				const double q = Q[i * n + j];
+				if (q != 0.0) {
+					next[mask | (1 << j)] += dp[mask] * q;
+				}
+			}
+		}
+		for (int mask = 0; mask < nmask; mask++) {
+			dp[mask] = next[mask];
+		}
+	}
+
+	double per = 0.0;
+	for (int mask = 0; mask < nmask; mask++) {
+		per += dp[mask];
+	}
+	return per;
+}
+
+double
+pose_metrics_pkf_permanent_augmented(const double *L, const double *L_clutter, int m, int n)
+{
+	assert(m >= 1 && m <= PKF_MAX_CLUSTER);
+	assert(n >= 0 && n <= PKF_MAX_CLUSTER);
+
+	double dp[1 << PKF_MAX_CLUSTER] = {0};
+	double next[1 << PKF_MAX_CLUSTER] = {0};
+	const int nmask = 1 << n;
+	dp[0] = 1.0;
+
+	for (int i = 0; i < m; i++) {
+		for (int mask = 0; mask < nmask; mask++) {
+			next[mask] = 0.0;
+		}
+		for (int mask = 0; mask < nmask; mask++) {
+			if (dp[mask] == 0.0) {
+				continue;
+			}
+			next[mask] += dp[mask] * L_clutter[i];
+			for (int j = 0; j < n; j++) {
+				if ((mask & (1 << j)) != 0) {
+					continue;
+				}
+				const double l = L[i * n + j];
+				if (l != 0.0) {
+					next[mask | (1 << j)] += dp[mask] * l;
+				}
+			}
+		}
+		for (int mask = 0; mask < nmask; mask++) {
+			dp[mask] = next[mask];
+		}
+	}
+
+	double per = 0.0;
+	for (int mask = 0; mask < nmask; mask++) {
+		per += dp[mask];
+	}
+	return per;
 }
 
 /* Detection NLL for a finished assignment, plus the all-missed reference for matched LEDs. */
@@ -560,7 +700,7 @@ pose_metrics_match_pose_to_blobs_prior(struct xrt_pose *pose,
 		}
 	}
 
-	qsort(cands, ncand, sizeof(cands[0]), gate_candidate_cmp);
+	sort_gate_candidates(cands, ncand);
 
 	bool blob_used[MAX_BLOBS_PER_FRAME] = {false};
 	bool led_used[MAX_OBJECT_LEDS] = {false};

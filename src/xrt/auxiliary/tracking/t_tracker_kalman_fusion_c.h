@@ -34,6 +34,10 @@ struct kalman_fusion_oov_debug
 	struct xrt_vec3 raw_predicted_position;
 	struct xrt_vec3 optical_hold_position;
 	struct xrt_vec3 body_report_position;
+	struct xrt_vec3 raw_velocity;
+	struct xrt_vec3 raw_acceleration;
+	struct xrt_vec3 angular_velocity;
+	double gravity_excess_m_s2;
 };
 
 //! One matched constellation LED for the tightly-coupled per-LED fusion update. C-accessible mirror
@@ -88,7 +92,16 @@ kalman_fusion_process_position(struct KalmanFusionInterfaceWrapper *wrapper,
                                timepoint_ns timestamp_ns,
                                const struct xrt_vec3 *position,
                                const struct xrt_vec3 *position_variance_optional,
-                               const struct xrt_pose *hmd_world_pose);
+                               const struct xrt_pose *hmd_world_pose,
+                               bool refresh_optical_anchor);
+
+//! Cache-only PnP candidate for per-LED divergence recovery. Updates only the guarded re-anchor target;
+//! does not adopt the pose, change optical freshness, or report tracking.
+void
+kalman_fusion_cache_pnp_pose_candidate(struct KalmanFusionInterfaceWrapper *wrapper,
+                                       timepoint_ns timestamp_ns,
+                                       const struct xrt_pose *pose,
+                                       const struct xrt_pose *hmd_world_pose);
 
 //! Tightly-coupled per-LED optical update (the ESKF feed). @p feed=false runs a read-only diagnostic
 //! (computes the per-LED reprojection RMS vs the current pose) instead of folding — used to verify
@@ -148,6 +161,13 @@ kalman_fusion_get_pose_uncertainty(struct KalmanFusionInterfaceWrapper *wrapper,
                                    double *position_std,
                                    double *orientation_std,
                                    double *yaw_std);
+
+//! Gravity-tilt-corrected held orientation (world<-body), with yaw preserved and tilt snapped to
+//! accelerometer gravity. @p out_excess_m_s2 is |||f|| - g|; small means low linear acceleration.
+bool
+kalman_fusion_get_gravity_tilt_reference(struct KalmanFusionInterfaceWrapper *wrapper,
+                                         struct xrt_quat *out_gravity_corrected_q,
+                                         double *out_excess_m_s2);
 
 //! Cross-session IMU calibration cache (persisted per controller by the driver). set_* seeds a prior
 //! before tracking; get_* reads the current converged gyro/accel bias + accel scale and returns true

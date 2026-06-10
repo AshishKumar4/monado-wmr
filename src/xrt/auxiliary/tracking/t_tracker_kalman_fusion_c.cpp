@@ -126,12 +126,26 @@ kalman_fusion_process_position(struct KalmanFusionInterfaceWrapper *wrapper,
                                timepoint_ns timestamp_ns,
                                const struct xrt_vec3 *position,
                                const struct xrt_vec3 *position_variance_optional,
-                               const struct xrt_pose *hmd_world_pose)
+                               const struct xrt_pose *hmd_world_pose,
+                               bool refresh_optical_anchor)
 {
 	if (wrapper == nullptr) {
 		return;
 	}
-	wrapper->fusion->process_position(timestamp_ns, position, position_variance_optional, hmd_world_pose);
+	wrapper->fusion->process_position(timestamp_ns, position, position_variance_optional, hmd_world_pose,
+	                                  refresh_optical_anchor);
+}
+
+void
+kalman_fusion_cache_pnp_pose_candidate(struct KalmanFusionInterfaceWrapper *wrapper,
+                                       timepoint_ns timestamp_ns,
+                                       const struct xrt_pose *pose,
+                                       const struct xrt_pose *hmd_world_pose)
+{
+	if (wrapper == nullptr) {
+		return;
+	}
+	wrapper->fusion->cache_pnp_pose_candidate(timestamp_ns, pose, hmd_world_pose);
 }
 
 bool
@@ -158,6 +172,17 @@ kalman_fusion_get_pose_uncertainty(struct KalmanFusionInterfaceWrapper *wrapper,
 		return false;
 	}
 	return wrapper->fusion->get_pose_uncertainty(position_std, orientation_std, yaw_std);
+}
+
+bool
+kalman_fusion_get_gravity_tilt_reference(struct KalmanFusionInterfaceWrapper *wrapper,
+                                         struct xrt_quat *out_gravity_corrected_q,
+                                         double *out_excess_m_s2)
+{
+	if (wrapper == nullptr) {
+		return false;
+	}
+	return wrapper->fusion->get_gravity_tilt_reference(out_gravity_corrected_q, out_excess_m_s2);
 }
 
 void

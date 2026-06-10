@@ -21,6 +21,7 @@
 #include "util/u_var.h"
 #include "util/u_sink.h"
 #include "util/u_frame.h"
+#include "util/u_g2_telemetry.h"
 #include "util/u_trace_marker.h"
 
 #include "wmr_config.h"
@@ -307,6 +308,7 @@ img_xfer_cb(struct libusb_transfer *xfer)
 	DRV_TRACE_MARKER();
 
 	struct wmr_camera *cam = xfer->user_data;
+	bool resubmitted = false;
 
 	if (xfer->status != LIBUSB_TRANSFER_COMPLETED) {
 		WMR_CAM_DEBUG(cam, "Camera transfer completed with status: %s (%u)", libusb_error_name(xfer->status),
@@ -395,9 +397,11 @@ img_xfer_cb(struct libusb_transfer *xfer)
 	uint16_t exposure = xf->data[6] << 8 | xf->data[7];
 	uint8_t seq = xf->data[89];
 	uint8_t seq_delta = seq - cam->last_seq;
+	uint64_t prev_frame_sequence = cam->frame_sequence;
 
 	/* Extend the sequence number to 64-bits */
 	cam->frame_sequence += seq_delta;
+	uint64_t source_delta = cam->frame_sequence - prev_frame_sequence;
 
 	WMR_CAM_TRACE(cam, "Camera frame seq %u (prev %u) -> frame %" PRIu64 " - exposure %u", seq, cam->last_seq,
 	              cam->frame_sequence, exposure);
@@ -415,6 +419,18 @@ img_xfer_cb(struct libusb_transfer *xfer)
 
 	cam->last_frame_ts = frame_start_ts;
 	cam->last_seq = seq;
+
+	if (!slam_tracking_frame && prev_frame_sequence != 0 && source_delta > 2 && g2_telem_enabled()) {
+		g2_telem_event(0, xf->timestamp, G2_TELEM_EV_CAMERA_SOURCE_DELTA, (float)source_delta);
+	}
+
+	/*
+	 * The USB buffer has been copied into @p xf. Resubmit before debug/tracker sinks run so downstream
+	 * processing cannot delay camera intake.
+	 */
+	if (libusb_submit_transfer(xfer) == 0) {
+		resubmitted = true;
+	}
 
 	/* Push to the appropriate debug output based on frame type */
 	int sink_index = slam_tracking_frame ? WMR_DEBUG_SINK_SLAM : WMR_DEBUG_SINK_CONTROLLER;
@@ -450,7 +466,9 @@ drop_frame:
 	xrt_frame_reference(&xf, NULL);
 
 out:
-	libusb_submit_transfer(xfer);
+	if (!resubmitted) {
+		libusb_submit_transfer(xfer);
+	}
 }
 
 

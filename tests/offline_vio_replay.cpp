@@ -15,6 +15,7 @@
  * replays; Stage C emits the trajectory + IMU<->visual drift analysis.
  */
 #include <cstdio>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -58,6 +59,18 @@ namespace fs = std::filesystem;
 
 double
 env_ms(const char *name, double fallback)
+{
+	const char *value = getenv(name);
+	if (value == nullptr || value[0] == '\0') {
+		return fallback;
+	}
+	char *end = nullptr;
+	const double parsed = strtod(value, &end);
+	return end != value && std::isfinite(parsed) ? parsed : fallback;
+}
+
+double
+env_double(const char *name, double fallback)
 {
 	const char *value = getenv(name);
 	if (value == nullptr || value[0] == '\0') {
@@ -132,6 +145,99 @@ read_file(const std::string &path)
 		return {};
 	}
 	return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+static const double IDENTITY3[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+
+struct ImuCalibrationCache
+{
+	double bg[3] = {0, 0, 0};
+	double ba[3] = {0, 0, 0};
+	double scale = 1.0;
+	int count = 0;
+	double mg[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+	double ta[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+};
+
+std::string
+controller_serial_from_json(const std::string &path)
+{
+	std::string txt = read_file(path);
+	cJSON *root = cJSON_Parse(txt.c_str());
+	if (root == nullptr) {
+		return {};
+	}
+	std::string serial;
+	const cJSON *ci = cJSON_GetObjectItemCaseSensitive(root, "CalibrationInformation");
+	const cJSON *meta = cJSON_GetObjectItemCaseSensitive(ci, "Metadata");
+	const cJSON *serial_id = cJSON_GetObjectItemCaseSensitive(meta, "SerialId");
+	if (cJSON_IsString(serial_id) && serial_id->valuestring != nullptr) {
+		serial = serial_id->valuestring;
+	}
+	cJSON_Delete(root);
+	return serial;
+}
+
+std::string
+imu_cal_filename(const std::string &serial)
+{
+	std::string out = "imu-cal-" + serial + ".txt";
+	for (char &ch : out) {
+		const unsigned char c = (unsigned char)ch;
+		if (!std::isalnum(c) && ch != '.' && ch != '-' && ch != '_') {
+			ch = '_';
+		}
+	}
+	return out;
+}
+
+bool
+load_imu_calibration_cache(const std::string &serial, ImuCalibrationCache *out)
+{
+	if (serial.empty() || out == nullptr) {
+		return false;
+	}
+	const char *override_dir = getenv("G2_REPLAY_IMU_CAL_DIR");
+	if (override_dir == nullptr || override_dir[0] == '\0') {
+		return false;
+	}
+	const std::string dir = override_dir;
+	std::ifstream f(fs::path(dir) / imu_cal_filename(serial));
+	if (!f) {
+		return false;
+	}
+
+	ImuCalibrationCache parsed = {};
+	memcpy(parsed.mg, IDENTITY3, sizeof(IDENTITY3));
+	memcpy(parsed.ta, IDENTITY3, sizeof(IDENTITY3));
+	int version = 0;
+	if (!(f >> version >> parsed.bg[0] >> parsed.bg[1] >> parsed.bg[2] >> parsed.ba[0] >> parsed.ba[1] >>
+	      parsed.ba[2] >> parsed.scale >> parsed.count)) {
+		return false;
+	}
+	if ((version != 1 && version != 2) || parsed.scale <= 0.9 || parsed.scale >= 1.1) {
+		return false;
+	}
+	for (int i = 0; i < 3; i++) {
+		if (!std::isfinite(parsed.bg[i]) || !std::isfinite(parsed.ba[i]) || std::abs(parsed.bg[i]) > 0.1 ||
+		    std::abs(parsed.ba[i]) > 0.5) {
+			return false;
+		}
+	}
+	if (version == 2) {
+		for (double &v : parsed.mg) {
+			if (!(f >> v)) {
+				return false;
+			}
+		}
+		for (double &v : parsed.ta) {
+			if (!(f >> v)) {
+				return false;
+			}
+		}
+	}
+	*out = parsed;
+	return true;
 }
 
 enum t_camera_distortion_model
@@ -258,6 +364,7 @@ load_led_model(const std::string &path, uint8_t device_id, struct t_constellatio
 struct MosaicFrame
 {
 	int64_t t_ns;
+	int exposure;
 	std::string cam_png[XRT_TRACKING_MAX_SLAM_CAMS];
 };
 
@@ -275,6 +382,7 @@ index_euroc(const std::string &mav0, int cam_count)
 		}
 		MosaicFrame mf{};
 		mf.t_ns = std::stoll(line.substr(0, comma));
+		mf.exposure = 6000;
 		std::string fname = line.substr(comma + 1);
 		fname.erase(std::remove_if(fname.begin(), fname.end(), [](char c) { return c == '\r' || c == '\n' || c == ' '; }),
 		            fname.end());
@@ -658,8 +766,49 @@ index_pgm_dump(const std::string &dir, int cam_count, const std::string &telemet
 	}
 
 	std::vector<MosaicFrame> out;
+	std::map<long long, int> seq_exposure;
+	std::map<int, size_t> exposure_group_counts;
 	for (const auto &kv : seq_counts) {
 		const long long seq = kv.first;
+		if (kv.second != cam_count) {
+			continue;
+		}
+		int exposure = -1;
+		bool same_exposure = true;
+		for (int c = 0; c < cam_count; c++) {
+			const auto it = by_key.find({seq, c});
+			if (it == by_key.end()) {
+				same_exposure = false;
+				break;
+			}
+			const int cam_exposure = it->second.front().exposure;
+			if (exposure < 0) {
+				exposure = cam_exposure;
+			} else if (exposure != cam_exposure) {
+				same_exposure = false;
+				break;
+			}
+		}
+		if (!same_exposure || exposure < 0) {
+			fprintf(stderr, "PGM dump invalid: seq=%lld mixes exposure across cameras\n", seq);
+			return {};
+		}
+		seq_exposure[seq] = exposure;
+		exposure_group_counts[exposure]++;
+	}
+	int controller_exposure = 0;
+	for (const auto &kv : exposure_group_counts) {
+		if (controller_exposure == 0 || kv.first < controller_exposure) {
+			controller_exposure = kv.first;
+		}
+	}
+	size_t skipped_non_controller = 0;
+	for (const auto &kv : seq_counts) {
+		const long long seq = kv.first;
+		if (controller_exposure > 0 && seq_exposure[seq] != controller_exposure) {
+			skipped_non_controller++;
+			continue;
+		}
 		MosaicFrame mf{};
 		bool have_all = true;
 		long long t_ns = -1;
@@ -680,8 +829,13 @@ index_pgm_dump(const std::string &dir, int cam_count, const std::string &telemet
 		}
 		if (have_all) {
 			mf.t_ns = t_ns;
+			mf.exposure = seq_exposure[seq];
 			out.push_back(mf);
 		}
+	}
+	if (skipped_non_controller != 0) {
+		fprintf(stderr, "PGM dump: selected controller exposure %d; skipped %zu non-controller frame groups\n",
+		        controller_exposure, skipped_non_controller);
 	}
 	std::sort(out.begin(), out.end(), [](const MosaicFrame &a, const MosaicFrame &b) { return a.t_ns < b.t_ns; });
 	*ok = true;
@@ -770,6 +924,7 @@ struct FakeController
 	struct xrt_vec3 opt_position {};
 	int opt_kind = 0; // 0=none, 1=full pose, 2=position-only, 3=LED-fold
 	int opt_led_count = 0;
+	int opt_led_folded = 0;
 	struct FakeHmd *hmd = nullptr; // body-lock reference (mirrors the production wcb->hmd_xdev)
 };
 
@@ -842,29 +997,41 @@ cb_push_leds(struct xrt_device *xdev, timepoint_ns t, const struct xrt_pose *P_x
 	}
 	// NULL variance => uniform fallback; per-blob variance is carried in obs when available.
 	struct xrt_pose hp;
-	kalman_fusion_process_led_observations(c->kf, t, obs, m, &view, nullptr, 8.0f, true,
-	                                       ctrl_head_pose(c, t, &hp));
+	const float folded = kalman_fusion_process_led_observations(c->kf, t, obs, m, &view, nullptr, 8.0f, true,
+	                                                            ctrl_head_pose(c, t, &hp));
 	std::lock_guard<std::mutex> lk(c->cap_lock);
 	if (c->opt_kind == 0) {
 		c->opt_kind = 3;
 	}
 	c->opt_led_count += (int)m;
+	if (folded > 0.0f) {
+		c->opt_led_folded += (int)folded;
+	}
 }
 void
 cb_push_position(struct xrt_device *xdev,
                  timepoint_ns t,
                  const struct xrt_vec3 *position,
-                 const struct xrt_vec3 *position_variance)
+                 const struct xrt_vec3 *position_variance,
+                 bool refresh_optical_anchor)
 {
 	FakeController *c = reinterpret_cast<FakeController *>(xdev);
 	struct xrt_pose hp;
-	kalman_fusion_process_position(c->kf, t, position, position_variance, ctrl_head_pose(c, t, &hp));
+	kalman_fusion_process_position(c->kf, t, position, position_variance, ctrl_head_pose(c, t, &hp),
+	                               refresh_optical_anchor);
 	std::lock_guard<std::mutex> lk(c->cap_lock);
 	c->opt_position_valid = true;
 	c->opt_position = *position;
 	if (c->opt_kind != 1) {
 		c->opt_kind = 2;
 	}
+}
+void
+cb_cache_pnp_pose_candidate(struct xrt_device *xdev, timepoint_ns t, const struct xrt_pose *pose)
+{
+	FakeController *c = reinterpret_cast<FakeController *>(xdev);
+	struct xrt_pose hp;
+	kalman_fusion_cache_pnp_pose_candidate(c->kf, t, pose, ctrl_head_pose(c, t, &hp));
 }
 bool
 cb_get_unc(struct xrt_device *xdev, double *ps, double *os, double *ys)
@@ -877,6 +1044,12 @@ cb_get_predicted_pose(struct xrt_device *xdev, timepoint_ns when_ns, struct xrt_
 	// The matcher's raw prior — the filter's honest estimate, NOT the body-lock report (== production driver).
 	kalman_fusion_get_predicted_pose(reinterpret_cast<FakeController *>(xdev)->kf, when_ns, out);
 	return true;
+}
+bool
+cb_get_last_optical_age_ms(struct xrt_device *xdev, timepoint_ns when_ns, double *age_ms)
+{
+	return kalman_fusion_debug_get_last_optical_age_ms(reinterpret_cast<FakeController *>(xdev)->kf, when_ns,
+	                                                  age_ms);
 }
 bool
 cb_predict_gate(struct xrt_device *xdev, timepoint_ns frame_mono_ns, const struct xrt_pose *P_xrworld_cam,
@@ -915,7 +1088,7 @@ assemble_mosaic(const MosaicFrame &mf, const struct t_constellation_camera_group
 	struct xrt_frame *f = nullptr;
 	u_frame_create_one_off(XRT_FORMAT_L8, (uint32_t)W, (uint32_t)H, &f);
 	memset(f->data, 0, f->size);
-	const uint16_t expo = 6000; // header row metadata; constellation reads exposure from data[6..7]
+	const uint16_t expo = mf.exposure > 0 ? (uint16_t)mf.exposure : 6000;
 	f->data[6] = (uint8_t)(expo >> 8);
 	f->data[7] = (uint8_t)(expo & 0xff);
 	for (int c = 0; c < cams.cam_count; c++) {
@@ -945,12 +1118,136 @@ assemble_mosaic(const MosaicFrame &mf, const struct t_constellation_camera_group
 struct CtrlSession
 {
 	std::unique_ptr<FakeController> ctrl;
+	std::string serial;
 	std::vector<ImuRow> imu;
 	size_t imu_ii = 0;
 	FILE *csv = nullptr;
+	FILE *render_csv = nullptr;
 	int opt_frames = 0;
 	int locked = 0;
+	int render_samples = 0;
+	int render_locked = 0;
+	int64_t last_optical_report_ns = 0;
+	bool intrinsics_seen = false;
+	bool intrinsics_valid = false;
+	std::array<double, 9> last_gyro_intrinsics{};
 };
+
+static void
+trace_intrinsics_if_changed(CtrlSession &cs, int64_t t_ns, bool enabled)
+{
+	if (!enabled) {
+		return;
+	}
+
+	double gyro[9] = {};
+	double accel[9] = {};
+	const bool valid = kalman_fusion_get_imu_intrinsics(cs.ctrl->kf, gyro, accel);
+	bool changed = !cs.intrinsics_seen || valid != cs.intrinsics_valid;
+	if (!changed && valid) {
+		for (int i = 0; i < 9; ++i) {
+			if (std::abs(gyro[i] - cs.last_gyro_intrinsics[(size_t)i]) > 1e-7) {
+				changed = true;
+				break;
+			}
+		}
+	}
+	if (!changed) {
+		return;
+	}
+
+	cs.intrinsics_seen = true;
+	cs.intrinsics_valid = valid;
+	for (int i = 0; i < 9; ++i) {
+		cs.last_gyro_intrinsics[(size_t)i] = gyro[i];
+	}
+	fprintf(stderr,
+	        "G2_REPLAY_INTRINSICS t_ns=%lld dev=%u valid=%d gyro_M="
+	        "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g\n",
+	        (long long)t_ns, cs.ctrl->device_id, valid ? 1 : 0, gyro[0], gyro[1], gyro[2], gyro[3],
+	        gyro[4], gyro[5], gyro[6], gyro[7], gyro[8]);
+}
+
+static void
+feed_controller_imu_until(CtrlSession &cs, int64_t t_ns)
+{
+	while (cs.imu_ii < cs.imu.size() && cs.imu[cs.imu_ii].t_ns <= t_ns) {
+		const ImuRow &r = cs.imu[cs.imu_ii];
+		struct xrt_imu_sample s = {};
+		s.timestamp_ns = r.t_ns;
+		s.accel_m_s2 = {r.ax, r.ay, r.az};
+		s.gyro_rad_secs = {r.gx, r.gy, r.gz};
+		kalman_fusion_process_imu_data(cs.ctrl->kf, &s, nullptr, nullptr);
+
+		struct xrt_pose hp_anchor;
+		kalman_fusion_update_body_anchor(cs.ctrl->kf,
+		                                 ctrl_head_pose(cs.ctrl.get(), s.timestamp_ns, &hp_anchor));
+		cs.imu_ii++;
+	}
+}
+
+static bool
+write_prediction_row(FILE *csv, CtrlSession &cs, int64_t t_ns, int64_t frame_t_ns, bool drop_optical)
+{
+	if (csv == nullptr) {
+		return false;
+	}
+
+	struct xrt_space_relation fused = {};
+	struct xrt_pose hp_pred;
+	const struct xrt_pose *hp_pred_ptr = ctrl_head_pose(cs.ctrl.get(), t_ns, &hp_pred);
+	kalman_fusion_get_prediction(cs.ctrl->kf, t_ns, &fused, hp_pred_ptr);
+	const bool ptracked = (fused.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
+
+	double last_optical_age_ms = 0.0;
+	const bool have_last_optical_age =
+	    kalman_fusion_debug_get_last_optical_age_ms(cs.ctrl->kf, t_ns, &last_optical_age_ms);
+	struct kalman_fusion_oov_debug oov_dbg = {};
+	const bool have_oov_dbg = kalman_fusion_debug_get_oov_report(cs.ctrl->kf, t_ns, hp_pred_ptr, &oov_dbg);
+
+	fprintf(csv,
+	        "%lld,%lld,%d,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,%d,",
+	        (long long)t_ns, (long long)frame_t_ns, drop_optical ? 1 : 0, fused.pose.position.x,
+	        fused.pose.position.y, fused.pose.position.z, fused.linear_velocity.x, fused.linear_velocity.y,
+	        fused.linear_velocity.z, fused.pose.orientation.x, fused.pose.orientation.y,
+	        fused.pose.orientation.z, fused.pose.orientation.w, ptracked ? 1 : 0);
+	if (have_last_optical_age) {
+		fprintf(csv, "%.3f,", last_optical_age_ms);
+	} else {
+		fprintf(csv, "nan,");
+	}
+	if (have_oov_dbg && oov_dbg.valid) {
+		fprintf(csv, "%d,%d,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,", oov_dbg.valid ? 1 : 0,
+		        oov_dbg.body_valid ? 1 : 0, oov_dbg.raw_predicted_position.x,
+		        oov_dbg.raw_predicted_position.y, oov_dbg.raw_predicted_position.z,
+		        oov_dbg.optical_hold_position.x, oov_dbg.optical_hold_position.y,
+		        oov_dbg.optical_hold_position.z);
+		if (oov_dbg.body_valid) {
+			fprintf(csv, "%.5f,%.5f,%.5f,", oov_dbg.body_report_position.x,
+			        oov_dbg.body_report_position.y, oov_dbg.body_report_position.z);
+		} else {
+			fprintf(csv, "nan,nan,nan,");
+		}
+			fprintf(csv, "%.6f,%.6f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,",
+			        oov_dbg.inertial_var, oov_dbg.body_var, oov_dbg.raw_velocity.x, oov_dbg.raw_velocity.y,
+			        oov_dbg.raw_velocity.z, oov_dbg.raw_acceleration.x, oov_dbg.raw_acceleration.y,
+			        oov_dbg.raw_acceleration.z, oov_dbg.angular_velocity.x, oov_dbg.angular_velocity.y,
+			        oov_dbg.angular_velocity.z, oov_dbg.gravity_excess_m_s2);
+		} else {
+			fprintf(csv,
+			        "0,0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,");
+		}
+	if (hp_pred_ptr != nullptr) {
+		const double dx = fused.pose.position.x - hp_pred_ptr->position.x;
+		const double dy = fused.pose.position.y - hp_pred_ptr->position.y;
+		const double dz = fused.pose.position.z - hp_pred_ptr->position.z;
+		fprintf(csv, "%.5f,%.5f,%.5f,%.5f\n", hp_pred_ptr->position.x, hp_pred_ptr->position.y,
+		        hp_pred_ptr->position.z, std::sqrt(dx * dx + dy * dy + dz * dz));
+	} else {
+		fprintf(csv, "nan,nan,nan,nan\n");
+	}
+	return ptracked;
+}
 
 int
 main(int argc, char **argv)
@@ -961,7 +1258,8 @@ main(int argc, char **argv)
 		        "<left_ctrl.json> [right_ctrl.json] [out_dir]\n"
 		        "  Replays all listed controllers simultaneously on the same tracker (the production\n"
 		        "  multi-device path). First controller becomes device_id=1 (left), second device_id=2\n"
-		        "  (right). out_dir, if given, receives one CSV per device (dev<id>.csv).\n",
+		        "  (right). out_dir, if given, receives one CSV per device (dev<id>.csv).\n"
+		        "  Optional: G2_REPLAY_IMU_CAL_DIR=<dir> seeds per-serial imu-cal-*.txt caches.\n",
 		        argv[0]);
 		return 2;
 	}
@@ -1001,6 +1299,7 @@ main(int argc, char **argv)
 			return 1;
 		}
 		sessions[s].ctrl = std::make_unique<FakeController>();
+		sessions[s].serial = controller_serial_from_json(ctrl_jsons[s]);
 		sessions[s].ctrl->device_id = device_id;
 		sessions[s].ctrl->leds.assign(m.leds, m.leds + m.num_leds);
 		t_constellation_led_model_clear(&m);
@@ -1096,6 +1395,10 @@ main(int argc, char **argv)
 	double drop_burst_min_ms = std::max(0.0, env_ms("G2_REPLAY_DROP_OPTICAL_BURST_MIN_MS", 0.0));
 	double drop_burst_max_ms = std::max(0.0, env_ms("G2_REPLAY_DROP_OPTICAL_BURST_MAX_MS", 0.0));
 	const uint64_t drop_burst_seed = env_u64("G2_REPLAY_DROP_OPTICAL_BURST_SEED", 0x475242ull);
+	const double render_hz = std::max(0.0, env_double("G2_REPLAY_RENDER_HZ", 0.0));
+	const int64_t render_period_ns =
+	    render_hz > 0.0 ? std::max<int64_t>(1, (int64_t)llround(1.0e9 / render_hz)) : 0;
+	const bool debug_intrinsics = env_int("G2_REPLAY_DEBUG_INTRINSICS", 0) != 0;
 	const int64_t replay_start_ns = frames.front().t_ns;
 	const int64_t replay_end_ns = frames.back().t_ns;
 	std::vector<DropWindow> drop_windows;
@@ -1136,6 +1439,23 @@ main(int argc, char **argv)
 	const bool dropout_enabled =
 	    drop_after_ms >= 0.0 || (drop_period_ms > 0.0 && drop_duration_ms > 0.0) ||
 	    drop_random_p > 0.0 || !drop_windows.empty();
+	auto optical_dropped_at = [&](int64_t t_ns) {
+		const double replay_elapsed_ms = (double)(t_ns - replay_start_ns) / 1e6;
+		bool drop_optical = drop_after_ms >= 0.0 && replay_elapsed_ms >= drop_after_ms;
+		if (drop_period_ms > 0.0 && drop_duration_ms > 0.0) {
+			const double phase_ms = std::fmod(std::max(0.0, replay_elapsed_ms), drop_period_ms);
+			if (phase_ms < drop_duration_ms) {
+				drop_optical = true;
+			}
+		}
+		if (drop_random_p > 0.0 && unit_hash(((uint64_t)t_ns) ^ drop_random_seed) < drop_random_p) {
+			drop_optical = true;
+		}
+		if (!drop_windows.empty() && in_drop_windows(drop_windows, t_ns)) {
+			drop_optical = true;
+		}
+		return drop_optical;
+	};
 	if (dropout_enabled) {
 		printf("optical dropout: after_ms=%.3f period_ms=%.3f duration_ms=%.3f random_p=%.6f "
 		       "random_seed=%llu bursts=%zu burst_seed=%llu\n",
@@ -1147,6 +1467,10 @@ main(int argc, char **argv)
 			       (double)(drop_windows[i].start_ns - replay_start_ns) / 1e6,
 			       (double)(drop_windows[i].end_ns - replay_start_ns) / 1e6);
 		}
+	}
+	if (render_period_ns > 0) {
+		printf("render sampler: %.3f Hz (period %.3f ms)%s\n", render_hz,
+		       (double)render_period_ns / 1e6, out_dir.empty() ? " [no out_dir: CSV disabled]" : "");
 	}
 
 	FakeHmd hmd = {};
@@ -1161,6 +1485,13 @@ main(int argc, char **argv)
 	for (CtrlSession &cs : sessions) {
 		FakeController &ctrl = *cs.ctrl;
 		ctrl.kf = kalman_fusion_create();
+		ImuCalibrationCache imu_cal = {};
+		if (load_imu_calibration_cache(cs.serial, &imu_cal)) {
+			kalman_fusion_set_imu_calibration(ctrl.kf, imu_cal.bg, imu_cal.ba, imu_cal.scale);
+			kalman_fusion_set_imu_intrinsics(ctrl.kf, imu_cal.mg, imu_cal.ta);
+			printf("  device %u: loaded IMU calibration serial=%s scale=%.6f sessions=%d\n",
+			       ctrl.device_id, cs.serial.c_str(), imu_cal.scale, imu_cal.count);
+		}
 		ctrl.hmd = &hmd; // mirrors wmr_controller_attach_to_hmd's wcb->hmd_xdev
 		ctrl.base.get_tracked_pose = ctrl_get_pose;
 		ctrl.base.update_inputs = dev_noop_update;
@@ -1189,8 +1520,10 @@ main(int argc, char **argv)
 	cbs.push_observed_position = cb_push_position;
 	cbs.push_brightness_update = cb_noop_bright;
 	cbs.push_observed_leds = cb_push_leds;
+	cbs.cache_pnp_pose_candidate = cb_cache_pnp_pose_candidate;
 	cbs.get_pose_uncertainty = cb_get_unc;
 	cbs.get_predicted_pose = cb_get_predicted_pose;
+	cbs.get_last_optical_age_ms = cb_get_last_optical_age_ms;
 	cbs.predict_led_gate = cb_predict_gate;
 	for (CtrlSession &cs : sessions) {
 		t_constellation_tracker_add_device(tracker, &cs.ctrl->base, &cbs);
@@ -1205,63 +1538,76 @@ main(int argc, char **argv)
 			snprintf(path, sizeof(path), "%s/dev%u.csv", out_dir.c_str(), cs.ctrl->device_id);
 			cs.csv = fopen(path, "w");
 			if (cs.csv != nullptr) {
-				fprintf(cs.csv,
-				        "t_ns,drop_optical,opt_valid,opt_px,opt_py,opt_pz,opt_qx,opt_qy,opt_qz,opt_qw,"
-				        "opt_kind,opt_position_valid,opt_position_px,opt_position_py,opt_position_pz,opt_led_count,"
-				        "pred_px,pred_py,pred_pz,pred_qx,pred_qy,pred_qz,pred_qw,pred_tracked,"
-				        "pred_flags,fusion_state,last_optical_age_ms,"
+					fprintf(cs.csv,
+					        "t_ns,drop_optical,opt_valid,opt_px,opt_py,opt_pz,opt_qx,opt_qy,opt_qz,opt_qw,"
+					        "opt_kind,opt_position_valid,opt_position_px,opt_position_py,opt_position_pz,opt_led_count,"
+					        "opt_led_folded,pred_px,pred_py,pred_pz,pred_vx,pred_vy,pred_vz,"
+					        "pred_qx,pred_qy,pred_qz,pred_qw,pred_tracked,"
+					        "pred_flags,fusion_state,last_optical_age_ms,"
 				        "oov_dbg_valid,oov_body_valid,oov_raw_px,oov_raw_py,oov_raw_pz,"
 				        "oov_hold_px,oov_hold_py,oov_hold_pz,oov_body_px,oov_body_py,oov_body_pz,"
-				        "oov_inertial_var,oov_body_var,"
+				        "oov_inertial_var,oov_body_var,oov_vx,oov_vy,oov_vz,oov_ax,oov_ay,oov_az,"
+				        "oov_wx,oov_wy,oov_wz,oov_gravity_excess,"
 				        "hmd_px,hmd_py,hmd_pz,pred_to_hmd_m\n");
 			} else {
 				fprintf(stderr, "WARN: could not open %s for write\n", path);
+			}
+			if (render_period_ns > 0) {
+				snprintf(path, sizeof(path), "%s/dev%u_render.csv", out_dir.c_str(), cs.ctrl->device_id);
+				cs.render_csv = fopen(path, "w");
+				if (cs.render_csv != nullptr) {
+					fprintf(cs.render_csv,
+					        "t_ns,frame_t_ns,drop_optical,pred_px,pred_py,pred_pz,pred_vx,pred_vy,pred_vz,"
+					        "pred_qx,pred_qy,pred_qz,pred_qw,pred_tracked,optical_age_ms,"
+					        "oov_dbg_valid,oov_body_valid,oov_raw_px,oov_raw_py,oov_raw_pz,"
+					        "oov_hold_px,oov_hold_py,oov_hold_pz,oov_body_px,oov_body_py,oov_body_pz,"
+					        "oov_inertial_var,oov_body_var,oov_vx,oov_vy,oov_vz,oov_ax,oov_ay,oov_az,"
+					        "oov_wx,oov_wy,oov_wz,oov_gravity_excess,"
+					        "hmd_px,hmd_py,hmd_pz,pred_to_hmd_m\n");
+				} else {
+					fprintf(stderr, "WARN: could not open %s for write\n", path);
+				}
 			}
 		}
 	}
 
 	uint64_t seq = 0;
 	size_t dropped_frame_groups = 0;
-	for (const MosaicFrame &mf : frames) {
-		const double replay_elapsed_ms = (double)(mf.t_ns - replay_start_ns) / 1e6;
-		bool drop_optical = drop_after_ms >= 0.0 && replay_elapsed_ms >= drop_after_ms;
-		if (drop_period_ms > 0.0 && drop_duration_ms > 0.0) {
-			const double phase_ms = std::fmod(std::max(0.0, replay_elapsed_ms), drop_period_ms);
-			if (phase_ms < drop_duration_ms) {
-				drop_optical = true;
+	int64_t next_render_ns = render_period_ns > 0 ? replay_start_ns + render_period_ns : INT64_MAX;
+	auto sample_render_until = [&](int64_t limit_ns, int64_t frame_t_ns) {
+		while (next_render_ns <= limit_ns) {
+			const bool render_drop = optical_dropped_at(next_render_ns);
+			for (CtrlSession &cs : sessions) {
+				feed_controller_imu_until(cs, next_render_ns);
+				const bool ptracked = write_prediction_row(cs.render_csv, cs, next_render_ns, frame_t_ns,
+				                                           render_drop);
+				if (cs.render_csv != nullptr) {
+					cs.render_samples++;
+					cs.render_locked += ptracked ? 1 : 0;
+				}
 			}
+			next_render_ns += render_period_ns;
 		}
-		if (drop_random_p > 0.0 && unit_hash(((uint64_t)mf.t_ns) ^ drop_random_seed) < drop_random_p) {
-			drop_optical = true;
+	};
+	for (const MosaicFrame &mf : frames) {
+		if (render_period_ns > 0) {
+			sample_render_until(mf.t_ns - 1, mf.t_ns);
 		}
-		if (!drop_windows.empty() && in_drop_windows(drop_windows, mf.t_ns)) {
-			drop_optical = true;
-		}
+		const bool drop_optical = optical_dropped_at(mf.t_ns);
 		dropped_frame_groups += drop_optical ? 1 : 0;
 
 		// Feed each device's IMU samples up to this frame's time so its matcher prior
 		// (kalman_fusion_get_prediction) is current. Per-device streams advance independently.
 		for (CtrlSession &cs : sessions) {
-			while (cs.imu_ii < cs.imu.size() && cs.imu[cs.imu_ii].t_ns <= mf.t_ns) {
-				const ImuRow &r = cs.imu[cs.imu_ii];
-				struct xrt_imu_sample s = {};
-				s.timestamp_ns = r.t_ns;
-				s.accel_m_s2 = {r.ax, r.ay, r.az};
-				s.gyro_rad_secs = {r.gx, r.gy, r.gz};
-				kalman_fusion_process_imu_data(cs.ctrl->kf, &s, nullptr, nullptr);
-				// Live head pose for the out-of-view body anchor (== production driver).
-				struct xrt_pose hp_anchor;
-				kalman_fusion_update_body_anchor(cs.ctrl->kf,
-				                                 ctrl_head_pose(cs.ctrl.get(), s.timestamp_ns, &hp_anchor));
-				cs.imu_ii++;
-			}
+			feed_controller_imu_until(cs, mf.t_ns);
 			std::lock_guard<std::mutex> lk(cs.ctrl->cap_lock);
 			cs.ctrl->opt_valid = false;
 			cs.ctrl->opt_position_valid = false;
-			cs.ctrl->opt_position = {};
-			cs.ctrl->opt_kind = 0;
-			cs.ctrl->opt_led_count = 0;
-		}
+				cs.ctrl->opt_position = {};
+				cs.ctrl->opt_kind = 0;
+				cs.ctrl->opt_led_count = 0;
+				cs.ctrl->opt_led_folded = 0;
+			}
 
 		if (!drop_optical) {
 			struct xrt_frame *f = assemble_mosaic(mf, cams, seq++);
@@ -1292,6 +1638,7 @@ main(int argc, char **argv)
 			struct xrt_pose hp_pred;
 			const struct xrt_pose *hp_pred_ptr = ctrl_head_pose(cs.ctrl.get(), mf.t_ns, &hp_pred);
 			kalman_fusion_get_prediction(cs.ctrl->kf, mf.t_ns, &fused, hp_pred_ptr);
+			trace_intrinsics_if_changed(cs, mf.t_ns, debug_intrinsics);
 			const bool ptracked =
 			    (fused.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
 			const unsigned long long pred_flags = (unsigned long long)fused.relation_flags;
@@ -1306,19 +1653,24 @@ main(int argc, char **argv)
 			bool ov;
 			struct xrt_pose op;
 			bool opv;
-			struct xrt_vec3 opt_position;
-			int opt_kind;
-			int opt_led_count;
-			{
-				std::lock_guard<std::mutex> lk(cs.ctrl->cap_lock);
-				ov = cs.ctrl->opt_valid;
-				op = cs.ctrl->opt_pose;
-				opv = cs.ctrl->opt_position_valid;
-				opt_position = cs.ctrl->opt_position;
-				opt_kind = cs.ctrl->opt_kind;
-				opt_led_count = cs.ctrl->opt_led_count;
-			}
+				struct xrt_vec3 opt_position;
+				int opt_kind;
+				int opt_led_count;
+				int opt_led_folded;
+				{
+					std::lock_guard<std::mutex> lk(cs.ctrl->cap_lock);
+					ov = cs.ctrl->opt_valid;
+					op = cs.ctrl->opt_pose;
+					opv = cs.ctrl->opt_position_valid;
+					opt_position = cs.ctrl->opt_position;
+					opt_kind = cs.ctrl->opt_kind;
+					opt_led_count = cs.ctrl->opt_led_count;
+					opt_led_folded = cs.ctrl->opt_led_folded;
+				}
 			cs.opt_frames += ov ? 1 : 0;
+			if (ov) {
+				cs.last_optical_report_ns = mf.t_ns;
+			}
 			if (cs.csv != nullptr) {
 				fprintf(cs.csv, "%lld,%d,%d,", (long long)mf.t_ns, drop_optical ? 1 : 0, ov ? 1 : 0);
 				if (ov) {
@@ -1327,15 +1679,17 @@ main(int argc, char **argv)
 					        op.orientation.z, op.orientation.w);
 				} else {
 					fprintf(cs.csv, "nan,nan,nan,nan,nan,nan,nan,");
-				}
-				if (opv) {
-					fprintf(cs.csv, "%d,1,%.5f,%.5f,%.5f,%d,", opt_kind, opt_position.x,
-					        opt_position.y, opt_position.z, opt_led_count);
-				} else {
-					fprintf(cs.csv, "%d,0,nan,nan,nan,%d,", opt_kind, opt_led_count);
-				}
-				fprintf(cs.csv, "%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,%d,",
+					}
+					if (opv) {
+						fprintf(cs.csv, "%d,1,%.5f,%.5f,%.5f,%d,%d,", opt_kind, opt_position.x,
+						        opt_position.y, opt_position.z, opt_led_count, opt_led_folded);
+					} else {
+						fprintf(cs.csv, "%d,0,nan,nan,nan,%d,%d,", opt_kind, opt_led_count,
+						        opt_led_folded);
+					}
+				fprintf(cs.csv, "%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,%d,",
 				        fused.pose.position.x, fused.pose.position.y, fused.pose.position.z,
+				        fused.linear_velocity.x, fused.linear_velocity.y, fused.linear_velocity.z,
 				        fused.pose.orientation.x, fused.pose.orientation.y, fused.pose.orientation.z,
 				        fused.pose.orientation.w, ptracked ? 1 : 0);
 				fprintf(cs.csv, "%llu,%d,", pred_flags, fusion_state);
@@ -1356,9 +1710,16 @@ main(int argc, char **argv)
 					} else {
 						fprintf(cs.csv, "nan,nan,nan,");
 					}
-					fprintf(cs.csv, "%.6f,%.6f,", oov_dbg.inertial_var, oov_dbg.body_var);
+					fprintf(cs.csv,
+					        "%.6f,%.6f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,",
+					        oov_dbg.inertial_var, oov_dbg.body_var, oov_dbg.raw_velocity.x,
+					        oov_dbg.raw_velocity.y, oov_dbg.raw_velocity.z, oov_dbg.raw_acceleration.x,
+					        oov_dbg.raw_acceleration.y, oov_dbg.raw_acceleration.z,
+					        oov_dbg.angular_velocity.x, oov_dbg.angular_velocity.y, oov_dbg.angular_velocity.z,
+					        oov_dbg.gravity_excess_m_s2);
 				} else {
-					fprintf(cs.csv, "0,0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,");
+					fprintf(cs.csv,
+					        "0,0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,");
 				}
 				if (hp_pred_ptr != nullptr) {
 					const double dx = fused.pose.position.x - hp_pred_ptr->position.x;
@@ -1372,12 +1733,19 @@ main(int argc, char **argv)
 				}
 			}
 		}
+		if (render_period_ns > 0) {
+			sample_render_until(mf.t_ns, mf.t_ns);
+		}
 	}
 
 	for (CtrlSession &cs : sessions) {
 		if (cs.csv != nullptr) {
 			fclose(cs.csv);
 			cs.csv = nullptr;
+		}
+		if (cs.render_csv != nullptr) {
+			fclose(cs.render_csv);
+			cs.render_csv = nullptr;
 		}
 	}
 	printf("replay done: %zu frames\n", frames.size());
@@ -1389,6 +1757,10 @@ main(int argc, char **argv)
 		printf("  device %u: optical pose on %d (%.0f%%) | position-tracked on %d (%.0f%%)\n",
 		       cs.ctrl->device_id, cs.opt_frames, 100.0 * cs.opt_frames / std::max<size_t>(frames.size(), 1),
 		       cs.locked, 100.0 * cs.locked / std::max<size_t>(frames.size(), 1));
+		if (render_period_ns > 0 && cs.render_samples > 0) {
+			printf("    render samples: position-tracked on %d/%d (%.0f%%)\n", cs.render_locked,
+			       cs.render_samples, 100.0 * cs.render_locked / std::max(1, cs.render_samples));
+		}
 	}
 	if (!out_dir.empty()) {
 		printf("wrote per-device CSVs to %s/\n", out_dir.c_str());

@@ -71,7 +71,12 @@
 #define RECOVER_NMS_RADIUS 2
 #define RECOVER_MAX_WH 5
 #define RECOVER_MIN_AREA 2
-#define RECOVER_MIN_SNR 6.0f
+#define RECOVER_MAX_AREA 30
+#define RECOVER_MARGIN_LO 3.0f
+#define RECOVER_MIN_ASPECT 0.55f
+#define RECOVER_MIN_FILL 0.55f
+#define RECOVER_MIN_PEAK_TO_MEAN 1.15f
+#define RECOVER_MIN_SNR 4.0f
 #define RECOVER_CENTER_EXCESS 4.0f
 #define RECOVER_RING_STD_FLOOR 1.0f
 #define RECOVER_DEDUP_R 3.0f
@@ -949,8 +954,8 @@ recover_dim_blobs(blobwatch *bw,
 			if (peak <= bw->pixel_threshold) {
 				continue;
 			}
-			const int lb = (int)local_bg_mean(bw, x, y, w, h);
-			if (peak - lb < (int)bw->adapt_margin) {
+			const double contrast = (double)peak - local_bg_mean(bw, x, y, w, h);
+			if (contrast < RECOVER_MARGIN_LO || contrast > (double)bw->adapt_margin) {
 				continue;
 			}
 
@@ -961,8 +966,12 @@ recover_dim_blobs(blobwatch *bw,
 					if (dx == 0 && dy == 0) {
 						continue;
 					}
-					const int v = r2[x + dx];
-					if (v > peak || (v == peak && (dy < 0 || (dy == 0 && dx < 0)))) {
+					const int xx = x + dx;
+					const int yy = y + dy;
+					const int v = r2[xx];
+					const double other_contrast = (double)v - local_bg_mean(bw, xx, yy, w, h);
+					if (other_contrast > contrast ||
+					    (other_contrast == contrast && (dy < 0 || (dy == 0 && dx < 0)))) {
 						is_peak = false;
 						break;
 					}
@@ -1021,7 +1030,7 @@ recover_dim_blobs(blobwatch *bw,
 			int stack[(2 * RECOVER_MAX_WH + 1) * (2 * RECOVER_MAX_WH + 1)];
 			int sp = 0;
 			int area = 0, bb_l = x, bb_r = x, bb_t = y, bb_b = y;
-			double wsum = 0.0, wx = 0.0, wy = 0.0;
+			double wsum = 0.0, wx = 0.0, wy = 0.0, contrast_sum = 0.0;
 
 			stack[sp++] = (y - wy0) * ww + (x - wx0);
 			seen[(y - wy0) * ww + (x - wx0)] = true;
@@ -1048,6 +1057,7 @@ recover_dim_blobs(blobwatch *bw,
 				wsum += wgt;
 				wx += wgt * xx;
 				wy += wgt * yy;
+				contrast_sum += wgt;
 
 				for (int dy = -1; dy <= 1; dy++) {
 					for (int dx = -1; dx <= 1; dx++) {
@@ -1068,17 +1078,32 @@ recover_dim_blobs(blobwatch *bw,
 						if (nv <= bw->pixel_threshold) {
 							continue;
 						}
-						const int nb = (int)local_bg_mean(bw, nxx, nyy, w, h);
-						if (nv - nb >= (int)bw->adapt_margin) {
+						const double neighbor_contrast =
+						    (double)nv - local_bg_mean(bw, nxx, nyy, w, h);
+						if (neighbor_contrast >= RECOVER_MARGIN_LO) {
 							stack[sp++] = nidx;
 						}
 					}
 				}
 			}
-			if (area < RECOVER_MIN_AREA) {
+			if (area < RECOVER_MIN_AREA || area > RECOVER_MAX_AREA) {
 				continue;
 			}
-			if (bb_r - bb_l + 1 > RECOVER_MAX_WH || bb_b - bb_t + 1 > RECOVER_MAX_WH) {
+			const int blob_w = bb_r - bb_l + 1;
+			const int blob_h = bb_b - bb_t + 1;
+			if (blob_w > RECOVER_MAX_WH || blob_h > RECOVER_MAX_WH) {
+				continue;
+			}
+			const float aspect = (float)min(blob_w, blob_h) / (float)max(blob_w, blob_h);
+			if (aspect < RECOVER_MIN_ASPECT) {
+				continue;
+			}
+			const float fill = (float)area / (float)(blob_w * blob_h);
+			if (fill < RECOVER_MIN_FILL) {
+				continue;
+			}
+			const double mean_contrast = contrast_sum / (double)area;
+			if (mean_contrast <= 0.0 || contrast / mean_contrast < RECOVER_MIN_PEAK_TO_MEAN) {
 				continue;
 			}
 
