@@ -75,8 +75,8 @@ struct pose_metrics_visible_led_info
 	struct xrt_vec2 pos_px; /* Projected position of the LED (pixels) */
 	struct xrt_vec3 pos_m;  /* Projected physical position of the LED (metres) */
 	double facing_dot;      /* Dot product between LED and camera */
-	/* Anisotropic blob<->LED match gate (px half-axes) derived from the prior
-	 * covariance projected at this LED's depth. Floors at led_radius_px. */
+	/* Blob<->LED match gate (px half-axes): the isotropic fixed LED-radius
+	 * circle, i.e. both equal led_radius_px. */
 	double gate_ax_px;
 	double gate_ay_px;
 	struct blob *matched_blob;
@@ -151,6 +151,9 @@ pose_metrics_get_device_bounds(struct xrt_pose *P_cam_obj,
                                struct xrt_vec2 *visible_points,
                                size_t *num_visible_points);
 
+/* Project the LED model at @p pose, gate each blob against the fixed per-LED radius circle, and commit the
+ * global one-to-one (GNN) blob<->LED assignment into @p match_info. The mutual-exclusion win comes from the
+ * global assignment, not a wider gate; sizing the gate from a prior covariance stays a body-only change. */
 void
 pose_metrics_match_pose_to_blobs(struct xrt_pose *pose,
                                  struct blob *blobs,
@@ -177,31 +180,6 @@ pose_metrics_pkf_detection_prob(double facing_dot);
 double
 pose_metrics_pkf_clutter_likelihood(void);
 
-/* As above, but size each LED's blob-match gate from the prior's per-axis
- * position/rotation uncertainty (anisotropic Mahalanobis ellipse) instead of a
- * fixed radius. NULL thresholds => the fixed-radius (isotropic) behaviour. */
-void
-pose_metrics_match_pose_to_blobs_prior(struct xrt_pose *pose,
-                                       struct blob *blobs,
-                                       int num_blobs,
-                                       const struct xrt_vec3 *pos_error_thresh,
-                                       const struct xrt_vec3 *rot_error_thresh,
-                                       struct t_constellation_led_model *led_model,
-                                       struct camera_model *calib,
-                                       struct pose_metrics_blob_match_info *match_info);
-
-/* Pure gate math (exposed for unit testing): compute the anisotropic per-LED
- * gate half-axes (px) from the prior covariance projected at the LED depth. */
-void
-pose_metrics_compute_led_gate(double focal_length_px,
-                              double led_depth_m,
-                              double led_lever_arm_m,
-                              double led_radius_px,
-                              const struct xrt_vec3 *pos_error_thresh,
-                              const struct xrt_vec3 *rot_error_thresh,
-                              double *out_gate_ax_px,
-                              double *out_gate_ay_px);
-
 void
 pose_metrics_evaluate_pose(struct pose_metrics *score,
                            struct xrt_pose *pose,
@@ -222,17 +200,15 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
                                       int num_blobs,
                                       struct t_constellation_led_model *leds_model,
                                       struct camera_model *calib,
-                                      struct pose_rect *out_bounds);
+                                      struct pose_rect *out_bounds,
+                                      struct pose_metrics_blob_match_info *out_match_info);
 
-bool
-pose_metrics_score_is_better_pose(struct pose_metrics *old_score, struct pose_metrics *new_score);
-
-/* As pose_metrics_score_is_better_pose, but the soft mirror-flip prior penalty (pose_metrics_prior_orient_cost)
- * is folded into the per-LED reprojection comparison: where two candidates have the same matched-blob count
- * (the mirror-twin case — twins reproject near-identically), the one with the lower (reproj + prior_penalty)
- * wins. This is the soft re-rank used in the ab-initio search: a flipped twin is out-ranked by its large
- * prior penalty rather than dropped, and a candidate is never rejected outright. @p old_prior_cost /
- * @p new_prior_cost are the summed prior penalties (px^2) for each candidate. */
+/* Return true if new_score is for a more likely pose than old_score. The soft mirror-flip prior penalty
+ * (pose_metrics_prior_orient_cost) is folded into the per-LED reprojection comparison: where two candidates
+ * have the same matched-blob count (the mirror-twin case — twins reproject near-identically), the one with
+ * the lower (reproj + prior_penalty) wins. This is the soft re-rank used in the ab-initio search: a flipped
+ * twin is out-ranked by its large prior penalty rather than dropped, and a candidate is never rejected
+ * outright. @p old_prior_cost / @p new_prior_cost are the summed prior penalties (px^2) for each candidate. */
 bool
 pose_metrics_score_is_better_pose_prior(struct pose_metrics *old_score,
                                         double old_prior_cost,

@@ -178,19 +178,6 @@ correspondence_search_set_blobs(struct correspondence_search *cs, struct blob *b
 void
 correspondence_search_free(struct correspondence_search *cs);
 
-bool
-correspondence_search_find_one_pose(struct correspondence_search *cs,
-                                    struct t_constellation_search_model *model,
-                                    enum correspondence_search_flags search_flags,
-                                    struct xrt_pose *pose,
-                                    struct xrt_vec3 *pos_error_thresh,
-                                    struct xrt_vec3 *rot_error_thresh,
-                                    struct xrt_vec3 *up_vector,
-                                    float sigma_tilt_rad,
-                                    float sigma_yaw_rad,
-                                    float huber_knee_sigma,
-                                    float cost_weight,
-                                    struct pose_metrics *score);
 int
 correspondence_search_find_pose_candidates(struct correspondence_search *cs,
                                            struct t_constellation_search_model *model,
@@ -208,11 +195,6 @@ correspondence_search_find_pose_candidates(struct correspondence_search *cs,
 void
 correspondence_search_get_last_diagnostics(struct correspondence_search *cs,
                                            struct correspondence_search_diagnostics *out_diag);
-bool
-correspondence_search_have_pose(struct correspondence_search *cs,
-                                int model_id,
-                                struct xrt_pose *pose,
-                                struct pose_metrics *score);
 
 #ifdef __cplusplus
 }

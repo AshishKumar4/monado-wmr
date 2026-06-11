@@ -28,21 +28,13 @@ extern "C" {
 #endif
 
 #ifdef XRT_HAVE_OPENCV
-bool
-ransac_pnp_pose(struct xrt_pose *pose,
-                struct blob *blobs,
-                int num_blobs,
-                struct t_constellation_led_model *leds_model,
-                struct camera_model *calib,
-                int *num_leds_out,
-                int *num_inliers);
-
 /*!
- * As ransac_pnp_pose, but when the inlier LED set is near-planar (the few-LED, edge-on geometry that
- * causes the PnP mirror two-fold ambiguity), also returns the second (mirror-twin) pose so the caller can
- * pick the one consistent with the IMU/fusion prior instead of silently committing one. @p twin receives the
- * analytic twin and @p has_twin is set true only when a distinct second solution exists; otherwise @p has_twin
- * is false and @p twin is untouched. @p pose is always the primary (RANSAC + LM) solution on success.
+ * RANSAC + LM PnP solve over the identified-LED blobs. When the inlier LED set is near-planar (the few-LED,
+ * edge-on geometry that causes the PnP mirror two-fold ambiguity), also returns the second (mirror-twin)
+ * pose so the caller can pick the one consistent with the IMU/fusion prior instead of silently committing
+ * one. @p twin receives the analytic twin and @p has_twin is set true only when a distinct second solution
+ * exists; otherwise @p has_twin is false and @p twin is untouched. @p pose is always the primary
+ * (RANSAC + LM) solution on success.
  */
 bool
 ransac_pnp_pose_with_twin(struct xrt_pose *pose,
@@ -77,25 +69,6 @@ pnp_solve_p3p(struct blob *blobs,
               int max_out);
 
 #else
-static inline bool
-ransac_pnp_pose(struct xrt_pose *pose,
-                struct blob *blobs,
-                int num_blobs,
-                struct t_constellation_led_model *leds_model,
-                struct camera_model *calib,
-                int *num_leds_out,
-                int *num_inliers)
-{
-	(void)pose;
-	(void)blobs;
-	(void)num_blobs;
-	(void)leds_model;
-	(void)calib;
-	(void)num_leds_out;
-	(void)num_inliers;
-	return false;
-}
-
 static inline bool
 ransac_pnp_pose_with_twin(struct xrt_pose *pose,
                           struct blob *blobs,

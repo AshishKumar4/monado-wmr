@@ -106,7 +106,6 @@ struct g2_telem_pose_attempt
 struct g2_telem_candidate
 {
 	uint64_t t_mono_ns;
-	uint64_t hw_ts_ns;
 	uint8_t device_id;
 	uint8_t cam_id;
 	uint8_t stage;
@@ -139,7 +138,6 @@ struct g2_telem_candidate
 struct g2_telem_search
 {
 	uint64_t t_mono_ns;
-	uint64_t hw_ts_ns;
 	uint8_t device_id;
 	uint8_t cam_id;
 	uint8_t pass;
@@ -203,6 +201,20 @@ struct g2_telem_head_pose
 	float px, py, pz, qx, qy, qz, qw;
 } G2_PACKED;
 
+//! getpose stream row: exactly what the SteamVR pose-pull consumed for one controller — the
+//! resolved relation (pose + velocities + flags) the driver's GetPose returned. This is the
+//! signal the user physically feels (vrserver predicts photon time from this pose+velocity);
+//! unrecorded until now, live jitter/lag could not be attributed to it.
+struct g2_telem_getpose
+{
+	uint64_t t_mono_ns;
+	uint8_t device_id;
+	uint32_t relation_flags;
+	float px, py, pz, qx, qy, qz, qw;
+	float vx, vy, vz; //!< linear velocity (m/s)
+	float wx, wy, wz; //!< angular velocity (rad/s)
+} G2_PACKED;
+
 #if defined(_MSC_VER)
 #pragma pack(pop)
 #endif
@@ -219,7 +231,8 @@ enum g2_telem_stream
 	G2_TELEM_STREAM_FUSION = 5,
 	G2_TELEM_STREAM_EVENT = 6,
 	G2_TELEM_STREAM_HEAD_POSE = 7,
-	G2_TELEM_STREAM_COUNT = 8,
+	G2_TELEM_STREAM_GETPOSE = 8,
+	G2_TELEM_STREAM_COUNT = 9,
 };
 
 
@@ -276,7 +289,7 @@ static const struct g2_field pose_attempt_fields[] = {
 };
 
 static const struct g2_field candidate_fields[] = {
-    F(g2_telem_candidate, t_mono_ns, "u64"), F(g2_telem_candidate, hw_ts_ns, "u64"),
+    F(g2_telem_candidate, t_mono_ns, "u64"),
     F(g2_telem_candidate, device_id, "u8"), F(g2_telem_candidate, cam_id, "u8"),
     F(g2_telem_candidate, stage, "u8"), F(g2_telem_candidate, candidate, "u8"),
     F(g2_telem_candidate, selected, "u8"), F(g2_telem_candidate, had_twin, "u8"),
@@ -300,7 +313,7 @@ static const struct g2_field candidate_fields[] = {
 };
 
 static const struct g2_field search_fields[] = {
-    F(g2_telem_search, t_mono_ns, "u64"), F(g2_telem_search, hw_ts_ns, "u64"),
+    F(g2_telem_search, t_mono_ns, "u64"),
     F(g2_telem_search, device_id, "u8"), F(g2_telem_search, cam_id, "u8"),
     F(g2_telem_search, pass, "u8"), F(g2_telem_search, result, "u8"),
     F(g2_telem_search, search_flags, "u16"), F(g2_telem_search, prior_tilt_trusted, "u8"),
@@ -339,6 +352,16 @@ static const struct g2_field head_pose_fields[] = {
     F(g2_telem_head_pose, qx, "f32"), F(g2_telem_head_pose, qy, "f32"), F(g2_telem_head_pose, qz, "f32"),
     F(g2_telem_head_pose, qw, "f32"),
 };
+
+static const struct g2_field getpose_fields[] = {
+    F(g2_telem_getpose, t_mono_ns, "u64"), F(g2_telem_getpose, device_id, "u8"),
+    F(g2_telem_getpose, relation_flags, "u32"),
+    F(g2_telem_getpose, px, "f32"), F(g2_telem_getpose, py, "f32"), F(g2_telem_getpose, pz, "f32"),
+    F(g2_telem_getpose, qx, "f32"), F(g2_telem_getpose, qy, "f32"), F(g2_telem_getpose, qz, "f32"),
+    F(g2_telem_getpose, qw, "f32"),
+    F(g2_telem_getpose, vx, "f32"), F(g2_telem_getpose, vy, "f32"), F(g2_telem_getpose, vz, "f32"),
+    F(g2_telem_getpose, wx, "f32"), F(g2_telem_getpose, wy, "f32"), F(g2_telem_getpose, wz, "f32"),
+};
 // clang-format on
 
 #define NF(arr) (sizeof(arr) / sizeof((arr)[0]))
@@ -361,7 +384,17 @@ static const struct g2_stream_desc g2_descs[G2_TELEM_STREAM_COUNT] = {
                                NF(event_fields)},
     [G2_TELEM_STREAM_HEAD_POSE] = {"head_pose", "head_pose.bin", sizeof(struct g2_telem_head_pose), 32768,
                                    head_pose_fields, NF(head_pose_fields)},
+    [G2_TELEM_STREAM_GETPOSE] = {"getpose", "getpose.bin", sizeof(struct g2_telem_getpose), 131072,
+                                 getpose_fields, NF(getpose_fields)},
 };
+
+/* drain_ring dequeues every stream into one fixed 256-byte buffer. */
+_Static_assert(sizeof(struct g2_telem_imu) <= 256 && sizeof(struct g2_telem_frame) <= 256 &&
+                   sizeof(struct g2_telem_pose_attempt) <= 256 && sizeof(struct g2_telem_candidate) <= 256 &&
+                   sizeof(struct g2_telem_search) <= 256 && sizeof(struct g2_telem_fusion) <= 256 &&
+                   sizeof(struct g2_telem_event) <= 256 && sizeof(struct g2_telem_head_pose) <= 256 &&
+                   sizeof(struct g2_telem_getpose) <= 256,
+               "every row struct must fit drain_ring's buffer");
 
 
 /*
@@ -779,7 +812,7 @@ g2_telem_init(const char *out_dir)
 		return;
 	}
 
-	g_telem.start_mono_ns = os_monotonic_get_ns();
+	g_telem.start_mono_ns = g2_telem_now_ns();
 	g_telem.start_realtime_ns = os_realtime_get_ns();
 
 	// Allocate rings + open files.
@@ -884,7 +917,7 @@ g2_telem_imu(uint8_t device_id, uint64_t hw_ts_ns, float ax, float ay, float az,
 		return;
 	}
 	struct g2_telem_imu row = {0};
-	row.t_mono_ns = (uint64_t)os_monotonic_get_ns();
+	row.t_mono_ns = g2_telem_now_ns();
 	row.hw_ts_ns = hw_ts_ns;
 	row.device_id = device_id;
 	row.ax = ax;
@@ -909,7 +942,7 @@ g2_telem_frame(uint8_t cam_id,
 		return;
 	}
 	struct g2_telem_frame row = {0};
-	row.t_mono_ns = (uint64_t)os_monotonic_get_ns();
+	row.t_mono_ns = g2_telem_now_ns();
 	row.hw_ts_ns = hw_ts_ns;
 	row.cam_id = cam_id;
 	row.frame_seq = frame_seq;
@@ -935,7 +968,7 @@ g2_telem_pose_attempt(uint8_t device_id,
 		return;
 	}
 	struct g2_telem_pose_attempt row = {0};
-	row.t_mono_ns = (uint64_t)os_monotonic_get_ns();
+	row.t_mono_ns = g2_telem_now_ns();
 	row.hw_ts_ns = hw_ts_ns;
 	row.device_id = device_id;
 	row.cam_id = cam_id;
@@ -989,7 +1022,6 @@ g2_telem_candidate(uint8_t device_id,
 	}
 	struct g2_telem_candidate row = {0};
 	row.t_mono_ns = ts_ns;
-	row.hw_ts_ns = ts_ns;
 	row.device_id = device_id;
 	row.cam_id = cam_id;
 	row.stage = stage;
@@ -1070,7 +1102,6 @@ g2_telem_search(uint8_t device_id,
 	}
 	struct g2_telem_search row = {0};
 	row.t_mono_ns = ts_ns;
-	row.hw_ts_ns = ts_ns;
 	row.device_id = device_id;
 	row.cam_id = cam_id;
 	row.pass = pass;
@@ -1115,7 +1146,7 @@ g2_telem_fusion(uint8_t device_id,
 		return;
 	}
 	// t_mono_ns carries the observation (frame/sample) time here, not the emit
-	// time -- see the per-stream note in u_g2_telemetry.h / TELEMETRY-SCHEMA.md.
+	// time -- see the per-stream note in u_g2_telemetry.h.
 	struct g2_telem_fusion row = {0};
 	row.t_mono_ns = ts_ns;
 	row.device_id = device_id;
@@ -1174,4 +1205,39 @@ g2_telem_head_pose(uint64_t ts_ns, const float pose[7])
 	row.qz = pose[5];
 	row.qw = pose[6];
 	(void)ring_emit(&g_telem.rings[G2_TELEM_STREAM_HEAD_POSE], &row);
+}
+
+void
+g2_telem_getpose(uint8_t device_id,
+                 uint64_t ts_ns,
+                 const float pose[7],
+                 const float lin_vel[3],
+                 const float ang_vel[3],
+                 uint32_t relation_flags)
+{
+	if (!g2_telem_enabled() || pose == NULL) {
+		return;
+	}
+	struct g2_telem_getpose row = {0};
+	row.t_mono_ns = ts_ns;
+	row.device_id = device_id;
+	row.relation_flags = relation_flags;
+	row.px = pose[0];
+	row.py = pose[1];
+	row.pz = pose[2];
+	row.qx = pose[3];
+	row.qy = pose[4];
+	row.qz = pose[5];
+	row.qw = pose[6];
+	if (lin_vel != NULL) {
+		row.vx = lin_vel[0];
+		row.vy = lin_vel[1];
+		row.vz = lin_vel[2];
+	}
+	if (ang_vel != NULL) {
+		row.wx = ang_vel[0];
+		row.wy = ang_vel[1];
+		row.wz = ang_vel[2];
+	}
+	(void)ring_emit(&g_telem.rings[G2_TELEM_STREAM_GETPOSE], &row);
 }

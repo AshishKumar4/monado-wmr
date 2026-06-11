@@ -524,11 +524,36 @@ imu_cal_filename(const char *serial, char *out, size_t out_size)
 	}
 }
 
-/* Parse a cached record (v1 or v2). Returns true on a well-formed, PLAUSIBLE bias/scale; fills @p mg /
- * @p ta with the v2 intrinsics, or identity for a v1 record (no intrinsics). Bounds mirror the filter's
- * plausibility caps: real MEMS gyro bias << 0.1 rad/s, accel bias << 0.5 m/s^2, scale within ~10%. */
+/* MEMS-plausible intrinsics: ICM-20602 sensitivity tolerance is ~±3% with <2% cross-axis, so beyond
+ * 8% diagonal / 0.06 off-diagonal is a degenerate fit, not hardware (a non-gravity-spanning rest set
+ * once persisted a 17.6% accel x-scale that measurably corrupted live tracking). */
 static bool
-imu_cal_parse(FILE *f, double bg[3], double ba[3], double *scale, int *count, double mg[9], double ta[9])
+imu_cal_intrinsics_plausible(const double m[9])
+{
+	for (int r = 0; r < 3; r++) {
+		for (int c = 0; c < 3; c++) {
+			const double v = m[r * 3 + c];
+			if (!isfinite(v) || (r == c ? fabs(v - 1.0) > 0.08 : fabs(v) > 0.06)) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+/* Parse a cached record (v1 or v2). Returns true on a well-formed, PLAUSIBLE bias/scale; fills @p mg /
+ * @p ta with the v2 intrinsics, or identity for a v1 record (no intrinsics) or implausible matrices
+ * (@p intrinsics_rejected set). Bounds mirror the filter's plausibility caps: real MEMS gyro bias
+ * << 0.1 rad/s, accel bias << 0.5 m/s^2, scale within ~10%. */
+static bool
+imu_cal_parse(FILE *f,
+              double bg[3],
+              double ba[3],
+              double *scale,
+              int *count,
+              double mg[9],
+              double ta[9],
+              bool *intrinsics_rejected)
 {
 	int ver = 0;
 	memcpy(mg, IMU_CAL_IDENTITY3, sizeof(IMU_CAL_IDENTITY3));
@@ -554,6 +579,13 @@ imu_cal_parse(FILE *f, double bg[3], double ba[3], double *scale, int *count, do
 				return false;
 			}
 		}
+		if (!imu_cal_intrinsics_plausible(mg) || !imu_cal_intrinsics_plausible(ta)) {
+			memcpy(mg, IMU_CAL_IDENTITY3, sizeof(IMU_CAL_IDENTITY3));
+			memcpy(ta, IMU_CAL_IDENTITY3, sizeof(IMU_CAL_IDENTITY3));
+			if (intrinsics_rejected != NULL) {
+				*intrinsics_rejected = true;
+			}
+		}
 	}
 	return true;
 }
@@ -572,13 +604,18 @@ imu_cal_load(struct wmr_controller_base *wcb, const char *serial)
 	}
 	int count = 0;
 	double bg[3], ba[3], scale = 1.0, mg[9], ta[9];
-	bool plausible = imu_cal_parse(f, bg, ba, &scale, &count, mg, ta);
+	bool intrinsics_rejected = false;
+	bool plausible = imu_cal_parse(f, bg, ba, &scale, &count, mg, ta, &intrinsics_rejected);
 	fclose(f);
 	if (plausible) {
 		kalman_fusion_set_imu_calibration(wcb->kalman_fusion, bg, ba, scale);
 		kalman_fusion_set_imu_intrinsics(wcb->kalman_fusion, mg, ta); // identity for a v1 cache (no-op)
 		WMR_INFO(wcb, "Loaded IMU calibration prior (serial %s, accel scale %.4f, %d sessions)", serial,
 		         scale, count);
+		if (intrinsics_rejected) {
+			WMR_WARN(wcb, "Rejected implausible cached IMU intrinsics (serial %s) - using identity",
+			         serial);
+		}
 	} else {
 		WMR_WARN(wcb, "Ignoring implausible IMU calibration cache (serial %s) - will recalibrate", serial);
 	}
@@ -604,7 +641,7 @@ imu_cal_save(struct wmr_controller_base *wcb, const char *serial)
 	FILE *rf = u_file_open_file_in_config_dir_subpath("wmr", fn, "r");
 	bool had_cache = false;
 	if (rf != NULL) {
-		had_cache = imu_cal_parse(rf, obg, oba, &oscale, &ocount, mg, ta);
+		had_cache = imu_cal_parse(rf, obg, oba, &oscale, &ocount, mg, ta, NULL);
 		fclose(rf);
 	}
 	if (!had_cache) {
@@ -627,7 +664,8 @@ imu_cal_save(struct wmr_controller_base *wcb, const char *serial)
 	 * geometric correction, not a slowly-drifting bias; get_* returns false (matrices unchanged) when
 	 * the filter holds no real correction, so the cached values carry forward untouched. */
 	double cur_mg[9], cur_ta[9];
-	if (kalman_fusion_get_imu_intrinsics(wcb->kalman_fusion, cur_mg, cur_ta)) {
+	if (kalman_fusion_get_imu_intrinsics(wcb->kalman_fusion, cur_mg, cur_ta) &&
+	    imu_cal_intrinsics_plausible(cur_mg) && imu_cal_intrinsics_plausible(cur_ta)) {
 		memcpy(mg, cur_mg, sizeof(mg));
 		memcpy(ta, cur_ta, sizeof(ta));
 	}

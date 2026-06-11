@@ -31,6 +31,7 @@ extern "C" {
 #include "util/u_device.h"
 #include "util/u_builders.h"
 #include "util/u_hand_tracking.h"
+#include "util/u_g2_telemetry.h"
 
 #include "xrt/xrt_config_have.h"
 #include "xrt/xrt_space.h"
@@ -1091,6 +1092,25 @@ public:
 		m_relation_chain_resolve(&chain, &rel);
 
 		apply_pose(&rel, &m_pose);
+
+		if (g2_telem_enabled()) {
+			const uint8_t dev_id =
+			    m_xdev->device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER    ? 1
+			    : m_xdev->device_type == XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER ? 2
+			                                                                   : 0;
+			if (dev_id != 0) {
+				const float pose7[7] = {rel.pose.position.x,    rel.pose.position.y,
+				                        rel.pose.position.z,    rel.pose.orientation.x,
+				                        rel.pose.orientation.y, rel.pose.orientation.z,
+				                        rel.pose.orientation.w};
+				const float lv[3] = {rel.linear_velocity.x, rel.linear_velocity.y,
+				                     rel.linear_velocity.z};
+				const float av[3] = {rel.angular_velocity.x, rel.angular_velocity.y,
+				                     rel.angular_velocity.z};
+				g2_telem_getpose(dev_id, (uint64_t)now_ns, pose7, lv, av,
+				                 (uint32_t)rel.relation_flags);
+			}
+		}
 
 #ifdef DUMP_POSE_CONTROLLERS
 		ovrd_log("get controller %d pose %f %f %f %f, %f %f %f\n", m_unObjectId, m_pose.qRotation.x,

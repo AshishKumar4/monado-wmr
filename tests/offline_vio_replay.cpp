@@ -29,6 +29,7 @@
 #include <chrono>
 #include <array>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -38,6 +39,7 @@
 #include <cjson/cJSON.h>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
@@ -135,6 +137,36 @@ in_drop_windows(const std::vector<DropWindow> &windows, int64_t t_ns)
 		}
 	}
 	return false;
+}
+
+/* Realistic-OOV mode: inside drop windows, black out ONE device's LEDs in the camera images
+ * (circles precomputed by tools/telemetry/make_led_mask.py) instead of withholding whole frame
+ * groups. Frames, clutter, and the other controller keep flowing -- which is what 79-89% of
+ * natural out-of-view episodes look like, unlike the transport-blackout drop mode. */
+struct MaskCircle
+{
+	int cam;
+	float x, y, r;
+};
+
+std::unordered_map<int64_t, std::vector<MaskCircle>>
+load_led_mask(const char *path)
+{
+	std::unordered_map<int64_t, std::vector<MaskCircle>> out;
+	std::ifstream f(path);
+	if (!f) {
+		return out;
+	}
+	std::string line;
+	std::getline(f, line); // header
+	while (std::getline(f, line)) {
+		long long t = 0;
+		MaskCircle c{};
+		if (sscanf(line.c_str(), "%lld,%d,%f,%f,%f", &t, &c.cam, &c.x, &c.y, &c.r) == 5) {
+			out[(int64_t)t].push_back(c);
+		}
+	}
+	return out;
 }
 
 std::string
@@ -1078,7 +1110,10 @@ cb_noop_bright(struct xrt_device *, uint8_t)
 
 // ---- reassemble the four cam tiles into the mosaic the tracker splits by ROI ----
 struct xrt_frame *
-assemble_mosaic(const MosaicFrame &mf, const struct t_constellation_camera_group &cams, uint64_t seq)
+assemble_mosaic(const MosaicFrame &mf,
+                const struct t_constellation_camera_group &cams,
+                uint64_t seq,
+                const std::vector<MaskCircle> *mask = nullptr)
 {
 	int W = 0, H = 0;
 	for (int c = 0; c < cams.cam_count; c++) {
@@ -1095,6 +1130,13 @@ assemble_mosaic(const MosaicFrame &mf, const struct t_constellation_camera_group
 		cv::Mat im = cv::imread(mf.cam_png[c], cv::IMREAD_GRAYSCALE);
 		if (im.empty()) {
 			continue;
+		}
+		if (mask != nullptr) {
+			for (const MaskCircle &mc : *mask) {
+				if (mc.cam == c) {
+					cv::circle(im, cv::Point((int)mc.x, (int)mc.y), (int)mc.r, cv::Scalar(0), -1);
+				}
+			}
 		}
 		const int ox = cams.cams[c].roi.offset.w, oy = cams.cams[c].roi.offset.h;
 		const int rw = std::min(im.cols, cams.cams[c].roi.extent.w);
@@ -1439,6 +1481,21 @@ main(int argc, char **argv)
 	const bool dropout_enabled =
 	    drop_after_ms >= 0.0 || (drop_period_ms > 0.0 && drop_duration_ms > 0.0) ||
 	    drop_random_p > 0.0 || !drop_windows.empty();
+	const int drop_mask_device = env_int("G2_REPLAY_DROP_DEVICE", 0);
+	std::unordered_map<int64_t, std::vector<MaskCircle>> led_mask;
+	if (drop_mask_device > 0) {
+		const char *mask_file = getenv("G2_REPLAY_LED_MASK_FILE");
+		if (mask_file == nullptr || mask_file[0] == '\0') {
+			fprintf(stderr, "G2_REPLAY_DROP_DEVICE set but G2_REPLAY_LED_MASK_FILE missing\n");
+			return 2;
+		}
+		led_mask = load_led_mask(mask_file);
+		if (led_mask.empty()) {
+			fprintf(stderr, "empty/unreadable LED mask file: %s\n", mask_file);
+			return 2;
+		}
+	}
+	const bool mask_mode = drop_mask_device > 0;
 	auto optical_dropped_at = [&](int64_t t_ns) {
 		const double replay_elapsed_ms = (double)(t_ns - replay_start_ns) / 1e6;
 		bool drop_optical = drop_after_ms >= 0.0 && replay_elapsed_ms >= drop_after_ms;
@@ -1462,6 +1519,10 @@ main(int argc, char **argv)
 		       drop_after_ms, drop_period_ms, drop_duration_ms, drop_random_p,
 		       (unsigned long long)drop_random_seed, drop_windows.size(),
 		       (unsigned long long)drop_burst_seed);
+		if (mask_mode) {
+			printf("  drop mode: LED-MASK device %d (%zu masked frame groups in file)\n",
+			       drop_mask_device, led_mask.size());
+		}
 		for (size_t i = 0; i < std::min<size_t>(drop_windows.size(), 16); i++) {
 			printf("  burst[%zu]: %.3f..%.3f ms\n", i,
 			       (double)(drop_windows[i].start_ns - replay_start_ns) / 1e6,
@@ -1579,8 +1640,10 @@ main(int argc, char **argv)
 			const bool render_drop = optical_dropped_at(next_render_ns);
 			for (CtrlSession &cs : sessions) {
 				feed_controller_imu_until(cs, next_render_ns);
+				const bool dev_render_drop =
+				    mask_mode ? (render_drop && cs.ctrl->device_id == drop_mask_device) : render_drop;
 				const bool ptracked = write_prediction_row(cs.render_csv, cs, next_render_ns, frame_t_ns,
-				                                           render_drop);
+				                                           dev_render_drop);
 				if (cs.render_csv != nullptr) {
 					cs.render_samples++;
 					cs.render_locked += ptracked ? 1 : 0;
@@ -1593,8 +1656,11 @@ main(int argc, char **argv)
 		if (render_period_ns > 0) {
 			sample_render_until(mf.t_ns - 1, mf.t_ns);
 		}
-		const bool drop_optical = optical_dropped_at(mf.t_ns);
-		dropped_frame_groups += drop_optical ? 1 : 0;
+		const bool drop_window = optical_dropped_at(mf.t_ns);
+		// Mask mode keeps pushing frames (with the target device's LEDs blacked out); only the
+		// transport-blackout mode withholds the whole group.
+		const bool drop_optical = drop_window && !mask_mode;
+		dropped_frame_groups += drop_window ? 1 : 0;
 
 		// Feed each device's IMU samples up to this frame's time so its matcher prior
 		// (kalman_fusion_get_prediction) is current. Per-device streams advance independently.
@@ -1609,8 +1675,20 @@ main(int argc, char **argv)
 				cs.ctrl->opt_led_folded = 0;
 			}
 
-		if (!drop_optical) {
-			struct xrt_frame *f = assemble_mosaic(mf, cams, seq++);
+		bool masked_this_frame = false;
+		const std::vector<MaskCircle> *frame_mask = nullptr;
+		if (mask_mode && drop_window) {
+			auto it = led_mask.find(mf.t_ns);
+			if (it != led_mask.end()) {
+				frame_mask = &it->second;
+				masked_this_frame = true;
+			}
+			// No mask coverage (no reference at this frame) -> the LEDs cannot be hidden
+			// honestly; withhold the group like the blackout mode rather than leak them.
+		}
+		const bool push_frame = !drop_optical && !(mask_mode && drop_window && !masked_this_frame);
+		if (push_frame) {
+			struct xrt_frame *f = assemble_mosaic(mf, cams, seq++, frame_mask);
 			// Completion BARRIER (replaces the old fixed 8ms sleep, which was a race: a frame whose
 			// ab-initio search ran past 8ms was read as "no optical pose" -> the yield % became
 			// machine-load-dependent, audit H1). The tracker increments frames_completed exactly once per
@@ -1672,7 +1750,9 @@ main(int argc, char **argv)
 				cs.last_optical_report_ns = mf.t_ns;
 			}
 			if (cs.csv != nullptr) {
-				fprintf(cs.csv, "%lld,%d,%d,", (long long)mf.t_ns, drop_optical ? 1 : 0, ov ? 1 : 0);
+				const bool dev_drop =
+				    mask_mode ? (drop_window && cs.ctrl->device_id == drop_mask_device) : drop_optical;
+				fprintf(cs.csv, "%lld,%d,%d,", (long long)mf.t_ns, dev_drop ? 1 : 0, ov ? 1 : 0);
 				if (ov) {
 					fprintf(cs.csv, "%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,", op.position.x,
 					        op.position.y, op.position.z, op.orientation.x, op.orientation.y,

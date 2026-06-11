@@ -20,9 +20,10 @@
  *    timestamp (per-sensor epoch/rate, NOT cross-stream comparable); only t_mono_ns
  *    is comparable across streams. hw_ts_ns is for per-sensor diagnostics, not for
  *    a t_mono_ns - hw_ts_ns latency that compares across the HMD vs controllers.
- *  - NON-BLOCKING: every g2_telem_* emit is wait-free for the producer (single-producer
- *    /single-consumer ring per stream + one background writer thread). An emit NEVER
- *    locks, mallocs, or does I/O on the calling (tracking/IMU) thread.
+ *  - NON-BLOCKING: every g2_telem_* emit is wait-free for the producer (multi-producer
+ *    /single-consumer ring per stream — e.g. the three IMU producers share the imu
+ *    stream — drained by one background writer thread). An emit NEVER locks, mallocs,
+ *    or does I/O on the calling (tracking/IMU) thread.
  *  - NEVER SILENTLY LOSE DATA: each ring is sized large enough to never roll over at
  *    expected rates (see u_g2_telemetry.c capacities). If a ring is ever full, the emit
  *    increments that stream's overflow counter and drops the row; the writer thread logs
@@ -71,6 +72,7 @@ enum g2_telem_event_type
 	G2_TELEM_EV_OPTICAL_JUMP_REJECTED = 3,
 	G2_TELEM_EV_IMU_ANOMALY = 4,
 	G2_TELEM_EV_RING_OVERFLOW = 5,
+	/* 6 retired; never reuse — captured event.bin decodes by these ids. */
 	G2_TELEM_EV_ESKF_FOLD_COUNT = 7,
 	G2_TELEM_EV_ESKF_LEDS_SEEN = 8,
 	G2_TELEM_EV_PARTIAL_FOLD_COUNT = 9,
@@ -212,7 +214,7 @@ g2_telem_fusion(uint8_t device_id,
                 uint8_t outcome);
 
 /*! Generic event marker for "interesting points" (lock loss, recovery, large jump…).
- *  @p event_type values are documented in docs/TELEMETRY-SCHEMA.md. @p value is event-specific. */
+ *  @p event_type values are the stable ids in enum g2_telem_event_type. @p value is event-specific. */
 void
 g2_telem_event(uint8_t device_id, uint64_t ts_ns, uint16_t event_type, float value);
 
@@ -221,6 +223,17 @@ g2_telem_event(uint8_t device_id, uint64_t ts_ns, uint16_t event_type, float val
  *  transform the live SLAM head pose provides (instead of an IMU-only reconstruction). */
 void
 g2_telem_head_pose(uint64_t ts_ns, const float pose[7]);
+
+/*! The resolved relation a SteamVR GetPose pull consumed for a controller: pose [px,py,pz,
+ *  qx,qy,qz,qw], linear + angular velocity, and the xrt relation flags. The signal the user
+ *  physically feels (vrserver predicts photon time from this pose+velocity). */
+void
+g2_telem_getpose(uint8_t device_id,
+                 uint64_t ts_ns,
+                 const float pose[7],
+                 const float lin_vel[3],
+                 const float ang_vel[3],
+                 uint32_t relation_flags);
 
 #ifdef __cplusplus
 }

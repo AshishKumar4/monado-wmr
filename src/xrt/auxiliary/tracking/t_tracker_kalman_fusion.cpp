@@ -539,6 +539,13 @@ namespace {
 		bool body_anchored{false};
 		bool optical_velocity_valid{false};
 		int optical_pos_history_count{0};
+		//! IMU-side stance state: without these, OOSM rewind-replay continues a rest run
+		//! containing future samples and re-applies the per-stance scale EMA to the same
+		//! samples, drifting a PERSISTED calibration nondeterministically.
+		int rest_count{0};
+		double accel_scale{1.0};
+		bool scale_bootstrapped{false};
+		Quaterniond gravity_corrected_q{1.0, 0.0, 0.0, 0.0};
 	};
 
 	//! One buffered IMU sample retained for out-of-sequence replay.
@@ -683,6 +690,9 @@ namespace {
 
 		bool
 		debug_get_pose_covariance(double cov6_row_major[36]) override;
+
+		bool
+		debug_get_state_covariance(double cov15_row_major[225]) override;
 
 		double
 		debug_get_accel_scale() override
@@ -1310,6 +1320,23 @@ namespace {
 		integrate_position_measurement(const Vector3d &pos,
 		                               const Vector3d &pos_variance,
 		                               bool refresh_optical_anchor);
+		//! Velocity-fit history treatment for mark_optical_adopted: keep it as-is (a reanchor() site
+		//! already re-seeded it), re-seed it from the adopted position, or append the accepted sample.
+		enum class OpticalHistory { Keep, Seed, Record };
+		//! Shared optical-adoption epilogue: tracking flags, the optical-freshness clock, the re-anchor
+		//! reference + velocity-fit history, and the body-lock capture. @p orientation_adopted additionally
+		//! marks the orientation state (the 6-DOF pose sites); @p refresh_good_position updates
+		//! last_good_position from the post-fold m_x.p.
+		void
+		mark_optical_adopted(bool orientation_adopted,
+		                     bool refresh_good_position,
+		                     OpticalHistory history,
+		                     const Vector3d &pos_variance);
+		//! Position-only re-anchor: overwrite position, take the fresh same-frame optical velocity or
+		//! zero, reset + cross-clear the position/velocity covariance, then run the adoption epilogue
+		//! with a re-seeded history.
+		void
+		adopt_optical_position(const Vector3d &pos, const Vector3d &pos_variance);
 		int
 		fold_led_observations(const std::vector<LEDObservation> &obs,
 		                      const LEDCameraView &view,
@@ -1738,6 +1765,10 @@ namespace {
 		c.body_anchored = m_body_anchored;
 		c.optical_velocity_valid = m_optical_velocity_valid;
 		c.optical_pos_history_count = m_optical_pos_history_count;
+		c.rest_count = m_rest_count;
+		c.accel_scale = m_accel_scale;
+		c.scale_bootstrapped = m_scale_bootstrapped;
+		c.gravity_corrected_q = m_gravity_corrected_q;
 		return c;
 	}
 
@@ -1773,6 +1804,10 @@ namespace {
 		m_body_anchored = c.body_anchored;
 		m_optical_velocity_valid = c.optical_velocity_valid;
 		m_optical_pos_history_count = c.optical_pos_history_count;
+		m_rest_count = c.rest_count;
+		m_accel_scale = c.accel_scale;
+		m_scale_bootstrapped = c.scale_bootstrapped;
+		m_gravity_corrected_q = c.gravity_corrected_q;
 	}
 
 	void
@@ -2212,9 +2247,12 @@ namespace {
 		const bool recovery_gate = position_gap_stale && !recent_led_evidence;
 		Mat15 gate_P = m_P;
 		if (recovery_gate) {
-			gate_P.block<3, 3>(EP, EP) = Mat3::Identity() * LOST_POS_VAR;
-			gate_P.block<3, 3>(EV, EV) = Mat3::Identity() * P0_VEL;
-			gate_P.block<3, 3>(ET, ET) = Mat3::Identity() * LOST_ORI_VAR;
+			// Cross-clear too: a diagonal overwrite below the coast-grown values with the stale
+			// cross-correlations retained can leave the matrix indefinite and redistributes
+			// recovery innovations into the biases through invalidated correlations.
+			reset_covariance_block(gate_P, EP, LOST_POS_VAR);
+			reset_covariance_block(gate_P, EV, P0_VEL);
+			reset_covariance_block(gate_P, ET, LOST_ORI_VAR);
 		}
 
 		// Gate each LED at the prior (chi-square + Huber), keeping the accepted LEDs' object points + the
@@ -2283,6 +2321,9 @@ namespace {
 		const bool position_recovery = recovery_gate && k >= POSITION_OBSERVABLE_MIN_LEDS;
 		const bool stationary_recovery = position_recovery && m_rest_count >= ZUPT_MIN_REST;
 		const Vector3d recovery_prior_velocity = m_x.v;
+		// Pre-gate covariance, restored on the reject paths: the widened gate_P is the intended
+		// PRIOR for the recovery solve, but a rejected fold must not keep the inflation.
+		const Mat15 P_pre_gate = m_P;
 		if (position_recovery) {
 			m_P = gate_P;
 		}
@@ -2415,7 +2456,7 @@ namespace {
 		if (!any_ok) {
 			U_LOG_E("Non-finite per-LED update - re-anchoring");
 			m_x = x0;
-			m_P = P0;
+			m_P = position_recovery ? P_pre_gate : P0;
 			const Vector3d pnp_pos = map_vec3(m_pnp_pose.position).cast<double>();
 			if (m_pnp_valid && pnp_pos.allFinite() && position_plausible(pnp_pos)) {
 				reanchor(pnp_pos, flip_guard(map_quat(m_pnp_pose.orientation).cast<double>()));
@@ -2430,7 +2471,7 @@ namespace {
 		m_P = 0.5 * (m_P + m_P.transpose()).eval();
 		if (!m_P.allFinite() || !m_x.p.allFinite() || !std::isfinite(m_x.q.norm())) {
 			m_x = x0;
-			m_P = P0;
+			m_P = position_recovery ? P_pre_gate : P0;
 			const Vector3d pnp_pos = map_vec3(m_pnp_pose.position).cast<double>();
 			if (m_pnp_valid && pnp_pos.allFinite() && position_plausible(pnp_pos)) {
 				reanchor(pnp_pos, flip_guard(map_quat(m_pnp_pose.orientation).cast<double>()));
@@ -2448,7 +2489,7 @@ namespace {
 		if (pos_observable && !optical_motion_plausible(m_x.p, filter_time_ns)) {
 			U_LOG_W("Per-LED fold moved position implausibly far - rejecting fold");
 			m_x = x0;
-			m_P = P0;
+			m_P = position_recovery ? P_pre_gate : P0;
 			return 0;
 		}
 
@@ -2765,6 +2806,39 @@ namespace {
 		return ekf_update(H, r, R);
 	}
 
+	void
+	EskfFusion::mark_optical_adopted(bool orientation_adopted,
+	                                 bool refresh_good_position,
+	                                 OpticalHistory history,
+	                                 const Vector3d &pos_variance)
+	{
+		tracked = true;
+		position_state.valid = position_state.tracked = true;
+		if (orientation_adopted) {
+			orientation_state.valid = orientation_state.tracked = true;
+		}
+		last_optical_ns = filter_time_ns;
+		if (refresh_good_position) {
+			last_good_position = m_x.p;
+		}
+		switch (history) {
+		case OpticalHistory::Keep: break;
+		case OpticalHistory::Seed: seed_optical_position_history(m_x.p, pos_variance); break;
+		case OpticalHistory::Record: record_optical_position_sample(m_x.p, pos_variance); break;
+		}
+		capture_body_lock();
+	}
+
+	void
+	EskfFusion::adopt_optical_position(const Vector3d &pos, const Vector3d &pos_variance)
+	{
+		m_x.p = pos;
+		m_x.v = fresh_optical_velocity_or_zero();
+		reset_covariance_block(m_P, EP, REANCHOR_POS_VAR);
+		reset_covariance_block(m_P, EV, P0_VEL);
+		mark_optical_adopted(false, true, OpticalHistory::Seed, pos_variance);
+	}
+
 	bool
 	EskfFusion::integrate_pose_measurement(const xrt_pose &pose,
 	                                       const Vector3d &pos_variance,
@@ -2797,11 +2871,7 @@ namespace {
 		if (resid > REANCHOR_SNAP_M || resid > residual_limit) {
 			(void)fold_optical_velocity_measurement(pos, pos_variance);
 			reanchor(pos, flip_guard(orient)); // gyro-arbitrated: a flipped PnP re-anchors position only
-			tracked = true;
-			position_state.valid = position_state.tracked = true;
-			orientation_state.valid = orientation_state.tracked = true;
-			last_optical_ns = filter_time_ns;
-			capture_body_lock();
+			mark_optical_adopted(true, false, OpticalHistory::Keep, pos_variance);
 			return true;
 		}
 
@@ -2833,30 +2903,15 @@ namespace {
 		}
 		if (!ok) {
 			reanchor(pos, flip_guard(orient));
-			tracked = true;
-			position_state.valid = position_state.tracked = true;
-			orientation_state.valid = orientation_state.tracked = true;
-			last_optical_ns = filter_time_ns;
-			capture_body_lock();
+			mark_optical_adopted(true, false, OpticalHistory::Keep, pos_variance);
 			return false;
 		}
 		if (!fold_optical_velocity_measurement(pos, pos_variance)) {
 			reanchor(pos, flip_guard(orient));
-			tracked = true;
-			position_state.valid = position_state.tracked = true;
-			orientation_state.valid = orientation_state.tracked = true;
-			last_optical_ns = filter_time_ns;
-			last_good_position = m_x.p;
-			capture_body_lock();
+			mark_optical_adopted(true, true, OpticalHistory::Keep, pos_variance);
 			return false;
 		}
-		tracked = true;
-		position_state.valid = position_state.tracked = true;
-		orientation_state.valid = orientation_state.tracked = true;
-		last_optical_ns = filter_time_ns;
-		last_good_position = m_x.p;
-		record_optical_position_sample(m_x.p, pos_variance);
-		capture_body_lock();
+		mark_optical_adopted(true, true, OpticalHistory::Record, pos_variance);
 		return true;
 	}
 
@@ -2884,20 +2939,7 @@ namespace {
 				return false;
 			}
 			(void)fold_optical_velocity_measurement(pos, pos_variance);
-			m_x.p = pos;
-			m_x.v = fresh_optical_velocity_or_zero();
-			m_P.block<3, 15>(EP, 0).setZero();
-			m_P.block<15, 3>(0, EP).setZero();
-			m_P.block<3, 15>(EV, 0).setZero();
-			m_P.block<15, 3>(0, EV).setZero();
-			m_P.block<3, 3>(EP, EP) = Mat3::Identity() * REANCHOR_POS_VAR;
-			m_P.block<3, 3>(EV, EV) = Mat3::Identity() * P0_VEL;
-			tracked = true;
-			position_state.valid = position_state.tracked = true;
-			last_optical_ns = filter_time_ns;
-			last_good_position = m_x.p;
-			seed_optical_position_history(m_x.p, pos_variance);
-			capture_body_lock();
+			adopt_optical_position(pos, pos_variance);
 			return true;
 		}
 
@@ -2910,41 +2952,20 @@ namespace {
 				return false;
 			}
 			(void)fold_optical_velocity_measurement(pos, pos_variance);
-			m_x.p = pos;
-			m_x.v = fresh_optical_velocity_or_zero();
-			m_P.block<3, 3>(EP, EP) = Mat3::Identity() * REANCHOR_POS_VAR;
-			m_P.block<3, 3>(EV, EV) = Mat3::Identity() * P0_VEL;
-			tracked = true;
-			position_state.valid = position_state.tracked = true;
-			last_optical_ns = filter_time_ns;
-			last_good_position = m_x.p;
-			seed_optical_position_history(m_x.p, pos_variance);
-			capture_body_lock();
+			adopt_optical_position(pos, pos_variance);
 			return false;
 		}
 		if (refresh_optical_anchor && !fold_optical_velocity_measurement(pos, pos_variance)) {
-			m_x.p = pos;
-			m_x.v = fresh_optical_velocity_or_zero();
-			m_P.block<3, 3>(EP, EP) = Mat3::Identity() * REANCHOR_POS_VAR;
-			m_P.block<3, 3>(EV, EV) = Mat3::Identity() * P0_VEL;
-			tracked = true;
-			position_state.valid = position_state.tracked = true;
-			last_optical_ns = filter_time_ns;
-			last_good_position = m_x.p;
-			seed_optical_position_history(m_x.p, pos_variance);
-			capture_body_lock();
+			adopt_optical_position(pos, pos_variance);
 			return false;
 		}
 
-		tracked = true;
-		position_state.valid = true;
-		if (refresh_optical_anchor) {
-			position_state.tracked = true;
-			last_optical_ns = filter_time_ns;
-			last_good_position = m_x.p;
-			record_optical_position_sample(m_x.p, pos_variance);
-			capture_body_lock();
+		if (!refresh_optical_anchor) {
+			tracked = true;
+			position_state.valid = true;
+			return true;
 		}
+		mark_optical_adopted(false, true, OpticalHistory::Record, pos_variance);
 		return true;
 	}
 
@@ -3273,9 +3294,9 @@ namespace {
 							if (m_rest_count >= ZUPT_MIN_REST) {
 								m_x.v.setZero();
 							}
-							m_P.block<3, 3>(EP, EP) = Mat3::Identity() * LOST_POS_VAR;
-							m_P.block<3, 3>(EV, EV) = Mat3::Identity() * P0_VEL;
-							m_P.block<3, 3>(ET, ET) = Mat3::Identity() * LOST_ORI_VAR;
+							reset_covariance_block(m_P, EP, LOST_POS_VAR);
+							reset_covariance_block(m_P, EV, P0_VEL);
+							reset_covariance_block(m_P, ET, LOST_ORI_VAR);
 						}
 					int seen2 = 0;
 					const float recovery_max_innov_px =
@@ -3598,6 +3619,18 @@ namespace {
 		for (int i = 0; i < 6; i++) {
 			for (int j = 0; j < 6; j++) {
 				cov6_row_major[i * 6 + j] = m_P(idx[i], idx[j]);
+			}
+		}
+		return tracked;
+	}
+
+	bool
+	EskfFusion::debug_get_state_covariance(double cov15_row_major[225])
+	{
+		std::lock_guard<std::mutex> lock(m_filter_lock);
+		for (int i = 0; i < 15; i++) {
+			for (int j = 0; j < 15; j++) {
+				cov15_row_major[i * 15 + j] = m_P(i, j);
 			}
 		}
 		return tracked;

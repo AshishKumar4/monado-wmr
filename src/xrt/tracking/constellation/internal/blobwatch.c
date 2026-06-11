@@ -23,6 +23,7 @@
 
 #include "os/os_threading.h"
 
+#include "math/m_api.h"
 #include "util/u_logging.h"
 #include "util/u_g2_telemetry.h"
 
@@ -96,10 +97,6 @@
 
 #define QUEUE_ENTRIES (NUM_FRAMES_HISTORY + 1)
 
-#define abs(x) ((x) >= 0 ? (x) : -(x))
-#define min(x, y) ((x) < (y) ? (x) : (y))
-#define max(x, y) ((x) > (y) ? (x) : (y))
-
 #define G2_PGM_DUMP_QUEUE_CAP 64
 
 struct g2_pgm_dump_job
@@ -114,6 +111,8 @@ struct g2_pgm_dump_queue
 	bool initialized;
 	bool enabled;
 	bool blocking;
+	const char *dir;
+	uint32_t stride;
 	struct g2_pgm_dump_job jobs[G2_PGM_DUMP_QUEUE_CAP];
 	uint32_t head;
 	uint32_t tail;
@@ -190,6 +189,12 @@ g2_pgm_dump_init_once(void)
 
 	g_pgm_dump.enabled = true;
 	g_pgm_dump.blocking = getenv("G2_DUMP_FRAMES_BLOCKING") != NULL;
+	g_pgm_dump.dir = dump_dir;
+	g_pgm_dump.stride = 1;
+	const char *stride_s = getenv("G2_DUMP_FRAMES_STRIDE");
+	if (stride_s != NULL && stride_s[0] != '\0' && atoi(stride_s) > 0) {
+		g_pgm_dump.stride = (uint32_t)atoi(stride_s);
+	}
 	if (os_thread_helper_init(&g_pgm_dump.helper) != 0) {
 		g_pgm_dump.enabled = false;
 		return;
@@ -482,6 +487,24 @@ sat_contour_center(int lo, int hi, float origin, float *out)
 }
 
 /*
+ * Parabolic (3-point) sub-pixel peak refinement on one axis: fit through the
+ * neighbour/peak/neighbour values (@p lo, @p c, @p hi) around the integer peak
+ * coordinate @p peak. Writes the refined coordinate to @p out only for a
+ * concave fit (a true peak) whose shift stays within +/-0.5 px.
+ */
+static inline void
+parabolic_subpixel_refine(float lo, float c, float hi, int peak, float *out)
+{
+	const float den = lo - 2.0f * c + hi;
+	if (den < 0.0f) {
+		const float s = 0.5f * (lo - hi) / den;
+		if (s > -0.5f && s < 0.5f) {
+			*out = peak + s;
+		}
+	}
+}
+
+/*
  * Sub-pixel centroid of one blob, plus its centroid measurement variance (R, px^2).
  *
  * Unsaturated: intensity-weighted greysum centre, then a parabolic (3-point)
@@ -620,19 +643,8 @@ compute_greysum(blobwatch *bw,
 		float lx = p[-1], rx = p[1];
 		float ux = p[-frame->stride], dx = p[frame->stride];
 
-		float denx = lx - 2.0f * c + rx;
-		float deny = ux - 2.0f * c + dx;
-		/* Only accept a concave (true peak) fit; clamp the shift to ±0.5 px */
-		if (denx < 0.0f) {
-			float dxs = 0.5f * (lx - rx) / denx;
-			if (dxs > -0.5f && dxs < 0.5f)
-				*led_x = peak_x + dxs;
-		}
-		if (deny < 0.0f) {
-			float dys = 0.5f * (ux - dx) / deny;
-			if (dys > -0.5f && dys < 0.5f)
-				*led_y = peak_y + dys;
-		}
+		parabolic_subpixel_refine(lx, c, rx, peak_x, led_x);
+		parabolic_subpixel_refine(ux, c, dx, peak_y, led_y);
 	}
 }
 
@@ -847,8 +859,8 @@ process_scanline(uint8_t *line,
 			 */
 			if (le < le_end && le->start <= center && le->end >= center) {
 				extent->top = le->top;
-				extent->left = min(extent->start, le->left);
-				extent->right = max(extent->end, le->right);
+				extent->left = MIN(extent->start, le->left);
+				extent->right = MAX(extent->end, le->right);
 				if (le->max_pixel > extent->max_pixel)
 					extent->max_pixel = le->max_pixel;
 				extent->area += le->area;
@@ -915,7 +927,7 @@ find_free_track(uint8_t *tracked)
 	return -1;
 }
 
-void
+static void
 copy_matching_blob(struct blob *to, struct blob *from)
 {
 	to->blob_id = from->blob_id;
@@ -1094,7 +1106,7 @@ recover_dim_blobs(blobwatch *bw,
 			if (blob_w > RECOVER_MAX_WH || blob_h > RECOVER_MAX_WH) {
 				continue;
 			}
-			const float aspect = (float)min(blob_w, blob_h) / (float)max(blob_w, blob_h);
+			const float aspect = (float)MIN(blob_w, blob_h) / (float)MAX(blob_w, blob_h);
 			if (aspect < RECOVER_MIN_ASPECT) {
 				continue;
 			}
@@ -1130,20 +1142,8 @@ recover_dim_blobs(blobwatch *bw,
 			const float lx = row[x - 1], rx = row[x + 1];
 			const float ux = frame->data[(size_t)frame->stride * (y - 1) + x];
 			const float dx = frame->data[(size_t)frame->stride * (y + 1) + x];
-			const float denx = lx - 2.0f * c + rx;
-			const float deny = ux - 2.0f * c + dx;
-			if (denx < 0.0f) {
-				const float s = 0.5f * (lx - rx) / denx;
-				if (s > -0.5f && s < 0.5f) {
-					led_x = (float)x + s;
-				}
-			}
-			if (deny < 0.0f) {
-				const float s = 0.5f * (ux - dx) / deny;
-				if (s > -0.5f && s < 0.5f) {
-					led_y = (float)y + s;
-				}
-			}
+			parabolic_subpixel_refine(lx, c, rx, x, &led_x);
+			parabolic_subpixel_refine(ux, c, dx, y, &led_y);
 
 			const float spread = 0.25f * (float)((bb_r - bb_l + 1) + (bb_b - bb_t + 1));
 			float pos_var_px2 = spread * spread;
@@ -1243,7 +1243,7 @@ process_frame_roi(blobwatch *bw,
 	if (ob->num_blobs >= 2) {
 		uint8_t bmax = 0;
 		for (int i = 0; i < ob->num_blobs; i++)
-			bmax = max(bmax, ob->blobs[i].brightness);
+			bmax = MAX(bmax, ob->blobs[i].brightness);
 		const float span = (float)bmax - (float)bw->blob_required_threshold;
 		if (span > 0.0f) {
 			for (int i = 0; i < ob->num_blobs; i++) {
@@ -1341,31 +1341,16 @@ blobwatch_process_roi(blobwatch *bw,
 	 * queue so capture I/O cannot stall controller tracking. Default dumps every frame but drops if storage
 	 * cannot keep up; set G2_DUMP_FRAMES_BLOCKING=1 for lossless offline-corpus capture, or
 	 * G2_DUMP_FRAMES_STRIDE=N for sparse visual inspection. */
-	{
-		static const char *dump_dir = NULL;
-		static bool dump_init = false;
-		static uint32_t dump_stride = 1;
-		if (!dump_init) {
-			dump_dir = getenv("G2_DUMP_FRAMES");
-			const char *stride_s = getenv("G2_DUMP_FRAMES_STRIDE");
-			if (stride_s != NULL && stride_s[0] != '\0' && atoi(stride_s) > 0) {
-				dump_stride = (uint32_t)atoi(stride_s);
-			}
-			dump_init = true;
-		}
-		if (dump_dir != NULL && dump_dir[0] != '\0' && frame->data != NULL && frame->width > 0 &&
-		    frame->stride >= frame->width) {
-			const uint32_t dump_ctr =
-			    atomic_fetch_add_explicit(&g_pgm_dump_stride_ctr, 1, memory_order_relaxed);
-			if ((dump_ctr % dump_stride) == 0) {
-				char path[512];
-				// Encode cam, frame timestamp (ns, for IMU alignment in offline replay), exposure (the real
-				// controller exposure the matcher needs), source seq (groups the 4 cams of one frame), blobs.
-				snprintf(path, sizeof(path), "%s/cam%u_t%020lld_e%u_s%010lu_n%u.pgm", dump_dir,
-				         bw->cam_id, (long long)frame->timestamp, (unsigned)exposure,
-				         (unsigned long)frame->source_sequence, (unsigned)ob->num_blobs);
-				g2_pgm_dump_enqueue(path, frame);
-			}
+	if (g2_pgm_dump_enabled() && frame->data != NULL && frame->width > 0 && frame->stride >= frame->width) {
+		const uint32_t dump_ctr = atomic_fetch_add_explicit(&g_pgm_dump_stride_ctr, 1, memory_order_relaxed);
+		if ((dump_ctr % g_pgm_dump.stride) == 0) {
+			char path[512];
+			// Encode cam, frame timestamp (ns, for IMU alignment in offline replay), exposure (the real
+			// controller exposure the matcher needs), source seq (groups the 4 cams of one frame), blobs.
+			snprintf(path, sizeof(path), "%s/cam%u_t%020lld_e%u_s%010lu_n%u.pgm", g_pgm_dump.dir,
+			         bw->cam_id, (long long)frame->timestamp, (unsigned)exposure,
+			         (unsigned long)frame->source_sequence, (unsigned)ob->num_blobs);
+			g2_pgm_dump_enqueue(path, frame);
 		}
 	}
 
@@ -1426,8 +1411,8 @@ blobwatch_process_roi(blobwatch *bw,
 				y = b1->y + b1->vy;
 
 				/* Absolute distance */
-				dx = abs(x - b2->x);
-				dy = abs(y - b2->y);
+				dx = fabsf(x - b2->x);
+				dy = fabsf(y - b2->y);
 				distsq = dx * dx + dy * dy;
 
 				if (closest_distsq < 0 || distsq < closest_distsq) {
@@ -1512,31 +1497,6 @@ blobwatch_process_roi(blobwatch *bw,
 #endif
 
 	bw->last_observation = ob;
-}
-
-struct blob *
-blobwatch_find_blob_at(blobwatch *bw, int x, int y)
-{
-	blobservation *ob = bw->last_observation;
-	int i;
-
-	if (ob == NULL) {
-		/* No blobs to match against yet */
-		return NULL;
-	}
-
-	for (i = 0; i < ob->num_blobs; i++) {
-		struct blob *b = ob->blobs + i;
-		int dx = abs(x - b->x);
-		int dy = abs(y - b->y);
-
-		/* Check if the target is outside the bounding box */
-		if (2 * dx > b->width || 2 * dy > b->height)
-			continue;
-		return b;
-	}
-
-	return NULL;
 }
 
 void

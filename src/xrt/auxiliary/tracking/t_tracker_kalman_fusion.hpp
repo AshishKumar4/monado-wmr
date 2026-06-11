@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  PS Move tracker code.
+ * @brief  IMU + optical (constellation) ESKF fusion interface.
  * @author Pete Black <pblack@collabora.com>
  * @author Jakob Bornecrantz <jakob@collabora.com>
  * @author Rylie Pavlik <rylie.pavlik@collabora.com>
@@ -251,6 +251,19 @@ public:
 	debug_get_pose_covariance(double cov6_row_major[36])
 	{
 		(void)cov6_row_major;
+		return false;
+	}
+
+	/*!
+	 * Diagnostics / tests: copy the full 15x15 error-state covariance (row-major), ordered
+	 * [position(3), velocity(3), global orientation(3), accel bias(3), gyro bias(3)]. Lets a test
+	 * assert P's structural health (positive semi-definiteness, cleared cross-covariance blocks)
+	 * after coast/recovery paths. Off the hot path. Returns false if not tracking.
+	 */
+	virtual bool
+	debug_get_state_covariance(double cov15_row_major[225])
+	{
+		(void)cov15_row_major;
 		return false;
 	}
 

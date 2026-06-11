@@ -137,8 +137,6 @@ void
 blobwatch_update_labels(blobwatch *bw, blobservation *ob, uint8_t device_id);
 void
 blobwatch_release_observation(blobwatch *bw, blobservation *ob);
-struct blob *
-blobwatch_find_blob_at(blobwatch *bw, int x, int y);
 
 #ifdef __cplusplus
 }

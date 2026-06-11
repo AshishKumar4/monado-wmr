@@ -41,15 +41,6 @@ enum association_hypothesis_flags
 	ASSOC_HYP_PRIOR_POSITION_UNTRACKED = 0x100,
 };
 
-enum association_state
-{
-	ASSOC_STATE_INERTIAL_SHORT_GAP = 0,
-	ASSOC_STATE_VISUAL_LOCKED = 1,
-	ASSOC_STATE_VISUAL_AMBIGUOUS = 2,
-	ASSOC_STATE_BODY_LOCKED = 3,
-	ASSOC_STATE_CONFUSED = 4,
-};
-
 struct association_blob_ref
 {
 	int16_t view_id;
@@ -61,14 +52,14 @@ struct association_cost_terms
 	float reprojection_nll;
 	float missed_led_nll;
 	float clutter_nll;
-	float matched_evidence_nll;
 	float position_prior_nll;
 	float orientation_prior_nll;
 	float head_anchor_nll;
-	float body_state_nll;
 	float orientation_consensus_nll;
 	float temporal_nll;
 	float joint_contention_delta_nll;
+	//! Per-matched-blob Cauchy reprojection NLL (nats); selection-channel only, not in total_nll.
+	float fit_quality_nll;
 	float total_nll;
 };
 

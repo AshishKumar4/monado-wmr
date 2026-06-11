@@ -89,7 +89,6 @@ struct g2_telem_pose_attempt
 struct g2_telem_candidate
 {
 	uint64_t t_mono_ns;
-	uint64_t hw_ts_ns;
 	uint8_t device_id;
 	uint8_t cam_id;
 	uint8_t stage;
@@ -121,7 +120,6 @@ struct g2_telem_candidate
 struct g2_telem_search
 {
 	uint64_t t_mono_ns;
-	uint64_t hw_ts_ns;
 	uint8_t device_id;
 	uint8_t cam_id;
 	uint8_t pass;
@@ -169,6 +167,22 @@ struct g2_telem_event
 	uint8_t device_id;
 	uint16_t event_type;
 	float value;
+} G2_PACKED;
+
+struct g2_telem_head_pose
+{
+	uint64_t t_mono_ns;
+	float px, py, pz, qx, qy, qz, qw;
+} G2_PACKED;
+
+struct g2_telem_getpose
+{
+	uint64_t t_mono_ns;
+	uint8_t device_id;
+	uint32_t relation_flags;
+	float px, py, pz, qx, qy, qz, qw;
+	float vx, vy, vz;
+	float wx, wy, wz;
 } G2_PACKED;
 
 #if defined(_MSC_VER)
@@ -319,6 +333,8 @@ slurp(const char *dir, const char *name)
 #define N_FRAME 50000
 #define N_POSE 60000
 #define N_FUSION 60000
+#define N_HEAD_POSE 30000
+#define N_GETPOSE 60000
 
 // Emit in chunks well below each ring's capacity, with a yield between chunks so
 // the continuously-draining writer always frees slots ahead of the producer.
@@ -385,6 +401,20 @@ test_peak(const char *dir)
 			pace();
 		}
 	}
+	for (long i = 0; i < N_HEAD_POSE; i++) {
+		g2_telem_head_pose(g2_telem_now_ns(), pose);
+		if ((i % CHUNK) == (CHUNK - 1)) {
+			pace();
+		}
+	}
+	float lin_vel[3] = {0.1f, 0.2f, 0.3f};
+	float ang_vel[3] = {0.01f, 0.02f, 0.03f};
+	for (long i = 0; i < N_GETPOSE; i++) {
+		g2_telem_getpose(1, g2_telem_now_ns(), pose, lin_vel, ang_vel, 0x3f);
+		if ((i % CHUNK) == (CHUNK - 1)) {
+			pace();
+		}
+	}
 	g2_telem_event(0, g2_telem_now_ns(), G2_TELEM_EV_LOCK_ACQUIRED, 1.0f);
 
 	for (int t = 0; t < N_IMU_THREADS; t++) {
@@ -402,6 +432,8 @@ test_peak(const char *dir)
 	long search_bytes = file_size(dir, "search.bin");
 	long fusion_bytes = file_size(dir, "fusion.bin");
 	long event_bytes = file_size(dir, "event.bin");
+	long head_pose_bytes = file_size(dir, "head_pose.bin");
+	long getpose_bytes = file_size(dir, "getpose.bin");
 
 	char *m = slurp(dir, "manifest.json");
 	CHECK(m != NULL, "manifest present");
@@ -412,6 +444,8 @@ test_peak(const char *dir)
 	long search_rs = find_row_size(m, "search");
 	long fusion_rs = find_row_size(m, "fusion");
 	long event_rs = find_row_size(m, "event");
+	long head_pose_rs = find_row_size(m, "head_pose");
+	long getpose_rs = find_row_size(m, "getpose");
 
 	long imu_rows = imu_bytes / imu_rs;
 	long frame_rows = frame_bytes / frame_rs;
@@ -420,6 +454,8 @@ test_peak(const char *dir)
 	long search_rows = search_bytes / search_rs;
 	long fusion_rows = fusion_bytes / fusion_rs;
 	long event_rows = event_bytes / event_rs;
+	long head_pose_rows = head_pose_bytes / head_pose_rs;
+	long getpose_rows = getpose_bytes / getpose_rs;
 
 	fprintf(stderr, "  imu: emitted=%ld written=%ld\n", imu_total, imu_rows);
 	fprintf(stderr, "  frame: emitted=%d written=%ld\n", N_FRAME, frame_rows);
@@ -428,6 +464,8 @@ test_peak(const char *dir)
 	fprintf(stderr, "  search: emitted=%d written=%ld\n", N_POSE, search_rows);
 	fprintf(stderr, "  fusion: emitted=%d written=%ld\n", N_FUSION, fusion_rows);
 	fprintf(stderr, "  event: emitted=1 written=%ld\n", event_rows);
+	fprintf(stderr, "  head_pose: emitted=%d written=%ld\n", N_HEAD_POSE, head_pose_rows);
+	fprintf(stderr, "  getpose: emitted=%d written=%ld\n", N_GETPOSE, getpose_rows);
 
 	CHECK(imu_rows == imu_total, "imu count matches (%ld != %ld)", imu_rows, imu_total);
 	CHECK(frame_rows == N_FRAME, "frame count matches");
@@ -435,6 +473,8 @@ test_peak(const char *dir)
 	CHECK(candidate_rows == N_POSE, "candidate count matches");
 	CHECK(search_rows == N_POSE, "search count matches");
 	CHECK(fusion_rows == N_FUSION, "fusion count matches");
+	CHECK(head_pose_rows == N_HEAD_POSE, "head_pose count matches");
+	CHECK(getpose_rows == N_GETPOSE, "getpose count matches");
 	// event = 1 emitted; with zero overflow there must be NO ring_overflow rows.
 	CHECK(event_rows == 1, "event count matches (zero overflow expected), got %ld", event_rows);
 
@@ -553,6 +593,15 @@ test_offsets(const char *dir)
 	CHKOFF("fusion", g2_telem_fusion, pred_qw);
 	CHKOFF("event", g2_telem_event, event_type);
 	CHKOFF("event", g2_telem_event, value);
+	CHKOFF("head_pose", g2_telem_head_pose, t_mono_ns);
+	CHKOFF("head_pose", g2_telem_head_pose, px);
+	CHKOFF("head_pose", g2_telem_head_pose, qw);
+	CHKOFF("getpose", g2_telem_getpose, device_id);
+	CHKOFF("getpose", g2_telem_getpose, relation_flags);
+	CHKOFF("getpose", g2_telem_getpose, px);
+	CHKOFF("getpose", g2_telem_getpose, qw);
+	CHKOFF("getpose", g2_telem_getpose, vx);
+	CHKOFF("getpose", g2_telem_getpose, wz);
 
 	// row_size in manifest must equal sizeof the packed struct.
 	CHECK(find_row_size(m, "imu") == (long)sizeof(struct g2_telem_imu), "imu row_size");
@@ -562,6 +611,8 @@ test_offsets(const char *dir)
 	CHECK(find_row_size(m, "search") == (long)sizeof(struct g2_telem_search), "search row_size");
 	CHECK(find_row_size(m, "fusion") == (long)sizeof(struct g2_telem_fusion), "fusion row_size");
 	CHECK(find_row_size(m, "event") == (long)sizeof(struct g2_telem_event), "event row_size");
+	CHECK(find_row_size(m, "head_pose") == (long)sizeof(struct g2_telem_head_pose), "head_pose row_size");
+	CHECK(find_row_size(m, "getpose") == (long)sizeof(struct g2_telem_getpose), "getpose row_size");
 
 #undef CHKOFF
 	free(m);
@@ -572,8 +623,8 @@ test_offsets(const char *dir)
  *
  * Test (b): deliberate overrun (tiny ring) -> overflow counted/logged/event row.
  *
- * We can't shrink the production rings, so we slam the smallest ring (event,
- * cap 8192) far faster than the writer drains by emitting a huge tight burst
+ * We can't shrink the production rings, so we slam the event ring (cap 65536)
+ * far faster than the writer drains by emitting a huge tight burst
  * (no yields, no I/O per row) from several threads at once. The writer must
  * fwrite every drained row, so a producer doing only an atomic + memcpy easily
  * outruns it and the ring fills -> overflow.
@@ -618,7 +669,7 @@ test_overflow(const char *dir)
 	g2_telem_init(dir);
 	CHECK(g2_telem_enabled(), "init for overflow");
 
-	// Tight, multi-threaded burst far exceeding the event ring (8192).
+	// Tight, multi-threaded burst far exceeding the event ring (65536).
 	const long burst = (long)N_OVERFLOW_THREADS * OVERFLOW_PER_THREAD;
 	pthread_t th[N_OVERFLOW_THREADS];
 	for (int t = 0; t < N_OVERFLOW_THREADS; t++) {

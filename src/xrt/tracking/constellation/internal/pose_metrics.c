@@ -112,28 +112,6 @@ pose_metrics_prior_orient_cost(const struct xrt_quat *q_cand,
 	return weight * rho;
 }
 
-/* Blob<->LED gate half-axes: the isotropic fixed LED-radius circle. The mutual-exclusion win comes from the
- * GLOBAL one-to-one assignment, not a wider gate, so the gate stays at led_radius_px. The prior-uncertainty
- * params are accepted but unused; widening the gate from them stays a body-only change. */
-void
-pose_metrics_compute_led_gate(double focal_length_px,
-                              double led_depth_m,
-                              double led_lever_arm_m,
-                              double led_radius_px,
-                              const struct xrt_vec3 *pos_error_thresh,
-                              const struct xrt_vec3 *rot_error_thresh,
-                              double *out_gate_ax_px,
-                              double *out_gate_ay_px)
-{
-	(void)focal_length_px;
-	(void)led_depth_m;
-	(void)led_lever_arm_m;
-	(void)pos_error_thresh;
-	(void)rot_error_thresh;
-	*out_gate_ax_px = led_radius_px;
-	*out_gate_ay_px = led_radius_px;
-}
-
 static void
 expand_rect(struct pose_rect *bounds, double x, double y, double w, double h)
 {
@@ -442,8 +420,6 @@ static void
 get_visible_leds_and_bounds(struct xrt_pose *pose,
                             struct t_constellation_led_model *led_model,
                             struct camera_model *calib,
-                            const struct xrt_vec3 *pos_error_thresh,
-                            const struct xrt_vec3 *rot_error_thresh,
                             struct pose_metrics_visible_led_info *visible_led_points,
                             int *num_visible_leds,
                             struct pose_rect *bounds)
@@ -489,11 +465,6 @@ get_visible_leds_and_bounds(struct xrt_pose *pose,
 		double led_radius_px = 4.0;
 		const double led_radius_mm = led->radius_mm;
 		led_radius_px = focal_length * led_radius_mm / led_pos_m->z / 1000.0;
-#if 0
-		printf("LED id %d led_radius_px %f = focal length %f led_radius %f Z = %f m\n",
-		       led_model->leds[i].id, led_radius_px,
-		       focal_length, led_radius_mm, led_pos_m->z);
-#endif
 
 		/* Convert the position to a unit vector for dot product comparison */
 		struct xrt_vec3 view_vec = *led_pos_m;
@@ -503,15 +474,6 @@ get_visible_leds_and_bounds(struct xrt_pose *pose,
 		math_quat_rotate_vec3(&pose->orientation, &leds[i].dir, &normal);
 
 		double facing_dot = m_vec3_dot(view_vec, normal);
-
-#if 0
-		printf ("device %d LED %u pos %f,%f,%f -> %f,%f (pos %f,%f,%f metres) dir %f %f %f dot %f visible %d\n",
-			led_model->id, i, leds[i].pos.x, leds[i].pos.y, leds[i].pos.z,
-			led_pos_px->x, led_pos_px->y,
-			led_pos_m.x, led_pos_m.y, led_pos_m.z,
-			normal.x, normal.y, normal.z, facing_dot,
-			facing_dot < cos(DEG_TO_RAD(180.0 - LED_ANGLE)));
-#endif
 
 		/* The vector to the LED position points out from the camera
 		 * to the LED, but the normal points toward the camera, so
@@ -525,13 +487,11 @@ get_visible_leds_and_bounds(struct xrt_pose *pose,
 			continue;
 		}
 
-		/* Anisotropic gate half-axes from the prior covariance projected at
-		 * this LED's depth. The lever arm for the rotation term is the LED's
-		 * body-frame distance from the model origin (the rotation pivot). */
-		double lever_arm_m = m_vec3_len(led->pos);
-		double gate_ax_px, gate_ay_px;
-		pose_metrics_compute_led_gate(focal_length, led_pos_m->z, lever_arm_m, led_radius_px, pos_error_thresh,
-		                              rot_error_thresh, &gate_ax_px, &gate_ay_px);
+		/* Blob<->LED gate half-axes: the isotropic fixed LED-radius circle. The mutual-exclusion win
+		 * comes from the GLOBAL one-to-one assignment, not a wider gate, so the gate stays at
+		 * led_radius_px; widening it from a prior covariance stays a body-only change. */
+		const double gate_ax_px = led_radius_px;
+		const double gate_ay_px = led_radius_px;
 
 		struct pose_metrics_visible_led_info *led_info = visible_led_points + (*num_visible_leds);
 		led_info->led = leds + i;
@@ -637,20 +597,6 @@ pose_metrics_match_pose_to_blobs(struct xrt_pose *pose,
                                  struct camera_model *calib,
                                  struct pose_metrics_blob_match_info *match_info)
 {
-	/* No prior covariance available here -> isotropic fixed-radius gate. */
-	pose_metrics_match_pose_to_blobs_prior(pose, blobs, num_blobs, NULL, NULL, led_model, calib, match_info);
-}
-
-void
-pose_metrics_match_pose_to_blobs_prior(struct xrt_pose *pose,
-                                       struct blob *blobs,
-                                       int num_blobs,
-                                       const struct xrt_vec3 *pos_error_thresh,
-                                       const struct xrt_vec3 *rot_error_thresh,
-                                       struct t_constellation_led_model *led_model,
-                                       struct camera_model *calib,
-                                       struct pose_metrics_blob_match_info *match_info)
-{
 	struct pose_rect *bounds = &match_info->bounds;
 
 	match_info->reprojection_error = 0.0;
@@ -659,10 +605,8 @@ pose_metrics_match_pose_to_blobs_prior(struct xrt_pose *pose,
 	match_info->data_nll_detection = 0.0;
 	match_info->data_nll_missed_if_matched = 0.0;
 
-	get_visible_leds_and_bounds(pose, led_model, calib, pos_error_thresh, rot_error_thresh, match_info->visible_leds,
-	                            &match_info->num_visible_leds, &match_info->bounds);
-
-	// printf("Bounding box for pose is %f,%f -> %f,%f\n", bounds.left, bounds.top, bounds.right, bounds.bottom);
+	get_visible_leds_and_bounds(pose, led_model, calib, match_info->visible_leds, &match_info->num_visible_leds,
+	                            &match_info->bounds);
 
 	/* Global ONE-TO-ONE assignment (Global Nearest Neighbour): collect every admissible (blob,LED) pair
 	 * within its gate ellipse, rank by reprojection cost, then assign greedily with mutual exclusivity —
@@ -740,7 +684,8 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
                                       int num_blobs,
                                       struct t_constellation_led_model *led_model,
                                       struct camera_model *calib,
-                                      struct pose_rect *out_bounds)
+                                      struct pose_rect *out_bounds,
+                                      struct pose_metrics_blob_match_info *out_match_info)
 {
 	/*
 	 * 1. Project the LED points with the provided pose
@@ -750,11 +695,7 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 	 */
 	struct pose_metrics_blob_match_info blob_match_info;
 
-	/* When we have a prior with error bounds, size the blob<->LED gate from
-	 * its anisotropic per-axis uncertainty; otherwise the fixed-radius gate. */
-	pose_metrics_match_pose_to_blobs_prior(pose, blobs, num_blobs, pose_prior ? pos_error_thresh : NULL,
-	                                       pose_prior ? rot_error_thresh : NULL, led_model, calib,
-	                                       &blob_match_info);
+	pose_metrics_match_pose_to_blobs(pose, blobs, num_blobs, led_model, calib, &blob_match_info);
 
 	assert(led_model->num_leds > 0);
 	assert(num_blobs > 0);
@@ -770,8 +711,6 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 		score->match_flags |= POSE_MATCH_LED_IDS;
 	}
 
-	double error_per_led = score->reprojection_error / score->matched_blobs;
-
 	/* If we have a pose prior, calculate the rotation and translation error and match flags as needed */
 	if (pose_prior) {
 		/* We can't validate a prior without error bounds */
@@ -785,6 +724,8 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 	if (score->matched_blobs < 3) {
 		goto done;
 	}
+
+	double error_per_led = score->reprojection_error / score->matched_blobs;
 
 	/* At this point, we have at least 3 LEDs and their blobs matching */
 	if (POSE_HAS_FLAGS(score, POSE_MATCH_POSITION | POSE_MATCH_ORIENT)) {
@@ -830,14 +771,11 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 			score->match_flags |= POSE_MATCH_STRONG;
 	}
 
-#if 0
-	printf ("score for pose is %u matched %u unmatched %u visible %f error\n",
-		score->matched_blobs, score->unmatched_blobs, score->visible_leds, score->reprojection_error);
-#endif
-
 done:
 	if (out_bounds)
 		*out_bounds = blob_match_info.bounds;
+	if (out_match_info)
+		*out_match_info = blob_match_info;
 }
 
 void
@@ -850,16 +788,10 @@ pose_metrics_evaluate_pose(struct pose_metrics *score,
                            struct pose_rect *out_bounds)
 {
 	pose_metrics_evaluate_pose_with_prior(score, pose, false, NULL, NULL, NULL, blobs, num_blobs, led_model, calib,
-	                                      out_bounds);
+	                                      out_bounds, NULL);
 }
 
 /* Return true if new_score is for a more likely pose than old_score */
-bool
-pose_metrics_score_is_better_pose(struct pose_metrics *old_score, struct pose_metrics *new_score)
-{
-	return pose_metrics_score_is_better_pose_prior(old_score, 0.0, new_score, 0.0);
-}
-
 bool
 pose_metrics_score_is_better_pose_prior(struct pose_metrics *old_score,
                                         double old_prior_cost,

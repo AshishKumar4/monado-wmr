@@ -320,14 +320,14 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 			if ((flags & DEBUG_DRAW_FLAG_BLOB_IDS) && (LED_LOCAL_ID(b->led_id) != LED_INVALID_ID)) {
 				cv::Point2f loc = cv::Point2f(start_x + w + 1, start_y);
 				char text[64];
-				sprintf(text, "%d", LED_LOCAL_ID(b->led_id));
+				snprintf(text, sizeof(text), "%d", LED_LOCAL_ID(b->led_id));
 				cv::putText(rgbOutMat, text, loc, cv::FONT_HERSHEY_PLAIN, 1.0, cvCol);
 			}
 
 			if ((flags & DEBUG_DRAW_FLAG_BLOB_UNIQUE_IDS)) {
 				cv::Point2f loc = cv::Point2f(start_x + w + 1, start_y + 10 + 1);
 				char text[64];
-				sprintf(text, "%u", b->blob_id);
+				snprintf(text, sizeof(text), "%u", b->blob_id);
 				cv::putText(rgbOutMat, text, loc, cv::FONT_HERSHEY_PLAIN, 1.0, cvCol);
 			}
 #endif

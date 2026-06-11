@@ -132,6 +132,25 @@ undistort_blob_points(std::vector<cv::Point2f> in_points,
 	}
 }
 
+/* vrserver statically links its own C++ EH runtime, so a cv::Exception thrown inside the live driver
+ * unwinds past our catch blocks and aborts the process. These finite-input preconditions keep the
+ * OpenCV solvers off their CV_Error paths; the catch blocks below only protect offline tools. */
+static bool
+points_finite(const std::vector<cv::Point3f> &p3d, const std::vector<cv::Point2f> &p2d)
+{
+	for (const cv::Point3f &p : p3d) {
+		if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+			return false;
+		}
+	}
+	for (const cv::Point2f &p : p2d) {
+		if (!std::isfinite(p.x) || !std::isfinite(p.y)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 /* Re-gate then Levenberg-Marquardt refine: reproject (rvec,tvec) over all correspondences, keep the
  * ones within `thresh`, and LM-refine over that set in place. Returns the inlier count used. Shared by
  * the polish + re-gate passes so the project-filter-refine logic lives in one place. */
@@ -497,18 +516,13 @@ ransac_pnp_pose_with_twin(struct xrt_pose *pose,
 	cv::Mat inliers;
 	const int iterationsCount = 100;
 	const float confidence = 0.99f;
-	cv::Mat dummyK = cv::Mat::eye(3, 3, CV_64FC1);
-	cv::Mat dummyD = cv::Mat::zeros(4, 1, CV_64FC1);
+	/* RANSAC stays the labelled-set solver: a direct SQPnP-on-all-points + all-inlier gate was tried
+	 * (2026-06-11) and regressed the dropout matrices (blackout geomean 48.57 -> 47.45, five cells down)
+	 * for only ~3% wall — best-of-100 genuinely beats one global solve here. Do not re-walk. */
+	static const cv::Mat dummyK = cv::Mat::eye(3, 3, CV_64FC1);
+	static const cv::Mat dummyD = cv::Mat::zeros(4, 1, CV_64FC1);
 	cv::Mat rvec = cv::Mat::zeros(3, 1, CV_64FC1);
 	cv::Mat tvec = cv::Mat::zeros(3, 1, CV_64FC1);
-	cv::Mat R = cv::Mat::zeros(3, 3, CV_64FC1);
-
-	tvec.at<double>(0) = pose->position.x;
-	tvec.at<double>(1) = pose->position.y;
-	tvec.at<double>(2) = pose->position.z;
-
-	quat_to_3x3(R, &pose->orientation);
-	cv::Rodrigues(R, rvec);
 
 	/* count identified leds */
 	for (i = 0; i < num_blobs; i++) {
@@ -563,8 +577,14 @@ ransac_pnp_pose_with_twin(struct xrt_pose *pose,
 	/* 3 pixel reprojection threshold (normalised by focal since we solve in normalised coords) */
 	const float reprojectionError = 3.0f / calib->calib.fx;
 
-	cv::solvePnPRansac(list_points3d, list_points2d_undistorted, dummyK, dummyD, rvec, tvec, false, iterationsCount,
-	                   reprojectionError, confidence, inliers, flags);
+	if (!points_finite(list_points3d, list_points2d_undistorted)) {
+		return false;
+	}
+
+	if (!cv::solvePnPRansac(list_points3d, list_points2d_undistorted, dummyK, dummyD, rvec, tvec, false,
+	                        iterationsCount, reprojectionError, confidence, inliers, flags)) {
+		return false;
+	}
 
 	/* SQPnP-RANSAC gives a good global estimate, but the LM reprojection refinement is what drives the
 	 * per-LED error down (the weak 6-7-inlier poses were accepted at ~2 px). Re-gate + refine twice
@@ -637,19 +657,6 @@ ransac_pnp_tilt_clamp(const struct xrt_pose *pose,
 	return true;
 }
 
-bool
-ransac_pnp_pose(struct xrt_pose *pose,
-                struct blob *blobs,
-                int num_blobs,
-                struct t_constellation_led_model *leds_model,
-                struct camera_model *calib,
-                int *num_leds_out,
-                int *num_inliers)
-{
-	return ransac_pnp_pose_with_twin(pose, blobs, num_blobs, leds_model, calib, num_leds_out, num_inliers,
-	                                 nullptr, nullptr);
-}
-
 int
 pnp_solve_p3p(struct blob *blobs,
               int num_blobs,
@@ -694,10 +701,13 @@ pnp_solve_p3p(struct blob *blobs,
 	cv::Mat K = cv::Mat::eye(3, 3, CV_64FC1);
 	cv::Mat D = cv::Mat::zeros(4, 1, CV_64FC1);
 	std::vector<cv::Mat> rvecs, tvecs;
+	if (!points_finite(p3d, p2d_und)) {
+		return 0;
+	}
 	try {
 		cv::solveP3P(p3d, p2d_und, K, D, rvecs, tvecs, cv::SOLVEPNP_AP3P);
 	} catch (const cv::Exception &) {
-		return 0;
+		return 0; // offline-only safety; live can't rely on this catch (see points_finite)
 	}
 
 	int written = 0;

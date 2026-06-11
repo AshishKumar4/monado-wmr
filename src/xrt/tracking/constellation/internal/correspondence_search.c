@@ -71,9 +71,6 @@
  *
  */
 
-// #define printf(s,...)
-#define abs(x) ((x) >= 0 ? (x) : -(x))
-
 struct correspondence_search *
 correspondence_search_new(struct camera_model *camera_calib)
 {
@@ -470,7 +467,7 @@ correspondence_search_project_pose(struct correspondence_search *cs,
 	if (mi->search_flags & CS_FLAG_HAVE_POSE_PRIOR) {
 		pose_metrics_evaluate_pose_with_prior(&score, pose, false, &mi->pose_prior, mi->pos_error_thresh,
 		                                      mi->rot_error_thresh, cs->blobs, cs->num_points, leds, cs->calib,
-		                                      NULL);
+		                                      NULL, NULL);
 	} else {
 		pose_metrics_evaluate_pose(&score, pose, cs->blobs, cs->num_points, leds, cs->calib, NULL);
 	}
@@ -732,37 +729,9 @@ check_led_against_model_subset(struct correspondence_search *cs,
 		tmp = m_vec3_sub(checkpos, checkblob);
 		float distance = m_vec3_len(tmp);
 
-#if 0
-		/* Convert back to pixels for the debug output */
-		math_vec3_scalar_mul(cs->calib->calib.fx, &checkpos);
-		math_vec3_scalar_mul(cs->calib->calib.fx, &checkblob);
-
-		printf ("model %u pose candidate orient %f %f %f %f pos %f %f %f\n",
-		    mi->id, pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w,
-		    pose.position.x, pose.position.y, pose.position.z);
-		printf ("4th point @ %f %f offset %f (undistorted) pixels from %f %f (blob_size %f)\n",
-		    checkpos.x, checkpos.y, distance * cs->calib->calib.fx,
-		    checkblob.x, checkblob.y, blobs[3]->max_dist * cs->calib->calib.fx);
-
-#endif
 		/* Check that the 4th point projected to within its blob */
 		if (distance <= blobs[3]->max_dist) {
 			correspondence_search_project_pose(cs, model, &pose, mi, depth);
-#if 0
-          printf ("  P4P points %f,%f,%f -> %f %f\n"
-                  "         %f,%f,%f -> %f %f\n"
-                  "         %f,%f,%f -> %f %f\n"
-                  "         %f,%f,%f -> %f %f\n",
-                x[0][0], x[0][1], x[0][2],
-                y1[0], y1[1],
-                x[1][0], x[1][1], x[1][2],
-                y2[0], y2[1],
-                x[2][0], x[2][1], x[2][2],
-                y3[0], y3[1],
-                xcheck->x, xcheck->y, xcheck->z,
-                checkblob.x,
-                checkblob.y);
-#endif
 		}
 	}
 }
@@ -950,9 +919,14 @@ search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi
 	struct t_constellation_search_model *model = mi->model;
 	int b, l;
 
-	/* clear the info for this model */
+	/* clear the info for this model (poses/depths too: on a no-GOOD-pose search these are
+	 * copied into the failure diagnostics and were previously read uninitialized) */
 	memset(&mi->best_score, 0, sizeof(struct pose_metrics));
 	memset(&mi->best_any_score, 0, sizeof(struct pose_metrics));
+	memset(&mi->best_pose, 0, sizeof(mi->best_pose));
+	memset(&mi->best_any_pose, 0, sizeof(mi->best_any_pose));
+	mi->best_pose_blob_depth = -1;
+	mi->best_pose_led_depth = -1;
 	mi->best_any_pose_blob_depth = -1;
 	mi->best_any_pose_led_depth = -1;
 	mi->best_prior_cost = 0.0;
@@ -1074,78 +1048,6 @@ finish_search_diagnostics(struct correspondence_search *cs, const struct cs_mode
 	cs->last_diag.best_any_blobs_matched = mi->best_any_score.matched_blobs;
 	cs->last_diag.best_any_unmatched_blobs = mi->best_any_score.unmatched_blobs;
 	cs->last_diag.best_any_reproj_err_px = mi->best_any_score.reprojection_error;
-}
-
-bool
-correspondence_search_find_one_pose(struct correspondence_search *cs,
-                                    struct t_constellation_search_model *model,
-                                    enum correspondence_search_flags search_flags,
-                                    struct xrt_pose *pose,
-                                    struct xrt_vec3 *pos_error_thresh,
-                                    struct xrt_vec3 *rot_error_thresh,
-                                    struct xrt_vec3 *up_vector,
-                                    float sigma_tilt_rad,
-                                    float sigma_yaw_rad,
-                                    float huber_knee_sigma,
-                                    float cost_weight,
-                                    struct pose_metrics *score)
-{
-	assert(pose != NULL);
-	assert(score != NULL);
-
-	/* If neither deep nor shallow search was requested, do a full search */
-	if ((search_flags & (CS_FLAG_SHALLOW_SEARCH | CS_FLAG_DEEP_SEARCH)) == 0)
-		search_flags |= CS_FLAG_SHALLOW_SEARCH | CS_FLAG_DEEP_SEARCH;
-
-	struct cs_model_info mi;
-
-	mi.id = model->id;
-	mi.model = model;
-	mi.search_flags = search_flags;
-	mi.match_flags = 0;
-	mi.max_trials = (search_flags & CS_FLAG_BOUNDED_SEARCH) ? BOUNDED_SEARCH_MAX_TRIALS : UINT_MAX;
-
-	if (search_flags & CS_FLAG_HAVE_POSE_PRIOR) {
-		assert(pos_error_thresh != NULL);
-		assert(rot_error_thresh != NULL);
-
-		mi.pose_prior = *pose;
-		mi.pos_error_thresh = pos_error_thresh;
-		mi.rot_error_thresh = rot_error_thresh;
-	}
-
-	if (search_flags & CS_FLAG_TRUST_PRIOR_ORIENT) {
-		/* The anisotropic soft prior-orientation cost needs the prior + the camera-frame world-up. */
-		assert((search_flags & CS_FLAG_HAVE_POSE_PRIOR) != 0);
-		assert(up_vector != NULL);
-		mi.up_vector = *up_vector;
-		mi.sigma_tilt_rad = sigma_tilt_rad;
-		mi.sigma_yaw_rad = sigma_yaw_rad;
-		mi.huber_knee_sigma = huber_knee_sigma;
-		mi.cost_weight = cost_weight;
-	}
-
-	if (search_pose_for_model(cs, &mi) && (mi.match_flags & POSE_MATCH_GOOD)) {
-		finish_search_diagnostics(cs, &mi);
-		*pose = mi.best_pose;
-		*score = mi.best_score;
-
-		DEBUG_TIMING("# Best match for model %d was %d points out of %d with error %f pixels^2\n", mi.id,
-		             mi.best_score.matched_blobs, mi.best_score.visible_leds, mi.best_score.reprojection_error);
-		DEBUG_TIMING("# Found at LED depth %d blob depth %d after %f ms of %f ms\n", mi.best_pose_led_depth,
-		             mi.best_pose_blob_depth,
-		             (float)(mi.best_pose_found_time - mi.search_start_time) / 1000000.0,
-		             (float)(os_monotonic_get_ns() - mi.search_start_time) / 1000000.0);
-		DEBUG_TIMING("# pose orient %f %f %f %f pos %f %f %f\n", mi.best_pose.orientation.x,
-		             mi.best_pose.orientation.y, mi.best_pose.orientation.z, mi.best_pose.orientation.w,
-		             mi.best_pose.position.x, mi.best_pose.position.y, mi.best_pose.position.z);
-		return true;
-	}
-
-	finish_search_diagnostics(cs, &mi);
-	*pose = mi.best_pose;
-	*score = mi.best_score;
-	return false;
 }
 
 int

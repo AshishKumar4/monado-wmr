@@ -1218,6 +1218,86 @@ TEST_CASE("kalman: stale recovery LED fold clears stale velocity correlations")
 	CHECK(norm(recovered.raw_velocity) < 0.20f);
 }
 
+TEST_CASE("kalman: moving stale recovery re-anchors and re-converges a wrong coast velocity without spikes")
+{
+	// The stationary recovery branch zeroes velocity; the moving branch keeps the dead-reckoned
+	// coast velocity. Reverse the true motion mid-coast so that kept velocity is wrong-signed,
+	// then verify recovery re-anchors position, stays bounded, and converges to the true velocity.
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+
+	const float vx = 0.5f;
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	int64_t t = 1000000;
+	xrt_vec3 truth = {0.0f, 0.0f, 1.0f};
+	for (int i = 0; i < 150; i++) {
+		feed_pose(kf.get(), t, truth, IDENTITY_QUAT);
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		truth.x += vx * (float)DT_NS / 1e9f;
+		t += DT_NS;
+	}
+
+	// 600 ms optical dropout; the true motion reverses while the filter dead-reckons forward.
+	for (int i = 0; i < 300; i++) {
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		truth.x -= vx * (float)DT_NS / 1e9f;
+		t += DT_NS;
+	}
+	double optical_age_ms = 0.0;
+	REQUIRE(kf->debug_get_last_optical_age_ms(t, &optical_age_ms));
+	REQUIRE(optical_age_ms > 500.0);
+
+	LEDCameraView view{};
+	view.fx = 400.0f;
+	view.fy = 400.0f;
+	view.cx = 320.0f;
+	view.cy = 240.0f;
+	view.cam_world_orient = IDENTITY_QUAT;
+	view.cam_world_pos = ZERO_VEC;
+	const std::array<xrt_vec3, 6> leds = {
+	    xrt_vec3{-0.05f, 0.0f, 0.0f}, xrt_vec3{0.05f, 0.0f, 0.0f},  xrt_vec3{0.0f, -0.05f, 0.0f},
+	    xrt_vec3{0.0f, 0.05f, 0.0f}, xrt_vec3{0.035f, 0.035f, 0.0f}, xrt_vec3{-0.035f, -0.035f, 0.0f},
+	};
+	std::vector<LEDObservation> obs;
+	for (const xrt_vec3 &led : leds) {
+		const xrt_vec3 world_led = {truth.x + led.x, truth.y + led.y, truth.z + led.z};
+		LEDObservation o{};
+		o.led_obj = led;
+		o.observed_px = {
+		    (float)(view.fx * (world_led.x / world_led.z) + view.cx),
+		    (float)(view.fy * (world_led.y / world_led.z) + view.cy),
+		};
+		obs.push_back(o);
+	}
+	REQUIRE(kf->process_led_observations(t, obs, view, nullptr, 1000.0f, true, nullptr) >= 4.0f);
+
+	xrt_space_relation reacquired{};
+	kf->get_prediction(t, &reacquired, nullptr);
+	CHECK(reacquired.pose.position.x == Approx(truth.x).margin(0.08));
+	kalman_fusion_oov_debug recovered{};
+	REQUIRE(kf->debug_get_oov_report(t, nullptr, &recovered));
+	REQUIRE(std::isfinite(norm(recovered.raw_velocity)));
+	CHECK(norm(recovered.raw_velocity) < 2.0f);
+
+	// Subsequent optical along the (reversed) true trajectory: bounded throughout, converged at the end.
+	for (int i = 0; i < 150; i++) {
+		feed_pose(kf.get(), t, truth, IDENTITY_QUAT);
+		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
+		truth.x -= vx * (float)DT_NS / 1e9f;
+		t += DT_NS;
+		xrt_space_relation rel{};
+		kf->get_prediction(t, &rel, nullptr);
+		REQUIRE(std::isfinite(rel.pose.position.x));
+		REQUIRE(std::abs(rel.pose.position.x - truth.x) < 0.6f);
+	}
+	kalman_fusion_oov_debug settled{};
+	REQUIRE(kf->debug_get_oov_report(t, nullptr, &settled));
+	CHECK(settled.raw_velocity.x == Approx(-vx).margin(0.3));
+	xrt_space_relation final_rel{};
+	kf->get_prediction(t, &final_rel, nullptr);
+	CHECK(final_rel.pose.position.x == Approx(truth.x).margin(0.05));
+}
+
 TEST_CASE("kalman: applies an optical pose that lags the filter clock")
 {
 	// With continuous IMU integration the filter clock tracks the latest
@@ -5129,6 +5209,104 @@ TEST_CASE("kalman: weak-DOF covariance floor keeps depth uncertainty from collap
 	CHECK(min6 >= -1e-9); // full joint pose covariance stays PSD after the weak-DOF floor
 }
 
+TEST_CASE("kalman: post-coast recovery keeps P positive semi-definite with coast-era crosses cleared")
+{
+	// A >2 s optical coast grows the pos/vel/ori <-> bias cross-covariances. The recovery prior
+	// overwrites the [pos,vel,ori] diagonals (LOST_POS_VAR/P0_VEL/LOST_ORI_VAR); retaining the
+	// coast-grown cross terms under those smaller diagonals can leave P indefinite and leaks the
+	// recovery innovation into the bias states through invalidated correlations, so the recovery
+	// must clear them (reset_covariance_block at every recovery overwrite). With a cleared prior
+	// the per-LED fold cannot re-create bias crosses in the same update (K's bias rows are
+	// P0(bias,[pos,ori])·H^T = 0), so right after the recovery call they are exactly zero.
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+	const LedModel led = make_led_model();
+	const Cam cam[2] = {make_cam(-0.06), make_cam(+0.06)};
+	const LEDCameraView view[2] = {make_view(cam[0]), make_view(cam[1])};
+	std::mt19937 rng(0xC0457);
+
+	const double imu_dt = 1.0 / 200.0;
+	const int64_t imu_dt_ns = (int64_t)(imu_dt * 1e9);
+	int64_t ts = 1000000;
+	double t = 0.0;
+	eskf_bootstrap(kf.get(), ts, t);
+
+	double next_opt = t;
+	auto run = [&](double dur, double bias_y, bool fold) {
+		double t_end = t + dur;
+		while (t < t_end) {
+			GTPose g = gt_pose(t);
+			xrt_vec3 a = gen_accel_body(g.q, gt_accel_world(t));
+			a.y += (float)bias_y;
+			feed_imu(kf.get(), ts, a, to_xrt_vec3(gt_gyro_body(t)));
+			t += imu_dt;
+			ts += imu_dt_ns;
+			if (fold && t >= next_opt) {
+				GTPose go = gt_pose(t);
+				feed_pose(kf.get(), ts, to_xrt_vec3(go.p), to_xrt_quat(go.q));
+				eskf_feed_leds(kf.get(), ts, go, led, cam, view, rng, 1.0, 0);
+				next_opt += 1.0 / 60.0;
+			}
+		}
+	};
+	run(1.0, 0.0, true);  // locked tracking
+	run(2.5, 0.2, false); // long coast: well past OPTICAL_FREEZE_NS, drifts but stays in the widened gate
+
+	// Re-acquire with ONE clean >=4-LED single-view frame: position_gap_stale with no recent LED
+	// evidence engages the recovery gate, and enough folded LEDs adopt the widened prior — the
+	// recovery overwrite site under test. A single call so nothing runs after the recovery fold.
+	GTPose g = gt_pose(t);
+	std::vector<LEDObservation> obs;
+	for (size_t k = 0; k < led.pos.size(); k++) {
+		V3 pw = g.p + q_rot(g.q, led.pos[k]);
+		V3 nw = q_rot(g.q, led.normal[k]);
+		if (dot(nw, pw - cam[0].C) >= 0) {
+			continue; // back-facing
+		}
+		double u, vy;
+		if (!project_px(cam[0], world_to_cam(cam[0], pw), u, vy)) {
+			continue;
+		}
+		LEDObservation o;
+		o.observed_px = xrt_vec2{(float)u, (float)vy};
+		o.led_obj = to_xrt_vec3(led.pos[k]);
+		obs.push_back(o);
+	}
+	REQUIRE((int)obs.size() >= 4);
+	const float folded = kf->process_led_observations(ts, obs, view[0], nullptr, 1000.0f, true, nullptr);
+	REQUIRE(folded >= 4.0f);
+
+	double P15[225];
+	REQUIRE(kf->debug_get_state_covariance(P15));
+	cv::Mat P(15, 15, CV_64F);
+	for (int r = 0; r < 15; r++)
+		for (int c = 0; c < 15; c++)
+			P.at<double>(r, c) = P15[r * 15 + c];
+	// (a) Structural health: the full error-state covariance is PSD right after the recovery.
+	cv::Mat Psym = 0.5 * (P + P.t());
+	cv::Mat ev;
+	cv::eigen(Psym, ev); // symmetric -> real eigenvalues, descending
+	const double min_ev = ev.at<double>(14);
+	INFO("min 15x15 covariance eigenvalue after recovery = " << min_ev);
+	CHECK(min_ev >= -1e-9);
+
+	// (b) The crosses the recovery clears are actually cleared at the recovery instant:
+	// [pos,vel,ori] <-> [accel bias, gyro bias] and pos <-> vel.
+	constexpr int EP = 0, EV = 3, ET = 6, EBA = 9;
+	double max_bias_cross = 0.0;
+	for (int r = EP; r < ET + 3; r++)
+		for (int c = EBA; c < 15; c++)
+			max_bias_cross = std::max(max_bias_cross, std::abs(P15[r * 15 + c]));
+	double max_pos_vel_cross = 0.0;
+	for (int r = EP; r < EP + 3; r++)
+		for (int c = EV; c < EV + 3; c++)
+			max_pos_vel_cross = std::max(max_pos_vel_cross, std::abs(P15[r * 15 + c]));
+	INFO("max |P([pos,vel,ori],bias)| = " << max_bias_cross
+	                                      << ", max |P(pos,vel)| = " << max_pos_vel_cross);
+	CHECK(max_bias_cross < 1e-9);
+	CHECK(max_pos_vel_cross < 1e-9);
+}
+
 // F1 regression: the per-LED reprojection orientation Jacobian H_theta MUST use the GLOBAL (world/left)
 // angular-error convention dpi*(-R_cw*[R*led_obj]_x), matching the filter's inject/propagation/gravity/pose
 // channels. The body/local form dpi*(-R_cw*R*[led_obj]_x) coincides only at R≈I (so it self-masks on
@@ -5331,6 +5509,69 @@ TEST_CASE("kalman: a reordered late IMU sample folds exactly as if it had arrive
 	CHECK(std::abs(r_drop.pose.position.x - r_in.pose.position.x) > 1e-3);
 }
 
+TEST_CASE("kalman: optical OOSM rewind across a rest run replays stance/scale state exactly")
+{
+	// A lagged OPTICAL pose rewinds to the anchor checkpoint and replays the IMU log. If the
+	// IMU-side stance state (rest_count, accel_scale, scale_bootstrapped) is not part of the
+	// checkpoint, the replay continues the CURRENT rest run instead of the anchor's, ZUPT gates
+	// on future information, and the per-stance scale EMA re-applies to the same rest samples —
+	// nondeterministically drifting a PERSISTED calibration. Two filters, identical information;
+	// one receives the optical in sequence, one late (after a rest run whose |a| != g so the
+	// scale EMA visibly moves). They must end bit-equal in scale and tightly equal in state.
+	auto in_order = KalmanFusionInterface::create();
+	auto late_opt = KalmanFusionInterface::create();
+	REQUIRE(in_order != nullptr);
+	REQUIRE(late_opt != nullptr);
+
+	int64_t t = 1000000;
+	int64_t t2 = 1000000;
+	b3a_lock(in_order.get(), t);
+	b3a_lock(late_opt.get(), t2);
+	REQUIRE(t == t2);
+
+	const xrt_vec3 gyro_move = {0.3f, 0.0f, 0.0f};
+	const xrt_vec3 accel_push = make_accel_body(IDENTITY_QUAT, {1.5f, 0.0f, 0.0f});
+	// Rest with |a| = 9.70: inside ZUPT_ACCEL_BAND so it counts as stance, but off g so the
+	// per-sample scale EMA moves — double-replay shifts the scale measurably.
+	xrt_vec3 accel_rest_off = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	const float off_k = 9.70f / 9.81f;
+	accel_rest_off.x *= off_k;
+	accel_rest_off.y *= off_k;
+	accel_rest_off.z *= off_k;
+
+	const int n_move = 16, n_rest = 14;
+	std::vector<int64_t> ts(n_move + n_rest);
+	for (size_t i = 0; i < ts.size(); i++) {
+		ts[i] = t + (int64_t)i * DT_NS;
+	}
+	const int64_t t_opt = ts[13] + DT_NS / 2; // optical lands mid-motion, before the rest run
+	auto sample_at = [&](int i, xrt_vec3 *accel, xrt_vec3 *gyro) {
+		*accel = i < n_move ? accel_push : accel_rest_off;
+		*gyro = i < n_move ? gyro_move : ZERO_VEC;
+	};
+
+	for (size_t i = 0; i < ts.size(); i++) {
+		xrt_vec3 a, w;
+		sample_at((int)i, &a, &w);
+		feed_imu(in_order.get(), ts[i], a, w);
+		feed_imu(late_opt.get(), ts[i], a, w);
+		if (ts[i] < t_opt && (i + 1 >= ts.size() || ts[i + 1] > t_opt)) {
+			feed_pose(in_order.get(), t_opt, ZERO_VEC, IDENTITY_QUAT); // in sequence
+		}
+	}
+	feed_pose(late_opt.get(), t_opt, ZERO_VEC, IDENTITY_QUAT); // lagged: rewind + replay the rest run
+
+	const int64_t when = ts.back();
+	xrt_space_relation r_in{}, r_late{};
+	in_order->get_prediction(when, &r_in, nullptr);
+	late_opt->get_prediction(when, &r_late, nullptr);
+	REQUIRE(std::isfinite(r_late.pose.position.x));
+	CHECK(late_opt->debug_get_accel_scale() == Approx(in_order->debug_get_accel_scale()).margin(1e-9));
+	CHECK(r_late.pose.position.x == Approx(r_in.pose.position.x).margin(1e-4));
+	CHECK(r_late.pose.position.y == Approx(r_in.pose.position.y).margin(1e-4));
+	CHECK(r_late.pose.position.z == Approx(r_in.pose.position.z).margin(1e-4));
+}
+
 TEST_CASE("kalman: an out-of-horizon late IMU sample is folded best-effort without destabilising")
 {
 	// A late sample older than the rewind horizon (the OOSM anchor) cannot be replayed exactly, but its
@@ -5381,6 +5622,103 @@ TEST_CASE("kalman: an out-of-horizon late IMU sample is folded best-effort witho
 	kf->get_prediction(t, &recov, nullptr);
 	CHECK(recov.pose.position.x == Approx(home.x).margin(0.05));
 	CHECK((recov.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0);
+}
+
+TEST_CASE("kalman: OOSM optical replay is deterministic (reordered feed ends bit-equal to in-order)")
+{
+	// The OOSM contract is EXACT replay: rewinding to the anchor checkpoint and replaying the IMU
+	// log performs the identical floating-point op sequence the in-order feed performed, so the
+	// final state must be BIT-equal — any epsilon would mask a state the checkpoint forgot to
+	// carry (the F1 bug class: rest_count/accel_scale/scale_bootstrapped/gravity_corrected_q,
+	// whose omission let the replay continue the current rest run and double-apply the per-stance
+	// scale EMA). Two filters get the identical observation set; one receives every optical pose
+	// in sequence, the other receives both late, each rewind crossing a rest run whose |a| = 9.70
+	// (inside the ZUPT accel band but off g, so the scale EMA visibly moves and the accel-scale
+	// channel — the one known to diverge without a complete checkpoint — is exercised).
+	auto in_order = KalmanFusionInterface::create();
+	auto reordered = KalmanFusionInterface::create();
+	REQUIRE(in_order != nullptr);
+	REQUIRE(reordered != nullptr);
+
+	int64_t t = 1000000;
+	int64_t t2 = 1000000;
+	b3a_lock(in_order.get(), t);
+	b3a_lock(reordered.get(), t2);
+	REQUIRE(t == t2);
+
+	const xrt_vec3 gyro_move = {0.3f, 0.0f, 0.0f};
+	const xrt_vec3 accel_push_x = make_accel_body(IDENTITY_QUAT, {1.5f, 0.0f, 0.0f});
+	const xrt_vec3 accel_push_z = make_accel_body(IDENTITY_QUAT, {0.0f, 0.0f, -1.2f});
+	xrt_vec3 accel_rest_off = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	const float off_k = 9.70f / 9.81f;
+	accel_rest_off.x *= off_k;
+	accel_rest_off.y *= off_k;
+	accel_rest_off.z *= off_k;
+
+	// motion(16) | rest(14) | motion(14) | rest(16): two motion->rest transitions.
+	const int N = 60;
+	std::vector<int64_t> ts(N);
+	for (int i = 0; i < N; i++) {
+		ts[i] = t + (int64_t)i * DT_NS;
+	}
+	auto sample_at = [&](int i, xrt_vec3 *accel, xrt_vec3 *gyro) {
+		if (i < 16) {
+			*accel = accel_push_x;
+			*gyro = gyro_move;
+		} else if (i < 30) {
+			*accel = accel_rest_off;
+			*gyro = ZERO_VEC;
+		} else if (i < 44) {
+			*accel = accel_push_z;
+			*gyro = gyro_move;
+		} else {
+			*accel = accel_rest_off;
+			*gyro = ZERO_VEC;
+		}
+	};
+	// Optical poses land mid-motion; the reordered filter receives each one only after the
+	// following rest run is underway, forcing a rewind-replay across the stance transition.
+	const int64_t t_opt1 = ts[13] + DT_NS / 2;
+	const int64_t t_opt2 = ts[41] + DT_NS / 2;
+	const int late1 = 35; // o1 delivered after ts[35]: rewinds across the whole first rest run
+	const int late2 = 51; // o2 delivered after ts[51]: rewinds across the second motion->rest edge
+
+	for (int i = 0; i < N; i++) {
+		xrt_vec3 a, w;
+		sample_at(i, &a, &w);
+		feed_imu(in_order.get(), ts[i], a, w);
+		feed_imu(reordered.get(), ts[i], a, w);
+		if (i == 13) {
+			feed_pose(in_order.get(), t_opt1, ZERO_VEC, IDENTITY_QUAT); // in sequence
+		}
+		if (i == 41) {
+			feed_pose(in_order.get(), t_opt2, ZERO_VEC, IDENTITY_QUAT); // in sequence
+		}
+		if (i == late1) {
+			feed_pose(reordered.get(), t_opt1, ZERO_VEC, IDENTITY_QUAT); // lagged: rewind + replay
+		}
+		if (i == late2) {
+			feed_pose(reordered.get(), t_opt2, ZERO_VEC, IDENTITY_QUAT); // lagged: rewind + replay
+		}
+	}
+
+	const int64_t when = ts.back();
+	xrt_space_relation r_in{}, r_re{};
+	in_order->get_prediction(when, &r_in, nullptr);
+	reordered->get_prediction(when, &r_re, nullptr);
+	REQUIRE(std::isfinite(r_re.pose.position.x));
+
+	CHECK(r_re.pose.position.x == r_in.pose.position.x);
+	CHECK(r_re.pose.position.y == r_in.pose.position.y);
+	CHECK(r_re.pose.position.z == r_in.pose.position.z);
+	CHECK(r_re.pose.orientation.w == r_in.pose.orientation.w);
+	CHECK(r_re.pose.orientation.x == r_in.pose.orientation.x);
+	CHECK(r_re.pose.orientation.y == r_in.pose.orientation.y);
+	CHECK(r_re.pose.orientation.z == r_in.pose.orientation.z);
+	CHECK(r_re.linear_velocity.x == r_in.linear_velocity.x);
+	CHECK(r_re.linear_velocity.y == r_in.linear_velocity.y);
+	CHECK(r_re.linear_velocity.z == r_in.linear_velocity.z);
+	CHECK(reordered->debug_get_accel_scale() == in_order->debug_get_accel_scale());
 }
 
 // ---------------------------------------------------------------------------

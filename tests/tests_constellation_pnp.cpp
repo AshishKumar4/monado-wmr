@@ -1093,12 +1093,13 @@ TEST_CASE("ab-initio prune: skips flipped hypotheses without changing the accept
 	    CS_FLAG_SHALLOW_SEARCH | CS_FLAG_HAVE_POSE_PRIOR | CS_FLAG_TRUST_PRIOR_ORIENT);
 
 	struct xrt_pose found = prior; // seeds mi.pose_prior
-	struct pose_metrics score = {};
-	const bool ok = correspondence_search_find_one_pose(cs, smodel, flags, &found, &pos_thresh, &rot_thresh,
-	                                                    &up, SIGMA_TILT, SIGMA_YAW, HUBER_KNEE, COST_WEIGHT,
-	                                                    &score);
-	REQUIRE(ok);
-	REQUIRE((score.match_flags & POSE_MATCH_GOOD) != 0);
+	struct correspondence_search_result results[CORRESPONDENCE_SEARCH_MAX_RESULTS] = {};
+	const int n_results =
+	    correspondence_search_find_pose_candidates(cs, smodel, flags, &found, &pos_thresh, &rot_thresh, &up,
+	                                               SIGMA_TILT, SIGMA_YAW, HUBER_KNEE, COST_WEIGHT, results,
+	                                               CORRESPONDENCE_SEARCH_MAX_RESULTS);
+	REQUIRE(n_results > 0);
+	REQUIRE((results[0].score.match_flags & POSE_MATCH_GOOD) != 0);
 
 	// 1) The accepted pose is the TRUE twin, not the mirror flip.
 	CHECK(quat_angle_deg(found.orientation, q_true) < 8.0);
@@ -1120,7 +1121,7 @@ TEST_CASE("ab-initio prune: skips flipped hypotheses without changing the accept
 		struct pose_metrics s = {};
 		struct xrt_pose pp = p;
 		pose_metrics_evaluate_pose_with_prior(&s, &pp, false, &prior, &pos_thresh, &rot_thresh, blobs.data(),
-		                                      (int)blobs.size(), &model, &cam, nullptr);
+		                                      (int)blobs.size(), &model, &cam, nullptr, nullptr);
 		const double pc = pose_metrics_prior_orient_cost(&p.orientation, &prior.orientation, &up, SIGMA_TILT,
 		                                                 SIGMA_YAW, HUBER_KNEE, COST_WEIGHT);
 		return std::make_pair(s, s.reprojection_error + pc);
@@ -1144,9 +1145,10 @@ TEST_CASE("ab-initio prune: skips flipped hypotheses without changing the accept
 	enum correspondence_search_flags cold_flags =
 	    (enum correspondence_search_flags)(CS_FLAG_SHALLOW_SEARCH | CS_FLAG_HAVE_POSE_PRIOR);
 	struct xrt_pose found_cold = prior;
-	struct pose_metrics score_cold = {};
-	correspondence_search_find_one_pose(cs_cold, smodel, cold_flags, &found_cold, &pos_thresh, &rot_thresh, &up,
-	                                    SIGMA_TILT, SIGMA_YAW, HUBER_KNEE, COST_WEIGHT, &score_cold);
+	struct correspondence_search_result results_cold[CORRESPONDENCE_SEARCH_MAX_RESULTS] = {};
+	correspondence_search_find_pose_candidates(cs_cold, smodel, cold_flags, &found_cold, &pos_thresh,
+	                                           &rot_thresh, &up, SIGMA_TILT, SIGMA_YAW, HUBER_KNEE, COST_WEIGHT,
+	                                           results_cold, CORRESPONDENCE_SEARCH_MAX_RESULTS);
 	CHECK(cs_cold->num_pose_checks_pruned == 0u);
 
 	correspondence_search_free(cs_cold);

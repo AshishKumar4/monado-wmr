@@ -195,6 +195,16 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 								${OpenCV_INCLUDE_DIRS})
 	add_test(NAME tests_blobwatch COMMAND tests_blobwatch --success --allow-running-no-tests)
 	set_target_properties(tests_blobwatch PROPERTIES FOLDER monado_tests)
+
+	# Detection-eval harness: runs the REAL blobwatch on PGM frames and dumps blob centroids as
+	# JSON, so detector recall/precision can be scored against the annotated LED GT (tools/led_dataset)
+	# independently of the matcher. A tool, not a ctest.
+	add_executable(blobdump blobdump.cpp)
+	target_link_libraries(blobdump PRIVATE constellation_tracker aux_util xrt-interfaces ${OpenCV_LIBRARIES})
+	target_include_directories(
+		blobdump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/tracking/constellation
+						 ${OpenCV_INCLUDE_DIRS})
+	set_target_properties(blobdump PROPERTIES FOLDER monado_tests)
 endif()
 
 if(XRT_BUILD_DRIVER_WMR)
