@@ -3,7 +3,7 @@
 // not the matcher) against the agent-annotated LED GT in tools/led_dataset, so detection recall /
 // precision can be measured authoritatively and apples-to-apples before/after a detector change.
 //
-//   blobdump <pix_thr> <req_thr> <out.json> <frame0.pgm> [frame1.pgm ...]
+//   blobdump <pix_thr> <out.json> <frame0.pgm> [frame1.pgm ...]
 //
 // Each frame is processed by a FRESH blobwatch (no cross-frame history), so the per-frame blob set is
 // exactly what the first-frame detector would produce — the temporal blob-tracker in blobwatch_process
@@ -25,21 +25,20 @@ extern "C" {
 int
 main(int argc, char **argv)
 {
-	if (argc < 5) {
-		fprintf(stderr, "usage: %s <pix_thr> <req_thr> <out.json> <frame.pgm> [frame.pgm ...]\n", argv[0]);
+	if (argc < 4) {
+		fprintf(stderr, "usage: %s <pix_thr> <out.json> <frame.pgm> [frame.pgm ...]\n", argv[0]);
 		return 2;
 	}
 	const uint8_t pix_thr = (uint8_t)atoi(argv[1]);
-	const uint8_t req_thr = (uint8_t)atoi(argv[2]);
-	FILE *out = fopen(argv[3], "wb");
+	FILE *out = fopen(argv[2], "wb");
 	if (!out) {
-		fprintf(stderr, "cannot open %s\n", argv[3]);
+		fprintf(stderr, "cannot open %s\n", argv[2]);
 		return 2;
 	}
 
 	fprintf(out, "{\n");
 	bool first = true;
-	for (int a = 4; a < argc; a++) {
+	for (int a = 3; a < argc; a++) {
 		const std::string path = argv[a];
 		cv::Mat img = cv::imread(path, cv::IMREAD_GRAYSCALE);
 		if (img.empty() || !img.isContinuous()) {
@@ -57,7 +56,7 @@ main(int argc, char **argv)
 		f.timestamp = 1;
 		f.source_sequence = 1;
 
-		blobwatch *bw = blobwatch_new(pix_thr, req_thr, 0);
+		blobwatch *bw = blobwatch_new(pix_thr, 0);
 		blobservation *ob = NULL;
 		blobwatch_process(bw, &f, 0, 0, &ob);
 

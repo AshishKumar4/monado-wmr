@@ -1489,10 +1489,12 @@ wmr_hmd_fill_slam_calibration(struct wmr_hmd *wh)
 static void
 wmr_hmd_fill_constellation_calibration(struct wmr_hmd *wh)
 {
-/* WMR thresholds for the adaptive blob detector. Keep the hard peak floor low enough to retain dim LEDs;
- * local contrast and shape gates handle clutter rejection. */
+/* WMR pixel floor for the adaptive blob detector. Keep the hard peak floor low enough to retain dim
+ * LEDs; local contrast and shape gates handle per-frame clutter rejection and the tracker's static
+ * map handles temporal clutter retention (the old per-frame retention threshold is retired — its only
+ * live effect was anchoring the dim-blob R inflation to the frame's brightest blob, coupling
+ * association margins to room content). */
 #define BLOB_PIXEL_THRESHOLD_WMR 0x8
-#define BLOB_THRESHOLD_MIN_WMR 0x10
 
 	struct t_constellation_camera_group *out = &wh->tracking.constellation_calib;
 
@@ -1504,7 +1506,6 @@ wmr_hmd_fill_constellation_calibration(struct wmr_hmd *wh)
 	                                               .roi = wh->config.tcams[0]->roi,
 	                                               .calibration = wmr_hmd_get_cam_calib(wh, 0),
 	                                               .blob_min_threshold = BLOB_PIXEL_THRESHOLD_WMR,
-	                                               .blob_detect_threshold = BLOB_THRESHOLD_MIN_WMR,
 	                                               .slam_tracking_index = 0};
 
 	// Fill remaining cameras
@@ -1528,7 +1529,6 @@ wmr_hmd_fill_constellation_calibration(struct wmr_hmd *wh)
 		                                               .roi = wh->config.tcams[i]->roi,
 		                                               .calibration = wmr_hmd_get_cam_calib(wh, i),
 		                                               .blob_min_threshold = BLOB_PIXEL_THRESHOLD_WMR,
-		                                               .blob_detect_threshold = BLOB_THRESHOLD_MIN_WMR,
 		                                               .slam_tracking_index = i};
 	}
 

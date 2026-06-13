@@ -52,6 +52,7 @@
 #include "tracking/t_constellation_tracking.h"
 #include "tracking/t_led_models.h"
 #include "tracking/t_tracker_kalman_fusion_c.h"
+#include "wmr/wmr_g2_timing.h"
 
 namespace {
 
@@ -344,7 +345,6 @@ load_camera_group(const std::string &path, struct t_constellation_camera_group *
 		cam->roi.extent.w = (int)jnum(roi, "w");
 		cam->roi.extent.h = (int)jnum(roi, "h");
 		cam->blob_min_threshold = (uint8_t)jnum(c, "blob_min_threshold");
-		cam->blob_detect_threshold = (uint8_t)jnum(c, "blob_detect_threshold");
 		cam->min_threshold = (uint8_t)jnum(c, "min_threshold");
 		cam->slam_tracking_index = (size_t)jnum(c, "slam_tracking_index");
 		i++;
@@ -993,13 +993,28 @@ cb_get_led_model(struct xrt_device *xdev, struct t_constellation_led_model *led_
 	}
 	return true;
 }
+
+// The harness plays the controller-transport role; G2_CTRL_TD_NS applies the same sensor-pair skew
+// production does (wmr_g2_timing.h). The REPLAY default is 0, not the live constant: the skew is
+// per-capture provenance (fit on 2026-06-11 live: +4.8ms; the May-era captures fit ~0), so a replay
+// must use the skew of ITS capture's era - pass the capture's recorded value for new captures.
+static int64_t
+ctrl_optical_td_ns()
+{
+	static int64_t td = INT64_MIN;
+	if (td == INT64_MIN) {
+		const char *e = getenv("G2_CTRL_TD_NS");
+		td = (e != NULL) ? atoll(e) : 0;
+	}
+	return td;
+}
 void
 cb_push_pose(struct xrt_device *xdev, timepoint_ns t, const struct xrt_pose *pose)
 {
 	FakeController *c = reinterpret_cast<FakeController *>(xdev);
 	struct xrt_pose_sample s = {};
 	s.pose = *pose;
-	s.timestamp_ns = t;
+	s.timestamp_ns = t + ctrl_optical_td_ns();
 	struct xrt_pose hp;
 	kalman_fusion_process_pose(c->kf, &s, nullptr, nullptr, 15, ctrl_head_pose(c, t, &hp));
 	std::lock_guard<std::mutex> lk(c->cap_lock);
@@ -1029,8 +1044,8 @@ cb_push_leds(struct xrt_device *xdev, timepoint_ns t, const struct xrt_pose *P_x
 	}
 	// NULL variance => uniform fallback; per-blob variance is carried in obs when available.
 	struct xrt_pose hp;
-	const float folded = kalman_fusion_process_led_observations(c->kf, t, obs, m, &view, nullptr, 8.0f, true,
-	                                                            ctrl_head_pose(c, t, &hp));
+	const float folded = kalman_fusion_process_led_observations(c->kf, t + ctrl_optical_td_ns(), obs, m, &view,
+	                                                            nullptr, 8.0f, true, ctrl_head_pose(c, t, &hp));
 	std::lock_guard<std::mutex> lk(c->cap_lock);
 	if (c->opt_kind == 0) {
 		c->opt_kind = 3;
@@ -1049,8 +1064,8 @@ cb_push_position(struct xrt_device *xdev,
 {
 	FakeController *c = reinterpret_cast<FakeController *>(xdev);
 	struct xrt_pose hp;
-	kalman_fusion_process_position(c->kf, t, position, position_variance, ctrl_head_pose(c, t, &hp),
-	                               refresh_optical_anchor);
+	kalman_fusion_process_position(c->kf, t + ctrl_optical_td_ns(), position, position_variance,
+	                               ctrl_head_pose(c, t, &hp), refresh_optical_anchor);
 	std::lock_guard<std::mutex> lk(c->cap_lock);
 	c->opt_position_valid = true;
 	c->opt_position = *position;
@@ -1063,7 +1078,7 @@ cb_cache_pnp_pose_candidate(struct xrt_device *xdev, timepoint_ns t, const struc
 {
 	FakeController *c = reinterpret_cast<FakeController *>(xdev);
 	struct xrt_pose hp;
-	kalman_fusion_cache_pnp_pose_candidate(c->kf, t, pose, ctrl_head_pose(c, t, &hp));
+	kalman_fusion_cache_pnp_pose_candidate(c->kf, t + ctrl_optical_td_ns(), pose, ctrl_head_pose(c, t, &hp));
 }
 bool
 cb_get_unc(struct xrt_device *xdev, double *ps, double *os, double *ys)
@@ -1074,13 +1089,15 @@ bool
 cb_get_predicted_pose(struct xrt_device *xdev, timepoint_ns when_ns, struct xrt_space_relation *out)
 {
 	// The matcher's raw prior — the filter's honest estimate, NOT the body-lock report (== production driver).
-	kalman_fusion_get_predicted_pose(reinterpret_cast<FakeController *>(xdev)->kf, when_ns, out);
+	kalman_fusion_get_predicted_pose(reinterpret_cast<FakeController *>(xdev)->kf,
+	                                 when_ns + ctrl_optical_td_ns(), out);
 	return true;
 }
 bool
 cb_get_last_optical_age_ms(struct xrt_device *xdev, timepoint_ns when_ns, double *age_ms)
 {
-	return kalman_fusion_debug_get_last_optical_age_ms(reinterpret_cast<FakeController *>(xdev)->kf, when_ns,
+	return kalman_fusion_debug_get_last_optical_age_ms(reinterpret_cast<FakeController *>(xdev)->kf,
+	                                                   when_ns + ctrl_optical_td_ns(),
 	                                                  age_ms);
 }
 bool
@@ -1097,7 +1114,8 @@ cb_predict_gate(struct xrt_device *xdev, timepoint_ns frame_mono_ns, const struc
 	                                      P_xrworld_cam->position};
 	struct kalman_led_observation obs = {};
 	obs.led_obj = *led_obj; // observed_px unused by the gate predictor
-	return kalman_fusion_predict_led_gate(c->kf, frame_mono_ns, &obs, &view, out_zhat, out_S);
+	return kalman_fusion_predict_led_gate(c->kf, frame_mono_ns + ctrl_optical_td_ns(), &obs, &view, out_zhat,
+	                                      out_S);
 }
 void
 cb_noop_frame(struct xrt_device *, uint64_t, uint64_t)

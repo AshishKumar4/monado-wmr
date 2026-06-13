@@ -84,6 +84,21 @@ struct g2_telem_frame
 	uint16_t exposure;
 	uint16_t gain;
 	uint16_t led_intensity;
+	uint16_t dropped_capacity;
+} G2_PACKED;
+
+//! blob stream row: one detected blob with its evidence-accumulating retention class.
+struct g2_telem_blob
+{
+	uint64_t t_mono_ns;
+	uint64_t hw_ts_ns;
+	uint8_t cam_id;
+	float x;
+	float y;
+	uint8_t brightness;
+	uint8_t retention_class;
+	float static_dwell_s;
+	float pos_var_px2;
 } G2_PACKED;
 
 //! pose_attempt stream row.
@@ -166,6 +181,8 @@ struct g2_telem_search
 	float reproj_err_per_match;
 	float unmatched_per_match;
 	float matched_visible_ratio;
+	uint32_t work_spent;
+	uint8_t budget_exhausted;
 } G2_PACKED;
 
 //! fusion stream row. Pose components are stored as named scalar f32 fields (not
@@ -232,7 +249,8 @@ enum g2_telem_stream
 	G2_TELEM_STREAM_EVENT = 6,
 	G2_TELEM_STREAM_HEAD_POSE = 7,
 	G2_TELEM_STREAM_GETPOSE = 8,
-	G2_TELEM_STREAM_COUNT = 9,
+	G2_TELEM_STREAM_BLOB = 9,
+	G2_TELEM_STREAM_COUNT = 10,
 };
 
 
@@ -275,6 +293,14 @@ static const struct g2_field frame_fields[] = {
     F(g2_telem_frame, t_mono_ns, "u64"), F(g2_telem_frame, hw_ts_ns, "u64"), F(g2_telem_frame, cam_id, "u8"),
     F(g2_telem_frame, frame_seq, "u32"), F(g2_telem_frame, n_blobs, "u16"), F(g2_telem_frame, exposure, "u16"),
     F(g2_telem_frame, gain, "u16"), F(g2_telem_frame, led_intensity, "u16"),
+    F(g2_telem_frame, dropped_capacity, "u16"),
+};
+
+static const struct g2_field blob_fields[] = {
+    F(g2_telem_blob, t_mono_ns, "u64"), F(g2_telem_blob, hw_ts_ns, "u64"), F(g2_telem_blob, cam_id, "u8"),
+    F(g2_telem_blob, x, "f32"), F(g2_telem_blob, y, "f32"), F(g2_telem_blob, brightness, "u8"),
+    F(g2_telem_blob, retention_class, "u8"), F(g2_telem_blob, static_dwell_s, "f32"),
+    F(g2_telem_blob, pos_var_px2, "f32"),
 };
 
 static const struct g2_field pose_attempt_fields[] = {
@@ -328,6 +354,7 @@ static const struct g2_field search_fields[] = {
     F(g2_telem_search, unmatched_blobs, "u8"), F(g2_telem_search, reproj_err_px, "f32"),
     F(g2_telem_search, bng_reason_flags, "u32"), F(g2_telem_search, reproj_err_per_match, "f32"),
     F(g2_telem_search, unmatched_per_match, "f32"), F(g2_telem_search, matched_visible_ratio, "f32"),
+    F(g2_telem_search, work_spent, "u32"), F(g2_telem_search, budget_exhausted, "u8"),
 };
 
 static const struct g2_field fusion_fields[] = {
@@ -386,6 +413,8 @@ static const struct g2_stream_desc g2_descs[G2_TELEM_STREAM_COUNT] = {
                                    head_pose_fields, NF(head_pose_fields)},
     [G2_TELEM_STREAM_GETPOSE] = {"getpose", "getpose.bin", sizeof(struct g2_telem_getpose), 131072,
                                  getpose_fields, NF(getpose_fields)},
+    [G2_TELEM_STREAM_BLOB] = {"blob", "blob.bin", sizeof(struct g2_telem_blob), 262144, blob_fields,
+                              NF(blob_fields)},
 };
 
 /* drain_ring dequeues every stream into one fixed 256-byte buffer. */
@@ -393,7 +422,7 @@ _Static_assert(sizeof(struct g2_telem_imu) <= 256 && sizeof(struct g2_telem_fram
                    sizeof(struct g2_telem_pose_attempt) <= 256 && sizeof(struct g2_telem_candidate) <= 256 &&
                    sizeof(struct g2_telem_search) <= 256 && sizeof(struct g2_telem_fusion) <= 256 &&
                    sizeof(struct g2_telem_event) <= 256 && sizeof(struct g2_telem_head_pose) <= 256 &&
-                   sizeof(struct g2_telem_getpose) <= 256,
+                   sizeof(struct g2_telem_getpose) <= 256 && sizeof(struct g2_telem_blob) <= 256,
                "every row struct must fit drain_ring's buffer");
 
 
@@ -936,7 +965,8 @@ g2_telem_frame(uint8_t cam_id,
                uint16_t n_blobs,
                uint16_t exposure,
                uint16_t gain,
-               uint16_t led_intensity)
+               uint16_t led_intensity,
+               uint16_t dropped_capacity)
 {
 	if (!g2_telem_enabled()) {
 		return;
@@ -950,7 +980,34 @@ g2_telem_frame(uint8_t cam_id,
 	row.exposure = exposure;
 	row.gain = gain;
 	row.led_intensity = led_intensity;
+	row.dropped_capacity = dropped_capacity;
 	(void)ring_emit(&g_telem.rings[G2_TELEM_STREAM_FRAME], &row);
+}
+
+void
+g2_telem_blob(uint8_t cam_id,
+              uint64_t hw_ts_ns,
+              float x,
+              float y,
+              uint8_t brightness,
+              uint8_t retention_class,
+              float static_dwell_s,
+              float pos_var_px2)
+{
+	if (!g2_telem_enabled()) {
+		return;
+	}
+	struct g2_telem_blob row = {0};
+	row.t_mono_ns = g2_telem_now_ns();
+	row.hw_ts_ns = hw_ts_ns;
+	row.cam_id = cam_id;
+	row.x = x;
+	row.y = y;
+	row.brightness = brightness;
+	row.retention_class = retention_class;
+	row.static_dwell_s = static_dwell_s;
+	row.pos_var_px2 = pos_var_px2;
+	(void)ring_emit(&g_telem.rings[G2_TELEM_STREAM_BLOB], &row);
 }
 
 void
@@ -1095,7 +1152,9 @@ g2_telem_search(uint8_t device_id,
                 uint32_t bng_reason_flags,
                 float reproj_err_per_match,
                 float unmatched_per_match,
-                float matched_visible_ratio)
+                float matched_visible_ratio,
+                uint32_t work_spent,
+                uint8_t budget_exhausted)
 {
 	if (!g2_telem_enabled()) {
 		return;
@@ -1130,6 +1189,8 @@ g2_telem_search(uint8_t device_id,
 	row.reproj_err_per_match = reproj_err_per_match;
 	row.unmatched_per_match = unmatched_per_match;
 	row.matched_visible_ratio = matched_visible_ratio;
+	row.work_spent = work_spent;
+	row.budget_exhausted = budget_exhausted;
 	(void)ring_emit(&g_telem.rings[G2_TELEM_STREAM_SEARCH], &row);
 }
 

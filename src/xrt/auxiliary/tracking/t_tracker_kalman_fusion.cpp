@@ -135,6 +135,19 @@ namespace {
 	constexpr double REENTRY_MAX_STEP_RAD = 0.10; //!< per-frame angular cap during the ease (~5.7°)
 	constexpr double REENTRY_MAX_ORIENT_SPEED_RAD_S = 9.0; //!< same cap, scaled for low-rate report callers
 	constexpr double REENTRY_MIN_SNAP_RAD = 0.087; //!< only ease angular jumps >= ~5°
+	//! Out-of-view report follow: while optical is stale the raw report steps at the 30 Hz body-anchor
+	//! fold cadence (an 8-10 Hz sawtooth, ~10-15 cm p2p on the 2026-06-11 live capture) and jumps at
+	//! loss transients. The felt report follows it through this first-order time constant — enough to
+	//! flatten the fold cadence, small enough to ride genuine body motion. In-view reports pass through
+	//! untouched (output smoothing of fresh optical was measured to WORSEN moving shake on that capture).
+	constexpr int64_t OOV_FOLLOW_TAU_NS = ms_to_ns(120);
+	//! Hold-model drift floor: a "still" hand still creeps. The out-of-view report target is the
+	//! precision-weighted blend of the dead-reckoned state (variance = the age^2 ramp) and the last
+	//! good optical position held in place (variance = ((|v at loss| + floor)*age)^2): a controller
+	//! lost while still stays freeze-accurate, one lost mid-swing rides the IMU through the blind zone.
+	constexpr double OOV_HOLD_DRIFT_FLOOR_M_S = 0.15;
+	constexpr double OOV_INERTIAL_VEL_ERR_M_S = 0.15;  //!< realistic velocity-error floor at loss
+	constexpr double OOV_INERTIAL_DRIFT_M_S2 = 1.0;    //!< conservative accel-bias drift during coast
 
 	//! Precomputed per-view geometry+intrinsics for the per-LED reprojection (built once per frame).
 	struct LedViewCache
@@ -1166,6 +1179,11 @@ namespace {
 		timepoint_ns m_reentry_last_render_ns{0};
 		bool m_reentry_epoch_blends{false}; //!< this epoch's initial gap >= REENTRY_MIN_SNAP_M (else pass-through)
 		bool m_reentry_epoch_blends_orient{false}; //!< this epoch's initial orient gap >= REENTRY_MIN_SNAP_RAD
+		//! The follow ran in stale (out-of-view) mode; a fresh report after a short gap (no re-entry edge)
+		//! then eases the residual instead of teleporting.
+		bool m_follow_was_stale{false};
+		//! Filter velocity at the last fresh pull: the hold-model scale for the out-of-view blend.
+		Vector3d m_v_at_loss{0, 0, 0};
 		Vector3d m_reentry_cur_pos{0, 0, 0};
 		Quaterniond m_reentry_cur_orient{1, 0, 0, 0}; //!< eased reported orientation (gyro-quat slid on the manifold)
 		//! last_optical_ns at the PREVIOUS position-constraining fold, so capture_body_lock can measure the
@@ -3409,6 +3427,7 @@ namespace {
 		const Eigen::Map<const Vector3d> s_lvel{snap.linear_velocity};
 		Quaterniond orient = est.orientation;
 		const Vector3d vel = est.velocity;
+		Vector3d report_vel = vel;
 		// Abandoned (set-down) controller: body-lock covers brief optical loss, but a sustained loss should
 		// degrade to a visual hold without POSITION_TRACKED instead of dragging a set-down controller forever.
 		const bool report_stale =
@@ -3489,9 +3508,44 @@ namespace {
 		if (stale_tracked_expired && !stale_confident_tracked) {
 			position_trackable = false;
 		}
+		if (report_stale && !position_trackable && !body_lock_abandoned) {
+			// Precision-weighted out-of-view target: dead-reckon vs held last-good. The hold's
+			// expected error is the hand's true displacement, scaled by how fast it was moving at
+			// loss OR is moving now (motion onset during a coast is accel-detectable and must ride;
+			// see OOV_HOLD_DRIFT_FLOOR_M_S). The dead-reckon's expected error uses the realistic
+			// velocity-error floor + bias-drift model, not the worst-case reporting ramp. The follow
+			// below smooths target transitions.
+			const double age_s = time_ns_to_s(optical_age_ns);
+			// Purely kinematic error models: the filter's coast-inflated P already encodes
+			// velocity uncertainty, so adding it here would double-count and drown the blend.
+			const double inertial_err =
+			    (OOV_INERTIAL_VEL_ERR_M_S + 0.5 * OOV_INERTIAL_DRIFT_M_S2 * age_s) * age_s;
+			double v_loss = 0.0;
+			{
+				std::lock_guard<std::mutex> lk(m_reentry_render_lock);
+				v_loss = m_v_at_loss.norm();
+			}
+			const double v_eff = std::max(v_loss, vel.norm()) + OOV_HOLD_DRIFT_FLOOR_M_S;
+			const double hold_var = sq(v_eff * age_s);
+			const double denom = hold_var + sq(inertial_err);
+			if (denom > 1e-12) {
+				const double w_raw = hold_var / denom;
+				const Vector3d hold = Eigen::Map<const Vector3d>{snap.last_good_position};
+				report = w_raw * report + (1.0 - w_raw) * hold;
+			}
+		}
 		if (body_lock_abandoned) {
 			position_trackable = false;
 			moving = false;
+			// A controller lost this long is set down or fully hidden: follow the calm body-carried
+			// point (or hold in place without an anchor) instead of riding the ever-integrating
+			// dead-reckon — an uncalibrated-IMU runaway would otherwise drift visibly to the reach
+			// clamp (the 2026-06-11 dev2 set-down did exactly that).
+			if (have_hmd && snap.body_lock_valid) {
+				report = hmd_pos + Eigen::Map<const Vector3d>{snap.body_offset_world};
+			} else {
+				report = Eigen::Map<const Vector3d>{snap.last_good_position};
+			}
 		}
 
 		// Re-entry ease: on re-acquisition after a coast the state jumps to the fresh fold; ease the reported
@@ -3510,11 +3564,27 @@ namespace {
 				const double gap_rad = 2.0 * std::acos(std::min(1.0, q_dot));
 				m_reentry_epoch_blends_orient = gap_rad >= REENTRY_MIN_SNAP_RAD;
 			}
+			if (!report_stale) {
+				m_v_at_loss = vel;
+			}
 			const double dt = std::max(0.0, time_ns_to_s(when_ns - m_reentry_last_render_ns));
-			const double tau = time_ns_to_s(REENTRY_WINDOW_NS) / 3.0;
-			const double alpha = std::min(1.0, tau > 0.0 ? dt / tau : 1.0);
-			if (edge && m_reentry_epoch_blends) {
+			// One report-follow, bandwidth by regime: re-entry ease (fresh target after a long gap),
+			// short-gap re-entry (fresh target right after a stale follow), or the stale follow itself.
+			// Fresh in-view reports pass through untouched.
+			const bool reentry_blend = edge && m_reentry_epoch_blends;
+			const bool short_gap_ease = !reentry_blend && !report_stale && m_follow_was_stale &&
+			                            (report - m_reentry_cur_pos).norm() >= REENTRY_MIN_SNAP_M;
+			double tau = 0.0;
+			if (reentry_blend || short_gap_ease) {
+				tau = time_ns_to_s(REENTRY_WINDOW_NS) / 3.0;
+			} else if (report_stale && !position_trackable) {
+				// Engage only once TRACKED is already down: lagging the still-confident
+				// 120-170 ms window costs real accuracy where the raw report is honest.
+				tau = time_ns_to_s(OOV_FOLLOW_TAU_NS);
+			}
+			if (tau > 0.0) {
 				const Vector3d target_report = report;
+				const double alpha = std::min(1.0, dt / tau);
 				Vector3d step = alpha * (report - m_reentry_cur_pos);
 				const double max_step = std::max(REENTRY_MAX_STEP_M, REENTRY_MAX_SPEED_M_S * dt);
 				if (step.norm() > max_step) {
@@ -3522,10 +3592,26 @@ namespace {
 				}
 				m_reentry_cur_pos += step;
 				report = m_reentry_cur_pos;
-				reentry_lagged = (report - target_report).norm() > REENTRY_TRACKED_MAX_LAG_M;
+				if (report_stale) {
+					// SteamVR's photon extrapolation runs on the reported velocity; out of view it
+					// must describe the followed path, not the raw dead-reckon velocity.
+					report_vel = dt > 1e-6 ? Vector3d(step / dt) : Vector3d::Zero();
+					const double vn = report_vel.norm();
+					if (vn > REENTRY_MAX_SPEED_M_S) {
+						report_vel *= REENTRY_MAX_SPEED_M_S / vn;
+					}
+				} else if (reentry_blend) {
+					// The honesty contract applies to the LONG-gap re-entry ease only. Applying it
+					// to short-gap eases manufactured a trailing 1-2 frame TRACKED blip per optical
+					// hiccup (88-91% of the 2026-06-12 clutter session's 609 flag flickers were
+					// sub-170ms runs) - flag churn the user feels as wobble. A short-gap ease
+					// converges within ~3 frames under the same step caps.
+					reentry_lagged = (report - target_report).norm() > REENTRY_TRACKED_MAX_LAG_M;
+				}
 			} else {
 				m_reentry_cur_pos = report;
 			}
+			m_follow_was_stale = (report_stale && !position_trackable) || short_gap_ease;
 			Quaterniond orient_target = orient;
 			if (m_reentry_cur_orient.dot(orient_target) < 0.0) {
 				orient_target.coeffs() *= -1.0;
@@ -3550,7 +3636,7 @@ namespace {
 		map_quat(out_relation->pose.orientation) = orient.cast<float>();
 		map_vec3(out_relation->pose.position) = report.cast<float>();
 		if (moving) {
-			map_vec3(out_relation->linear_velocity) = vel.cast<float>();
+			map_vec3(out_relation->linear_velocity) = report_vel.cast<float>();
 		} else {
 			out_relation->linear_velocity = xrt_vec3{0.f, 0.f, 0.f};
 		}

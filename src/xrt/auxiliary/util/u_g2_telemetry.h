@@ -89,6 +89,10 @@ enum g2_telem_event_type
 	G2_TELEM_EV_FRAME_DUMP_DROPPED = 20,
 	G2_TELEM_EV_CAMERA_SOURCE_DELTA = 21,
 	G2_TELEM_EV_ASSOC_RAW_EPIPOLAR_POSITION = 22,
+	/*! Cold-search work units spent this frame (1 unit = 1 P3P trial, pose check = 5).
+	 * Deterministic: <= ASSOC_FRAME_WORK_BUDGET by construction; pairs with TRACKER_FAST_MS
+	 * so units->ms drift on other machines is observable offline. */
+	G2_TELEM_EV_TRACKER_WORK_UNITS = 23,
 };
 
 /* ---- Stream emit functions (POD rows; lock-free; safe from any single producer) ---- */
@@ -97,7 +101,9 @@ enum g2_telem_event_type
 void
 g2_telem_imu(uint8_t device_id, uint64_t hw_ts_ns, float ax, float ay, float az, float gx, float gy, float gz);
 
-/*! Per-camera-frame blob/exposure stats (one row per processed frame per camera). */
+/*! Per-camera-frame blob/exposure stats (one row per processed frame per camera).
+ *  @p dropped_capacity counts qualifying blobs that lost the priority selection at the
+ *  per-frame blob cap (0 on every frame that does not hit the cap). */
 void
 g2_telem_frame(uint8_t cam_id,
                uint64_t hw_ts_ns,
@@ -105,7 +111,23 @@ g2_telem_frame(uint8_t cam_id,
                uint16_t n_blobs,
                uint16_t exposure,
                uint16_t gain,
-               uint16_t led_intensity);
+               uint16_t led_intensity,
+               uint16_t dropped_capacity);
+
+/*! Per-blob retention/centroid row (one per detected blob per camera frame), emitted after the
+ *  tracker's static-clutter map has written the blob's retention class. The authoritative record
+ *  of what the detector kept and how retention classified it — detection P/R/F1 and
+ *  clutter-suppression metrics are scored offline from this stream against projected replay
+ *  poses / hand GT. @p retention_class is enum blob_retention_class. */
+void
+g2_telem_blob(uint8_t cam_id,
+              uint64_t hw_ts_ns,
+              float x,
+              float y,
+              uint8_t brightness,
+              uint8_t retention_class,
+              float static_dwell_s,
+              float pos_var_px2);
 
 /*! Constellation/PnP optical pose attempt. @p outcome: 0=rejected,1=accepted,2=recovered.
  *  @p pose is [px,py,pz, qx,qy,qz,qw] in the camera-relative frame. */
@@ -200,7 +222,9 @@ g2_telem_search(uint8_t device_id,
                 uint32_t bng_reason_flags,
                 float reproj_err_per_match,
                 float unmatched_per_match,
-                float matched_visible_ratio);
+                float matched_visible_ratio,
+                uint32_t work_spent,
+                uint8_t budget_exhausted);
 
 /*! Fusion step: optical observation vs IMU-predicted state -> residual (the SLAM<->IMU
  *  drift). @p outcome: 0=rejected,1=accepted,2=reset. Poses are [px,py,pz,qx,qy,qz,qw]. */

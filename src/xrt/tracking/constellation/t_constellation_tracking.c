@@ -38,14 +38,35 @@
 #include "internal/multicam_triangulate.h"
 #include "internal/ransac_pnp.h"
 #include "internal/sample.h"
+#include "internal/static_map.h"
+#include "internal/work_budget.h"
 #include "internal/yaw_belief.h"
 
 DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
 
-#define ASSOC_COLD_SEARCH_PASSES 2
-#define ASSOC_COLD_PARALLEL_MIN_BLOBS 8
 #define ASSOC_COLD_SEARCH_STARTING_WORKERS 2
 #define ASSOC_COLD_SEARCH_THREADS 4
+
+/* Deterministic cold-search work-unit budget (1 unit = 1 P3P trial, pose check = 5 units; see
+ * correspondence_search.c). ASSOC_FRAME_WORK_BUDGET caps the TOTAL cold-search work per frame
+ * across devices+views. Sized for the G2's 22.2ms median camera period: 40k units x 228ns =
+ * 9.1ms serial worst case, leaving headroom under the 22ms frame budget for blob extraction
+ * (p99 2ms) and the uncharged warm paths (~5ms). The capture-replayed sweep on the band-2
+ * clutter capture measured fast p95 13.3ms with 2/4029 frames >22ms at this cap, vs p95 77ms /
+ * 673 frames >22ms unbudgeted — and the MAX_FAST_QUEUE_SIZE=2 sink queue stops dropping frames.
+ * Every allowance is PRE-ASSIGNED from frame content + tracker state before any search task
+ * runs (never a shared pool drained in completion order), so identical inputs spend identical
+ * units live and offline. The units->ms mapping is machine-specific (228ns is this CPU);
+ * the budget stays deterministic everywhere and the drift is observable via the
+ * G2_TELEM_EV_TRACKER_WORK_UNITS event + the search stream's work_spent field. */
+#define ASSOC_FRAME_WORK_BUDGET 40000u
+/* The rotating full-frame deep-view slot gets twice a shallow-only view's share: the measured
+ * success-trials p50 for full-frame deep passes (46.1k) is ~2x full-frame shallow (22.5k). */
+#define ASSOC_COLD_DEEP_VIEW_WEIGHT 2u
+/* Per-view allowance for the uncovered-view pickup of tracked devices (wave D): 5x the p50 of
+ * today's bounded pickup spend (512 trials) and well under its 9216 deep-tail, so the common
+ * pickup is unchanged while the worst case stays bounded now that BOUNDED_SEARCH is gone. */
+#define ASSOC_COLD_UNCOVERED_VIEW_ALLOWANCE 2560u
 
 #define MIN_ROT_ERROR DEG_TO_RAD(30)
 #define MIN_POS_ERROR 0.10
@@ -369,7 +390,8 @@ telem_emit_search_result(uint8_t device_id,
 	                (uint8_t)diag->best_any_pose_led_depth, diag->best_any_match_flags,
 	                (uint8_t)diag->best_any_leds_visible, (uint8_t)diag->best_any_blobs_matched,
 	                (uint8_t)diag->best_any_unmatched_blobs, diag->best_any_reproj_err_px,
-	                bng_reason_flags, reproj_per_match, unmatched_per_match, matched_visible_ratio);
+	                bng_reason_flags, reproj_per_match, unmatched_per_match, matched_visible_ratio,
+	                diag->work_spent, diag->budget_exhausted);
 }
 
 static void
@@ -386,7 +408,7 @@ telem_emit_search_skip(uint8_t device_id,
 {
 	g2_telem_search(device_id, (uint8_t)view_id, timestamp_ns, (uint8_t)pass, (uint8_t)result,
 	                (uint16_t)flags, prior_tilt_trusted ? 1 : 0, input_blobs, visible_leds, roi_blobs, 0, 0, 0,
-	                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0f, 0, 0.0f, 0.0f, 0.0f);
+	                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0f, 0, 0.0f, 0.0f, 0.0f, 0, 0);
 }
 
 void
@@ -428,8 +450,8 @@ t_constellation_camera_group_dump_json(const struct t_constellation_camera_group
 		        c->P_imu_cam.orientation.w);
 		fprintf(f, "      \"roi\": {\"x\": %d, \"y\": %d, \"w\": %d, \"h\": %d},\n", c->roi.offset.w,
 		        c->roi.offset.h, c->roi.extent.w, c->roi.extent.h);
-		fprintf(f, "      \"blob_min_threshold\": %u, \"blob_detect_threshold\": %u, \"min_threshold\": %u\n",
-		        c->blob_min_threshold, c->blob_detect_threshold, c->min_threshold);
+		fprintf(f, "      \"blob_min_threshold\": %u, \"min_threshold\": %u\n", c->blob_min_threshold,
+		        c->min_threshold);
 		fprintf(f, "    }%s\n", (i + 1 < cams->cam_count) ? "," : "");
 	}
 	fprintf(f, "  ]\n}\n");
@@ -488,6 +510,12 @@ struct constellation_tracker_device
 	bool have_temporal_yaw_prior;
 	struct xrt_quat temporal_yaw_ref_prior;
 
+	/* Rotating full-frame deep-view slot (wave C): which qualifying view gets this device's
+	 * deep cold pass, advanced once per frame the device runs the full-frame wave. Keyed on
+	 * processed-frame count — never wall-clock — so a lost device completes full depth across
+	 * all views within <= n_views frames and the rotation replays deterministically offline. */
+	uint32_t cold_deep_view_rr;
+
 	struct constellation_yaw_belief yaw_belief;
 };
 
@@ -505,9 +533,14 @@ struct constellation_tracker_camera_state
 	blobwatch *bw;
 	int last_num_blobs;
 
-	//! Pose-hypothesis search state used by the unified associator.
-	struct correspondence_search *cs;
-	struct correspondence_search *cold_search[CONSTELLATION_MAX_DEVICES][ASSOC_COLD_SEARCH_PASSES];
+	//! Evidence-accumulating retention: world-anchored static-clutter map for this camera
+	//! (fast thread only; updated right after blob extraction each frame).
+	struct static_map static_map;
+
+	//! Per-device cold-search state for the unified associator: each (camera, device) scope
+	//! task owns one instance, and the waves are serialized by wait_all, so one per device
+	//! suffices (a task runs its shallow and conditional deep pass sequentially on it).
+	struct correspondence_search *cold_search[CONSTELLATION_MAX_DEVICES];
 
 	//! Debug output
 	struct u_sink_debug debug_sink;
@@ -516,6 +549,45 @@ struct constellation_tracker_camera_state
 
 	//! The index into the slam tracking camera array this camera represents
 	size_t slam_tracking_index;
+};
+
+/* One cold-search scope = (device, view, blob set): the unit of work-budget pre-assignment.
+ * A task runs the shallow pass and then — ONLY if its own shallow results produced no GOOD
+ * pose, and only when it owns the deep slot — the deep pass, sequentially, within one
+ * pre-assigned allowance. All outputs are task-local; merging into the shared per-device
+ * hypothesis list happens after u_worker_group_wait_all in fixed (device, view) order, so
+ * nothing about the spend or the results depends on pool completion order. */
+struct association_cold_scope_task
+{
+	struct correspondence_search *cs;
+	struct t_constellation_search_model *search_model;
+	struct blob *blobs;
+	int num_blobs;
+	struct xrt_pose P_cam_obj;
+	struct xrt_vec3 prior_pos_error;
+	struct xrt_vec3 prior_rot_error;
+	struct xrt_vec3 cam_gravity_vector;
+	float prior_yaw_sigma_rad;
+	enum correspondence_search_flags pass_flags[2];
+	uint32_t work_allowance;
+	bool run_deep;
+	uint64_t timestamp_ns;
+	uint8_t device_id;
+	int dev_slot;
+	int view_id;
+	int pass_base;
+	bool prior_tilt_trusted;
+	bool ignore_prior_results;
+
+	/* Task-local outputs: [0] = shallow pass, [1] = conditional deep pass. */
+	bool pass_ran[2];
+	int n_results[2];
+	struct correspondence_search_result results[2][CORRESPONDENCE_SEARCH_MAX_RESULTS];
+	struct correspondence_search_diagnostics diag[2];
+	uint32_t work_spent;
+
+	/* Prior-ROI scopes search a blob subset; it must outlive the push onto the pool. */
+	struct blob roi_blobs[MAX_BLOBS_PER_FRAME];
 };
 
 /*!
@@ -561,12 +633,16 @@ struct t_constellation_tracker
 
 	uint64_t last_fast_analysis_ms;
 	uint64_t last_blob_analysis_ms;
+	uint64_t last_assoc_work_units;
 
 	// Fast tracking thread
 	struct xrt_frame_sink *fast_q_sink;
 	struct xrt_frame_sink fast_process_sink;
 	struct u_worker_thread_pool *cold_search_pool;
 	struct u_worker_group *cold_search_group;
+	//! Scope-task storage for the cold-search waves (one frame in flight on the fast thread;
+	//! each wave uses at most one task per (device, view) and waves are serialized).
+	struct association_cold_scope_task cold_scope_tasks[CONSTELLATION_MAX_DEVICES * CONSTELLATION_MAX_CAMERAS];
 
 	//! Frames fully processed through the pipeline. Lets the offline harness barrier on
 	//! per-frame completion instead of racing a fixed sleep (debug/test only).
@@ -1366,7 +1442,6 @@ association_fold_prior_leds(struct t_constellation_tracker *ct,
 #define ASSOC_COLD_PRIOR_ROI_MIN_MARGIN_PX 96.0f
 #define ASSOC_COLD_PRIOR_ROI_MAX_MARGIN_PX 260.0f
 #define ASSOC_COLD_PRIOR_ROI_ROT_LEVER_M 0.16f
-#define ASSOC_COLD_FULLFRAME_BOUND_TRIGGER 12
 #define ASSOC_POSITION_ONLY_BASE_STD_M 0.06f
 #define ASSOC_POSITION_ONLY_PER_REPROJ_STD_M 0.02f
 #define ASSOC_POSITION_ONLY_SINGLE_VIEW_INFLATE_M 0.04f
@@ -3073,6 +3148,37 @@ association_count_prior_visible_leds_in_view(const struct tracking_sample_device
 	return association_prior_visible_led_bounds(dev_state, view, cam, 64.0f, NULL);
 }
 
+/* Cold-search blob staging order IS the anchor priority: correspondence search tries anchor
+ * blobs in array order inside every LED-combination pass, so under the per-frame work budget
+ * a stable partition with STATIC_CLUTTER blobs last spends trials on live candidates first
+ * and falls through to positively-static blobs only when the live ones fail. Suppression
+ * never removes a blob from the set. */
+static void
+association_partition_static_last(struct blob *blobs, int n)
+{
+	struct blob staged[MAX_BLOBS_PER_FRAME];
+	int n_live = 0, n_static = 0;
+	for (int i = 0; i < n; i++) {
+		if (blobs[i].retention_class == BLOB_RETENTION_STATIC_CLUTTER) {
+			staged[n_static++] = blobs[i];
+		} else {
+			blobs[n_live++] = blobs[i];
+		}
+	}
+	memcpy(blobs + n_live, staged, (size_t)n_static * sizeof(struct blob));
+}
+
+/* Snapshot a view's blobs for a full-frame cold-search task, static-clutter last. The copy also
+ * decouples the task from concurrent label updates on the live observation. */
+static int
+association_stage_search_blobs(const struct tracking_sample_frame *view, struct blob *out_blobs)
+{
+	const int n = view->bwobs->num_blobs < MAX_BLOBS_PER_FRAME ? view->bwobs->num_blobs : MAX_BLOBS_PER_FRAME;
+	memcpy(out_blobs, view->bwobs->blobs, (size_t)n * sizeof(struct blob));
+	association_partition_static_last(out_blobs, n);
+	return n;
+}
+
 struct association_prior_roi_result
 {
 	enum g2_search_result status;
@@ -3153,17 +3259,20 @@ association_build_prior_roi_blobs(const struct tracking_sample_device_state *dev
 		result.status = G2_SEARCH_ROI_SKIP_FULL_EQUIV;
 		return result;
 	}
+	association_partition_static_last(out_blobs, n);
 	result.status = G2_SEARCH_SUCCESS;
 	return result;
 }
 
+/* Wave-C suppression needs STRONG evidence, not merely usable: a mirror flip can be lock/fold
+ * eligible (GOOD, plausible reprojection) and would then suppress the full-frame search that
+ * disambiguates it — the baseline found the true pose at hand-GT frame cam0_150718252458505
+ * via exactly that search while a GOOD-flip-gated wave C reproduced a 135 deg flip there. */
 static bool
-association_work_has_usable_hypothesis(const struct association_device_work *work)
+association_work_has_strong_hypothesis(const struct association_device_work *work)
 {
 	for (int i = 0; work != NULL && i < work->count; i++) {
-		const struct association_pose_hypothesis *hyp = &work->hyps[i];
-		if (association_lock_eligible(hyp) || association_position_only_eligible(hyp) ||
-		    association_led_fold_eligible(hyp)) {
+		if (POSE_HAS_FLAGS(&work->hyps[i].score, POSE_MATCH_STRONG)) {
 			return true;
 		}
 	}
@@ -3219,40 +3328,13 @@ association_work_has_uncovered_blob_view(const struct association_device_work *w
 static void
 association_resort_work(struct association_device_work *work);
 
-struct association_cold_pass_task
-{
-	struct correspondence_search *cs;
-	struct t_constellation_search_model *search_model;
-	struct blob *blobs;
-	int num_blobs;
-	struct xrt_pose P_cam_obj;
-	struct xrt_vec3 prior_pos_error;
-	struct xrt_vec3 prior_rot_error;
-	struct xrt_vec3 cam_gravity_vector;
-	float prior_yaw_sigma_rad;
-	enum correspondence_search_flags flags;
-	uint64_t timestamp_ns;
-	uint8_t device_id;
-	int view_id;
-	int pass;
-	bool prior_tilt_trusted;
-	bool ignore_prior_results;
-	int n_results;
-	struct correspondence_search_result results[CORRESPONDENCE_SEARCH_MAX_RESULTS];
-	struct correspondence_search_diagnostics diag;
-};
-
 static enum correspondence_search_flags
 association_cold_search_flags(const struct tracking_sample_device_state *dev_state,
                               int search_blob_count,
-                              bool bounded_full_frame,
                               int pass,
                               bool trust_prior)
 {
 	enum correspondence_search_flags flags = pass == 0 ? CS_FLAG_SHALLOW_SEARCH : CS_FLAG_DEEP_SEARCH;
-	if (bounded_full_frame) {
-		flags |= CS_FLAG_BOUNDED_SEARCH;
-	}
 	if (trust_prior && dev_state->prior_tilt_trusted) {
 		flags |= CS_FLAG_HAVE_POSE_PRIOR | CS_FLAG_TRUST_PRIOR_ORIENT | CS_FLAG_RETURN_BEST_PARTIAL;
 	}
@@ -3262,193 +3344,135 @@ association_cold_search_flags(const struct tracking_sample_device_state *dev_sta
 	return flags;
 }
 
-static void
-association_run_cold_pass_task(void *ptr)
+/* The shallow->deep fall-through predicate. It keys ONLY on this task's OWN shallow results —
+ * never on the shared per-device hypothesis list, which sibling scopes merge into in pool
+ * completion order — so the work spend is a pure function of the frame. A GOOD task-local
+ * result is the stand-in for "usable": a partial-only shallow result may still become usable
+ * after the multi-view merge, so it conservatively keeps the deep pass (allowance-bounded
+ * either way). NOTE this skip is BEHAVIOR-CHANGING, not free: in the clutter capture's 1426
+ * both-succeed scopes the deep result differed from the shallow one in 99.9% (deep had better
+ * reproj-per-match in 52.9%) — the surviving hypothesis changes on those frames and the
+ * validation battery adjudicates the decision-shape movement. */
+static bool
+association_cold_scope_found_good(const struct association_cold_scope_task *task)
 {
-	struct association_cold_pass_task *task = ptr;
-	struct xrt_pose P_cam_obj = task->P_cam_obj;
-	correspondence_search_set_blobs(task->cs, task->blobs, task->num_blobs);
-	task->n_results = correspondence_search_find_pose_candidates(
-	    task->cs, task->search_model, task->flags, &P_cam_obj, &task->prior_pos_error,
-	    &task->prior_rot_error, &task->cam_gravity_vector, (float)GRAVITY_TILT_TOL,
-	    task->prior_yaw_sigma_rad, (float)FLIP_COST_HUBER_KNEE_SIGMA, (float)FLIP_COST_WEIGHT,
-	    task->results, CORRESPONDENCE_SEARCH_MAX_RESULTS);
-	correspondence_search_get_last_diagnostics(task->cs, &task->diag);
+	/* STRONG, not GOOD: a mirror flip can pass GOOD with plausible reprojection but essentially
+	 * never STRONG (<0.75px at 6+ LEDs). Skipping the deep pass on a merely-GOOD shallow result
+	 * let one gross flip (135 deg tilt) through the hand-GT scorecard; STRONG-only keeps the
+	 * deep pass wherever the shallow result is still flip-ambiguous. */
+	for (int i = 0; i < task->n_results[0]; i++) {
+		if (POSE_HAS_FLAGS(&task->results[0][i].score, POSE_MATCH_STRONG)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static void
-association_merge_cold_pass_task(struct t_constellation_tracker *ct,
-                                 struct association_device_work *work,
-                                 struct tracking_sample_device_state *dev_state,
-                                 struct constellation_tracking_sample *sample,
-                                 const struct association_cold_pass_task *task)
+association_run_cold_scope_task(void *ptr)
 {
-	telem_emit_search_result(task->device_id, task->view_id, task->timestamp_ns, task->pass, task->flags,
-	                         task->n_results > 0, task->prior_tilt_trusted, &task->diag);
-	for (int i = 0; i < task->n_results; i++) {
-		uint16_t flags = task->ignore_prior_results ? ASSOC_HYP_IGNORE_PRIOR : ASSOC_HYP_NONE;
-		if (!POSE_HAS_FLAGS(&task->results[i].score, POSE_MATCH_GOOD)) {
-			flags |= ASSOC_HYP_PARTIAL_ONLY;
+	struct association_cold_scope_task *task = ptr;
+	correspondence_search_set_blobs(task->cs, task->blobs, task->num_blobs);
+	for (int pass = 0; pass < 2; pass++) {
+		if (pass == 1 && (!task->run_deep || association_cold_scope_found_good(task))) {
+			break;
 		}
-		association_add_pose_hypothesis(ct, work, dev_state, sample, task->view_id,
-		                                ASSOC_SOURCE_COLD_SEARCH, flags,
-		                                &task->results[i].pose, true);
+		struct xrt_pose P_cam_obj = task->P_cam_obj;
+		task->n_results[pass] = correspondence_search_find_pose_candidates(
+		    task->cs, task->search_model, task->pass_flags[pass],
+		    task->work_allowance - task->work_spent, &P_cam_obj, &task->prior_pos_error,
+		    &task->prior_rot_error, &task->cam_gravity_vector, (float)GRAVITY_TILT_TOL,
+		    task->prior_yaw_sigma_rad, (float)FLIP_COST_HUBER_KNEE_SIGMA, (float)FLIP_COST_WEIGHT,
+		    task->results[pass], CORRESPONDENCE_SEARCH_MAX_RESULTS);
+		correspondence_search_get_last_diagnostics(task->cs, &task->diag[pass]);
+		task->work_spent += task->diag[pass].work_spent;
+		task->pass_ran[pass] = true;
 	}
 }
 
 static void
-association_search_cold_scope(struct t_constellation_tracker *ct,
-                              struct association_device_work *work,
-                              struct tracking_sample_device_state *dev_state,
-                              struct constellation_tracking_sample *sample,
-                              int view_id,
-                              struct blob *search_blobs,
-                              int search_blob_count,
-                              bool bounded_full_frame,
-                              bool trust_prior,
-                              int pass_base)
+association_merge_cold_scope_task(struct t_constellation_tracker *ct,
+                                  struct association_device_work *work,
+                                  struct tracking_sample_device_state *dev_state,
+                                  struct constellation_tracking_sample *sample,
+                                  const struct association_cold_scope_task *task)
+{
+	for (int pass = 0; pass < 2; pass++) {
+		if (!task->pass_ran[pass]) {
+			continue;
+		}
+		telem_emit_search_result(task->device_id, task->view_id, task->timestamp_ns,
+		                         task->pass_base + pass, task->pass_flags[pass],
+		                         task->n_results[pass] > 0, task->prior_tilt_trusted,
+		                         &task->diag[pass]);
+		for (int i = 0; i < task->n_results[pass]; i++) {
+			uint16_t flags = task->ignore_prior_results ? ASSOC_HYP_IGNORE_PRIOR : ASSOC_HYP_NONE;
+			if (!POSE_HAS_FLAGS(&task->results[pass][i].score, POSE_MATCH_GOOD)) {
+				flags |= ASSOC_HYP_PARTIAL_ONLY;
+			}
+			association_add_pose_hypothesis(ct, work, dev_state, sample, task->view_id,
+			                                ASSOC_SOURCE_COLD_SEARCH, flags,
+			                                &task->results[pass][i].pose, true);
+		}
+	}
+}
+
+static void
+association_init_cold_scope_task(struct t_constellation_tracker *ct,
+                                 struct association_cold_scope_task *task,
+                                 struct tracking_sample_device_state *dev_state,
+                                 struct constellation_tracking_sample *sample,
+                                 int dev_slot,
+                                 int view_id,
+                                 struct blob *blobs,
+                                 int num_blobs,
+                                 bool run_deep,
+                                 bool trust_prior,
+                                 int pass_base)
 {
 	struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
 	struct tracking_sample_frame *view = sample->views + view_id;
 	struct constellation_tracker_camera_state *cam = ct->cam + view_id;
-
-	if (search_blobs == NULL || search_blob_count <= 0) {
-		return;
-	}
-
-	const int pass_count = bounded_full_frame ? 1 : 2;
 	const struct xrt_device *xdev = device->connection != NULL ? device->connection->xdev : NULL;
-	const bool run_parallel = ct->cold_search_group != NULL && pass_count == ASSOC_COLD_SEARCH_PASSES &&
-	                          search_blob_count >= ASSOC_COLD_PARALLEL_MIN_BLOBS &&
-	                          dev_state->dev_index >= 0 &&
-	                          dev_state->dev_index < CONSTELLATION_MAX_DEVICES &&
-	                          cam->cold_search[dev_state->dev_index][0] != NULL &&
-	                          cam->cold_search[dev_state->dev_index][1] != NULL;
 
-	if (run_parallel) {
-		struct association_cold_pass_task tasks[ASSOC_COLD_SEARCH_PASSES] = {0};
-		for (int pass = 0; pass < pass_count; pass++) {
-			struct association_cold_pass_task *task = &tasks[pass];
-			task->cs = cam->cold_search[dev_state->dev_index][pass];
-			task->search_model = device->search_led_model;
-			task->blobs = search_blobs;
-			task->num_blobs = search_blob_count;
-			math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &task->P_cam_obj);
-			task->prior_pos_error = dev_state->prior_pos_error;
-			task->prior_rot_error = dev_state->prior_rot_error;
-			task->cam_gravity_vector = view->cam_gravity_vector;
-			task->prior_yaw_sigma_rad = dev_state->prior_yaw_sigma_rad;
-			task->flags =
-			    association_cold_search_flags(dev_state, search_blob_count, bounded_full_frame, pass, trust_prior);
-			task->timestamp_ns = sample->timestamp;
-			task->device_id = telem_device_id(xdev);
-			task->view_id = view_id;
-			task->pass = pass_base + pass;
-			task->prior_tilt_trusted = dev_state->prior_tilt_trusted;
-			task->ignore_prior_results = !trust_prior;
-			u_worker_group_push(ct->cold_search_group, association_run_cold_pass_task, task);
-		}
-		u_worker_group_wait_all(ct->cold_search_group);
-		for (int pass = 0; pass < pass_count; pass++) {
-			association_merge_cold_pass_task(ct, work, dev_state, sample, &tasks[pass]);
-		}
-		return;
-	}
-
-	correspondence_search_set_blobs(cam->cs, search_blobs, search_blob_count);
-	for (int pass = 0; pass < pass_count; pass++) {
-		enum correspondence_search_flags flags =
-		    association_cold_search_flags(dev_state, search_blob_count, bounded_full_frame, pass, trust_prior);
-		struct xrt_pose P_cam_obj;
-		math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj);
-		struct correspondence_search_result results[CORRESPONDENCE_SEARCH_MAX_RESULTS];
-		const int n_results = correspondence_search_find_pose_candidates(
-		    cam->cs, device->search_led_model, flags, &P_cam_obj, &dev_state->prior_pos_error,
-		    &dev_state->prior_rot_error, &view->cam_gravity_vector, (float)GRAVITY_TILT_TOL,
-		    dev_state->prior_yaw_sigma_rad, (float)FLIP_COST_HUBER_KNEE_SIGMA, (float)FLIP_COST_WEIGHT,
-		    results, CORRESPONDENCE_SEARCH_MAX_RESULTS);
-		struct correspondence_search_diagnostics diag;
-		correspondence_search_get_last_diagnostics(cam->cs, &diag);
-		telem_emit_search_result(telem_device_id(xdev), view_id, sample->timestamp, pass_base + pass, flags,
-		                         n_results > 0, dev_state->prior_tilt_trusted, &diag);
-		for (int i = 0; i < n_results; i++) {
-			uint16_t result_flags = trust_prior ? ASSOC_HYP_NONE : ASSOC_HYP_IGNORE_PRIOR;
-			if (!POSE_HAS_FLAGS(&results[i].score, POSE_MATCH_GOOD)) {
-				result_flags |= ASSOC_HYP_PARTIAL_ONLY;
-			}
-			association_add_pose_hypothesis(ct, work, dev_state, sample, view_id,
-			                                ASSOC_SOURCE_COLD_SEARCH, result_flags, &results[i].pose,
-			                                true);
-		}
-	}
+	task->cs = cam->cold_search[dev_state->dev_index];
+	task->search_model = device->search_led_model;
+	task->blobs = blobs;
+	task->num_blobs = num_blobs;
+	math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &task->P_cam_obj);
+	task->prior_pos_error = dev_state->prior_pos_error;
+	task->prior_rot_error = dev_state->prior_rot_error;
+	task->cam_gravity_vector = view->cam_gravity_vector;
+	task->prior_yaw_sigma_rad = dev_state->prior_yaw_sigma_rad;
+	task->pass_flags[0] = association_cold_search_flags(dev_state, num_blobs, 0, trust_prior);
+	task->pass_flags[1] = association_cold_search_flags(dev_state, num_blobs, 1, trust_prior);
+	task->work_allowance = 0;
+	task->run_deep = run_deep;
+	task->timestamp_ns = sample->timestamp;
+	task->device_id = telem_device_id(xdev);
+	task->dev_slot = dev_slot;
+	task->view_id = view_id;
+	task->pass_base = pass_base;
+	task->prior_tilt_trusted = dev_state->prior_tilt_trusted;
+	task->ignore_prior_results = !trust_prior;
+	task->pass_ran[0] = task->pass_ran[1] = false;
+	task->n_results[0] = task->n_results[1] = 0;
+	task->work_spent = 0;
 }
 
 static void
-association_add_cold_search_source(struct t_constellation_tracker *ct,
-                                   struct association_device_work *work,
-                                   struct tracking_sample_device_state *dev_state,
-                                   struct constellation_tracking_sample *sample,
-                                   bool only_uncovered_views)
+association_dispatch_cold_scopes(struct t_constellation_tracker *ct, int n_tasks)
 {
-	for (int view_id = 0; view_id < sample->n_views; view_id++) {
-		struct tracking_sample_frame *view = sample->views + view_id;
-		struct constellation_tracker_camera_state *cam = ct->cam + view_id;
-		if (view->bwobs == NULL || view->bwobs->num_blobs == 0) {
-			continue;
+	if (ct->cold_search_group != NULL) {
+		for (int t = 0; t < n_tasks; t++) {
+			u_worker_group_push(ct->cold_search_group, association_run_cold_scope_task,
+			                    &ct->cold_scope_tasks[t]);
 		}
-		const int unclaimed =
-		    only_uncovered_views
-		        ? association_view_unclaimed_blob_count(
-		              view, (ct->devices + dev_state->dev_index)->led_model.id)
-		        : 0;
-		if (only_uncovered_views &&
-		    (unclaimed < 4 || association_work_has_view_hypothesis(work, view_id))) {
-			continue;
-		}
-		if (only_uncovered_views) {
-			// Bound on the UNCLAIMED count: partner-labelled blobs neither qualify a view as
-			// uncovered nor buy it an unbounded deep pass (the measured 64.6M-trial regression);
-			// genuinely-uncovered small views keep full depth for second-view pickup.
-			const bool bounded_full_frame = unclaimed > ASSOC_COLD_FULLFRAME_BOUND_TRIGGER;
-			association_search_cold_scope(ct, work, dev_state, sample, view_id, view->bwobs->blobs,
-			                              view->bwobs->num_blobs, bounded_full_frame, false, 4);
-			continue;
-		}
-		struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
-		const struct xrt_device *xdev = device->connection != NULL ? device->connection->xdev : NULL;
-		if (dev_state->prior_tilt_trusted && !dev_state->prior_optical_stale &&
-		    association_count_prior_visible_leds_in_view(dev_state, view, cam) < 3) {
-			telem_emit_search_skip(telem_device_id(xdev), view_id, sample->timestamp, 0,
-			                       G2_SEARCH_ROI_SKIP_VISIBLE_LT3, CS_FLAG_HAVE_POSE_PRIOR,
-			                       dev_state->prior_tilt_trusted, (uint32_t)view->bwobs->num_blobs, 0, 0);
-			continue;
-		}
-		struct blob roi_blobs[MAX_BLOBS_PER_FRAME];
-		const struct association_prior_roi_result roi =
-		    association_build_prior_roi_blobs(dev_state, view, cam, roi_blobs);
-		if (roi.status == G2_SEARCH_SUCCESS) {
-			association_search_cold_scope(ct, work, dev_state, sample, view_id, roi_blobs,
-			                              roi.blob_count, false, true, 0);
-			if (association_work_has_usable_hypothesis(work)) {
-				continue;
-			}
-		} else {
-			enum correspondence_search_flags flags = CS_FLAG_HAVE_POSE_PRIOR;
-			if (dev_state->prior_tilt_trusted) {
-				flags |= CS_FLAG_TRUST_PRIOR_ORIENT;
-			}
-			telem_emit_search_skip(telem_device_id(xdev), view_id, sample->timestamp, 0, roi.status, flags,
-			                       dev_state->prior_tilt_trusted, (uint32_t)view->bwobs->num_blobs,
-			                       (uint32_t)roi.visible_leds, (uint32_t)roi.blob_count);
-		}
-		if (!dev_state->prior_tilt_trusted && !dev_state->have_last_seen_pose &&
-		           view->bwobs->num_blobs > ASSOC_COLD_FULLFRAME_BOUND_TRIGGER) {
-			association_search_cold_scope(ct, work, dev_state, sample, view_id, view->bwobs->blobs,
-			                              view->bwobs->num_blobs, true, true, 2);
-		} else {
-			association_search_cold_scope(ct, work, dev_state, sample, view_id, view->bwobs->blobs,
-			                              view->bwobs->num_blobs, false, true, 2);
-		}
+		u_worker_group_wait_all(ct->cold_search_group);
+		return;
+	}
+	for (int t = 0; t < n_tasks; t++) {
+		association_run_cold_scope_task(&ct->cold_scope_tasks[t]);
 	}
 }
 
@@ -3463,12 +3487,219 @@ association_work_has_lockable_hypothesis(const struct association_device_work *w
 	return false;
 }
 
+/* The deterministic cold-search waves. ASSOC_FRAME_WORK_BUDGET is partitioned BEFORE any task
+ * runs — per-scope allowances are pure functions of frame content + tracker state (never a
+ * shared pool drained in completion order) — and merging back into the shared hypothesis lists
+ * happens after each wave's wait_all in fixed (device, view) order. Returns the units spent. */
+static uint64_t
+association_run_cold_waves(struct t_constellation_tracker *ct,
+                           struct association_device_work *work,
+                           struct constellation_tracking_sample *sample)
+{
+	uint64_t total_spent = 0;
+
+	bool is_cold[CONSTELLATION_MAX_DEVICES] = {false};
+	bool view_gated[CONSTELLATION_MAX_DEVICES][CONSTELLATION_MAX_CAMERAS] = {{false}};
+	int n_cold = 0;
+	for (int i = 0; i < sample->n_devices; i++) {
+		is_cold[i] = !association_work_has_lockable_hypothesis(&work[i]);
+		n_cold += is_cold[i] ? 1 : 0;
+	}
+	const uint32_t dev_budget = n_cold > 0 ? ASSOC_FRAME_WORK_BUDGET / (uint32_t)n_cold : 0;
+	uint32_t dev_spent[CONSTELLATION_MAX_DEVICES] = {0};
+
+	/* Wave B: per cold device, prior-ROI scopes share HALF the device budget, split across the
+	 * scope views proportionally to the prior-projected-LED count (largest-remainder rounding,
+	 * ties to the lower view index — g2_work_budget_split); the other half is reserved for the
+	 * wave-C full-frame remainder. Each scope task runs shallow then conditional deep. */
+	int n_tasks = 0;
+	for (int i = 0; i < sample->n_devices; i++) {
+		if (!is_cold[i]) {
+			continue;
+		}
+		struct tracking_sample_device_state *dev_state = &sample->devices[i];
+		struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
+		const struct xrt_device *xdev = device->connection != NULL ? device->connection->xdev : NULL;
+
+		struct association_cold_scope_task *scopes[CONSTELLATION_MAX_CAMERAS];
+		uint32_t weights[CONSTELLATION_MAX_CAMERAS];
+		int n_scopes = 0;
+		for (int view_id = 0; view_id < sample->n_views; view_id++) {
+			struct tracking_sample_frame *view = sample->views + view_id;
+			struct constellation_tracker_camera_state *cam = ct->cam + view_id;
+			if (view->bwobs == NULL || view->bwobs->num_blobs == 0) {
+				continue;
+			}
+			if (dev_state->prior_tilt_trusted && !dev_state->prior_optical_stale &&
+			    association_count_prior_visible_leds_in_view(dev_state, view, cam) < 3) {
+				view_gated[i][view_id] = true;
+				telem_emit_search_skip(telem_device_id(xdev), view_id, sample->timestamp, 0,
+				                       G2_SEARCH_ROI_SKIP_VISIBLE_LT3, CS_FLAG_HAVE_POSE_PRIOR,
+				                       dev_state->prior_tilt_trusted,
+				                       (uint32_t)view->bwobs->num_blobs, 0, 0);
+				continue;
+			}
+			struct association_cold_scope_task *task = &ct->cold_scope_tasks[n_tasks];
+			const struct association_prior_roi_result roi =
+			    association_build_prior_roi_blobs(dev_state, view, cam, task->roi_blobs);
+			if (roi.status != G2_SEARCH_SUCCESS) {
+				enum correspondence_search_flags flags = CS_FLAG_HAVE_POSE_PRIOR;
+				if (dev_state->prior_tilt_trusted) {
+					flags |= CS_FLAG_TRUST_PRIOR_ORIENT;
+				}
+				telem_emit_search_skip(telem_device_id(xdev), view_id, sample->timestamp, 0,
+				                       roi.status, flags, dev_state->prior_tilt_trusted,
+				                       (uint32_t)view->bwobs->num_blobs,
+				                       (uint32_t)roi.visible_leds, (uint32_t)roi.blob_count);
+				continue;
+			}
+			association_init_cold_scope_task(ct, task, dev_state, sample, i, view_id,
+			                                 task->roi_blobs, roi.blob_count, true, true, 0);
+			weights[n_scopes] = (uint32_t)roi.visible_leds;
+			scopes[n_scopes++] = task;
+			n_tasks++;
+		}
+		if (n_scopes > 0) {
+			uint32_t alloc[CONSTELLATION_MAX_CAMERAS];
+			g2_work_budget_split(dev_budget / 2, weights, n_scopes, alloc);
+			for (int k = 0; k < n_scopes; k++) {
+				scopes[k]->work_allowance = alloc[k];
+			}
+		}
+	}
+	association_dispatch_cold_scopes(ct, n_tasks);
+	for (int t = 0; t < n_tasks; t++) {
+		const struct association_cold_scope_task *task = &ct->cold_scope_tasks[t];
+		association_merge_cold_scope_task(ct, &work[task->dev_slot],
+		                                  &sample->devices[task->dev_slot], sample, task);
+		dev_spent[task->dev_slot] += task->work_spent;
+		total_spent += task->work_spent;
+	}
+
+	/* Wave C: cold devices still without a usable hypothesis run full-frame scopes with the
+	 * device's deterministic remainder (the wave-B spend is input-determined, so the remainder
+	 * is too). One ROTATING qualifying view per device (cold_deep_view_rr) owns the deep pass
+	 * at ASSOC_COLD_DEEP_VIEW_WEIGHT x a shallow view's split share, so a lost device reaches
+	 * full depth in every view within <= n_views frames instead of every device paying for full
+	 * depth everywhere each frame (100% of the capture's winning poses were shallow-reachable
+	 * at blob_depth <= 3). */
+	n_tasks = 0;
+	for (int i = 0; i < sample->n_devices; i++) {
+		if (!is_cold[i] || association_work_has_strong_hypothesis(&work[i])) {
+			continue;
+		}
+		struct tracking_sample_device_state *dev_state = &sample->devices[i];
+		struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
+
+		/* Qualifying views, ordered by prior-projected-LED count descending (insertion sort,
+		 * stable: ties keep the lower view index first). The order fixes both which view the
+		 * deep slot lands on and who wins the split's remainder units. */
+		int view_order[CONSTELLATION_MAX_CAMERAS];
+		int view_leds[CONSTELLATION_MAX_CAMERAS];
+		int n_q = 0;
+		for (int view_id = 0; view_id < sample->n_views; view_id++) {
+			struct tracking_sample_frame *view = sample->views + view_id;
+			if (view->bwobs == NULL || view->bwobs->num_blobs == 0 || view_gated[i][view_id]) {
+				continue;
+			}
+			const int leds =
+			    association_count_prior_visible_leds_in_view(dev_state, view, ct->cam + view_id);
+			int k = n_q;
+			while (k > 0 && view_leds[k - 1] < leds) {
+				view_order[k] = view_order[k - 1];
+				view_leds[k] = view_leds[k - 1];
+				k--;
+			}
+			view_order[k] = view_id;
+			view_leds[k] = leds;
+			n_q++;
+		}
+		if (n_q == 0) {
+			continue;
+		}
+		const int deep_idx = (int)(device->cold_deep_view_rr % (uint32_t)n_q);
+		device->cold_deep_view_rr++;
+
+		uint32_t weights[CONSTELLATION_MAX_CAMERAS];
+		for (int k = 0; k < n_q; k++) {
+			weights[k] = k == deep_idx ? ASSOC_COLD_DEEP_VIEW_WEIGHT : 1u;
+		}
+		uint32_t alloc[CONSTELLATION_MAX_CAMERAS];
+		g2_work_budget_split(dev_budget - dev_spent[i], weights, n_q, alloc);
+		for (int k = 0; k < n_q; k++) {
+			struct tracking_sample_frame *view = sample->views + view_order[k];
+			struct association_cold_scope_task *task = &ct->cold_scope_tasks[n_tasks++];
+			const int n_blobs = association_stage_search_blobs(view, task->roi_blobs);
+			association_init_cold_scope_task(ct, task, dev_state, sample, i, view_order[k],
+			                                 task->roi_blobs, n_blobs, k == deep_idx, true, 2);
+			task->work_allowance = alloc[k];
+		}
+	}
+	association_dispatch_cold_scopes(ct, n_tasks);
+	for (int t = 0; t < n_tasks; t++) {
+		const struct association_cold_scope_task *task = &ct->cold_scope_tasks[t];
+		association_merge_cold_scope_task(ct, &work[task->dev_slot],
+		                                  &sample->devices[task->dev_slot], sample, task);
+		total_spent += task->work_spent;
+	}
+
+	/* Wave D: uncovered-view pickup for devices that already hold a lockable hypothesis. Each
+	 * uncovered view takes a FIXED bounded slice of whatever frame budget remains, assigned in
+	 * (device, view) order — keeping the old BOUNDED_SEARCH protection (today's pickup spends
+	 * p50 512 trials) without being unbounded on good frames or silently starved on bad ones.
+	 * Partner-labelled blobs still neither qualify a view as uncovered nor buy it search work
+	 * (the measured 64.6M-trial hands-close regression). */
+	uint32_t frame_remaining = ASSOC_FRAME_WORK_BUDGET - (uint32_t)total_spent;
+	bool resort[CONSTELLATION_MAX_DEVICES] = {false};
+	n_tasks = 0;
+	for (int i = 0; i < sample->n_devices; i++) {
+		if (is_cold[i]) {
+			continue;
+		}
+		struct tracking_sample_device_state *dev_state = &sample->devices[i];
+		const int model_id = (ct->devices + dev_state->dev_index)->led_model.id;
+		if (!association_work_has_uncovered_blob_view(&work[i], sample, model_id)) {
+			continue;
+		}
+		for (int view_id = 0; view_id < sample->n_views; view_id++) {
+			struct tracking_sample_frame *view = sample->views + view_id;
+			if (view->bwobs == NULL || view->bwobs->num_blobs == 0) {
+				continue;
+			}
+			if (association_view_unclaimed_blob_count(view, model_id) < 4 ||
+			    association_work_has_view_hypothesis(&work[i], view_id)) {
+				continue;
+			}
+			struct association_cold_scope_task *task = &ct->cold_scope_tasks[n_tasks++];
+			const int n_blobs = association_stage_search_blobs(view, task->roi_blobs);
+			association_init_cold_scope_task(ct, task, dev_state, sample, i, view_id,
+			                                 task->roi_blobs, n_blobs, true, false, 4);
+			task->work_allowance =
+			    g2_work_budget_take(&frame_remaining, ASSOC_COLD_UNCOVERED_VIEW_ALLOWANCE);
+			resort[i] = true;
+		}
+	}
+	association_dispatch_cold_scopes(ct, n_tasks);
+	for (int t = 0; t < n_tasks; t++) {
+		const struct association_cold_scope_task *task = &ct->cold_scope_tasks[t];
+		association_merge_cold_scope_task(ct, &work[task->dev_slot],
+		                                  &sample->devices[task->dev_slot], sample, task);
+		total_spent += task->work_spent;
+	}
+	for (int i = 0; i < sample->n_devices; i++) {
+		if (resort[i]) {
+			association_resort_work(&work[i]);
+		}
+	}
+
+	return total_spent;
+}
+
 static void
 association_build_device_work(struct t_constellation_tracker *ct,
                               struct association_device_work *work,
                               struct tracking_sample_device_state *dev_state,
-                              struct constellation_tracking_sample *sample,
-                              bool allow_cold_search)
+                              struct constellation_tracking_sample *sample)
 {
 	*work = (struct association_device_work){0};
 	static int sibling_negative_env_init = 0;
@@ -3478,20 +3709,11 @@ association_build_device_work(struct t_constellation_tracker *ct,
 		sibling_negative_enabled = getenv("G2_ASSOC_SIBLING_NEGATIVE") != NULL;
 	}
 	work->sibling_negative_enabled = sibling_negative_enabled;
+	/* Wave A — the warm sources. Never charged against the work budget: a tracked device's
+	 * fast path keeps full quality regardless of clutter load. */
 	association_add_prior_pose_sources(ct, work, dev_state, sample);
 	association_add_joint_pnp_source(ct, work, dev_state, sample);
 	association_add_label_sources(ct, work, dev_state, sample);
-
-	if (allow_cold_search) {
-		const bool has_lockable = association_work_has_lockable_hypothesis(work);
-		if (!has_lockable) {
-			association_add_cold_search_source(ct, work, dev_state, sample, false);
-		} else if (association_work_has_uncovered_blob_view(
-		               work, sample, (ct->devices + dev_state->dev_index)->led_model.id)) {
-			association_add_cold_search_source(ct, work, dev_state, sample, true);
-			association_resort_work(work);
-		}
-	}
 }
 
 static bool
@@ -4692,12 +4914,14 @@ association_update_yaw_belief(struct t_constellation_tracker *ct,
 
 static void
 constellation_associate_covariance_frame(struct t_constellation_tracker *ct,
-                                         struct constellation_tracking_sample *sample,
-                                         bool allow_cold_search)
+                                         struct constellation_tracking_sample *sample)
 {
 	struct association_device_work work[CONSTELLATION_MAX_DEVICES] = {0};
 	for (int i = 0; i < sample->n_devices; i++) {
-		association_build_device_work(ct, &work[i], &sample->devices[i], sample, allow_cold_search);
+		association_build_device_work(ct, &work[i], &sample->devices[i], sample);
+	}
+	ct->last_assoc_work_units = association_run_cold_waves(ct, work, sample);
+	for (int i = 0; i < sample->n_devices; i++) {
 		association_apply_orientation_consensus(&work[i]);
 	}
 	association_apply_joint_contention(ct, work, sample);
@@ -4774,6 +4998,40 @@ constellation_associate_covariance_frame(struct t_constellation_tracker *ct,
 		if (association_fold_prior_leds(ct, dev_state, sample)) {
 			work[slot].folded_partial = true;
 		}
+	}
+}
+
+/* Project a device's LED model at the given world pose into this camera's distorted image and
+ * append the in-bounds pixels to the static map's exemption list (same projection convention as
+ * pose_metrics). All LEDs are used, facing or not — the exemption protects a REGION around the
+ * device, not a visibility prediction. */
+static void
+append_exempt_led_px(const struct tracking_sample_frame *view,
+                     const struct constellation_tracker_camera_state *cam,
+                     const struct t_constellation_led_model *led_model,
+                     const struct xrt_pose *P_world_obj,
+                     struct xrt_vec2 *exempt_px,
+                     int *n_exempt,
+                     int max_exempt)
+{
+	struct xrt_pose P_cam_obj;
+	math_pose_transform(&view->P_cam_world, P_world_obj, &P_cam_obj);
+	for (int li = 0; li < led_model->num_leds && *n_exempt < max_exempt; li++) {
+		struct xrt_vec3 cam_point;
+		math_pose_transform_point(&P_cam_obj, &led_model->leds[li].pos, &cam_point);
+		if (cam_point.z <= 0.0f) {
+			continue;
+		}
+		float u, v;
+		if (!t_camera_models_project(&cam->camera_model.calib, cam_point.x, cam_point.y, cam_point.z, &u,
+		                             &v)) {
+			continue;
+		}
+		if (u < 0.0f || v < 0.0f || u >= (float)cam->camera_model.width ||
+		    v >= (float)cam->camera_model.height) {
+			continue;
+		}
+		exempt_px[(*n_exempt)++] = (struct xrt_vec2){u, v};
 	}
 }
 
@@ -4959,7 +5217,7 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 				int rw = (int)ceilf(xmax - xmin) + 1;
 				int rh = (int)ceilf(ymax - ymin) + 1;
 				blobwatch_process_roi_lowthresh(cam->bw, view->vframe, frame_exposure, 0, rx, ry, rw, rh,
-				                                4, 3, 12, &view->bwobs);
+				                                4, 3, &view->bwobs);
 				used_roi = true;
 			}
 		}
@@ -5093,7 +5351,44 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 	}
 	os_mutex_unlock(&ct->tracked_device_lock);
 
-	constellation_associate_covariance_frame(ct, sample, true);
+	/* Evidence-accumulating retention (H5): update each camera's world-anchored static-clutter
+	 * map and write per-blob retention classes before association consumes the blobs. The
+	 * device exemption projects every device's LEDs at BOTH the live prediction (regardless of
+	 * tracked state — the ride/OOV prediction exists while lost) and the last optically-seen
+	 * pose, so a lost-and-resting controller's region is never demoted: the cold-search
+	 * fall-through to suppressed blobs is work-budget-gated and must not be relied on there. */
+	for (int i = 0; i < sample->n_views; i++) {
+		struct constellation_tracker_camera_state *cam = ct->cam + i;
+		struct tracking_sample_frame *view = sample->views + i;
+		if (view->bwobs == NULL) {
+			continue;
+		}
+		struct xrt_vec2 exempt_px[2 * CONSTELLATION_MAX_DEVICES * MAX_OBJECT_LEDS];
+		int n_exempt = 0;
+		for (int d = 0; d < sample->n_devices; d++) {
+			struct tracking_sample_device_state *dev_state = sample->devices + d;
+			append_exempt_led_px(view, cam, dev_state->led_model, &dev_state->P_world_obj_prior,
+			                     exempt_px, &n_exempt, (int)ARRAY_SIZE(exempt_px));
+			if (dev_state->have_last_seen_pose) {
+				append_exempt_led_px(view, cam, dev_state->led_model, &dev_state->last_seen_pose,
+				                     exempt_px, &n_exempt, (int)ARRAY_SIZE(exempt_px));
+			}
+		}
+		static_map_update(&cam->static_map, view->bwobs, &cam->camera_model, &view->P_world_cam,
+		                  &view->P_cam_world, sample->timestamp, exempt_px, n_exempt);
+
+		if (g2_telem_enabled()) {
+			for (int b = 0; b < view->bwobs->num_blobs; b++) {
+				const struct blob *blob = &view->bwobs->blobs[b];
+				g2_telem_blob((uint8_t)i, (uint64_t)xf->timestamp, blob->x, blob->y,
+				              blob->brightness, blob->retention_class, blob->static_dwell_s,
+				              blob->pos_var_px2);
+			}
+		}
+	}
+
+	constellation_associate_covariance_frame(ct, sample);
+	g2_telem_event(0, xf->timestamp, G2_TELEM_EV_TRACKER_WORK_UNITS, (float)ct->last_assoc_work_units);
 
 	uint64_t fast_analysis_finish_ts = os_monotonic_get_ns();
 	ct->last_fast_analysis_ms = (fast_analysis_finish_ts - fast_analysis_start_ts) / U_TIME_1MS_IN_NS;
@@ -5184,14 +5479,9 @@ constellation_tracker_node_destroy(struct xrt_frame_node *node)
 
 		u_sink_debug_destroy(&cam->debug_sink);
 
-		if (cam->cs) {
-			correspondence_search_free(cam->cs);
-		}
 		for (int dev = 0; dev < CONSTELLATION_MAX_DEVICES; dev++) {
-			for (int pass = 0; pass < ASSOC_COLD_SEARCH_PASSES; pass++) {
-				if (cam->cold_search[dev][pass]) {
-					correspondence_search_free(cam->cold_search[dev][pass]);
-				}
+			if (cam->cold_search[dev]) {
+				correspondence_search_free(cam->cold_search[dev]);
 			}
 		}
 
@@ -5246,12 +5536,9 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
 		t_camera_model_params_from_t_camera_calibration(&cam_cfg->calibration, &cam->camera_model.calib);
 
 		os_mutex_init(&cam->bw_lock);
-		cam->bw = blobwatch_new(cam_cfg->blob_min_threshold, cam_cfg->blob_detect_threshold, (uint8_t)i);
-		cam->cs = correspondence_search_new(&cam->camera_model);
+		cam->bw = blobwatch_new(cam_cfg->blob_min_threshold, (uint8_t)i);
 		for (int dev = 0; dev < CONSTELLATION_MAX_DEVICES; dev++) {
-			for (int pass = 0; pass < ASSOC_COLD_SEARCH_PASSES; pass++) {
-				cam->cold_search[dev][pass] = correspondence_search_new(&cam->camera_model);
-			}
+			cam->cold_search[dev] = correspondence_search_new(&cam->camera_model);
 		}
 	}
 
@@ -5285,6 +5572,7 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
 	u_var_add_ro_u64(ct, &ct->last_frame_timestamp, "Last Frame Timestamp");
 	u_var_add_ro_u64(ct, &ct->last_blob_analysis_ms, "Blob tracking time (ms)");
 	u_var_add_ro_u64(ct, &ct->last_fast_analysis_ms, "Fast analysis time (ms)");
+	u_var_add_ro_u64(ct, &ct->last_assoc_work_units, "Cold search work units");
 
 	u_var_add_bool(ct, &ct->debug_draw_normalise, "Debug: Normalise source frame");
 	u_var_add_bool(ct, &ct->debug_draw_blob_tint, "Debug: Tint blobs by device assignment");

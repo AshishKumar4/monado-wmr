@@ -52,8 +52,6 @@ struct t_constellation_camera
 	uint8_t min_threshold;
 	//! Minimum blob brightness threshold for pixel inclusion
 	uint8_t blob_min_threshold;
-	//! Threshold at which a group of pixels become a detected blob
-	uint8_t blob_detect_threshold;
 	//! The index into the slam tracking camera array this camera represents
 	size_t slam_tracking_index;
 };

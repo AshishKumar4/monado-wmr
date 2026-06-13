@@ -41,8 +41,8 @@ enum correspondence_search_flags
 	             of the candidate orientation from the prior (TILT scaled by the tight driftless sigma, YAW by
 	             the live fusion sigma), Huber-robustified. Requires CS_FLAG_HAVE_POSE_PRIOR + an up_vector
 	             (the world-up in camera frame). */
-	CS_FLAG_BOUNDED_SEARCH =
-	    0x40, /* Bound trial count for pathological no-prior clutter frames without pre-pruning blobs. */
+	/* 0x40 retired (BOUNDED_SEARCH; subsumed by the per-pass work allowance). Never reuse —
+	 * search_flags is recorded verbatim in the search telemetry stream. */
 	CS_FLAG_RETURN_BEST_PARTIAL =
 	    0x80, /* If no GOOD pose was found, return the best tight non-GOOD candidate so callers can use its
 	             matched LED evidence for partial/position-only fusion without accepting a full pose lock. */
@@ -99,7 +99,10 @@ struct cs_model_info
 
 	/* Search parameters */
 	double search_start_time;
-	unsigned int max_trials;
+	/* Pre-assigned work-unit allowance for this pass (1 unit = 1 P3P trial, pose check = 5;
+	 * see correspondence_search.c). The search stops — never overspends — when a charge
+	 * would exceed it. */
+	uint32_t work_allowance;
 	int led_depth;
 	int led_index;
 	int blob_index;
@@ -149,6 +152,8 @@ struct correspondence_search_diagnostics
 	uint32_t best_any_blobs_matched;
 	uint32_t best_any_unmatched_blobs;
 	float best_any_reproj_err_px;
+	uint32_t work_spent;     /* work units charged by this pass (trials + 5x pose checks) */
+	uint8_t budget_exhausted; /* 1 if a charge was denied: the pass hit its pre-assigned allowance */
 };
 
 struct correspondence_search
@@ -161,6 +166,8 @@ struct correspondence_search
 	unsigned int num_trials;
 	unsigned int num_pose_checks;
 	unsigned int num_pose_checks_pruned; /* candidates skipped by the admissible-bound prior prune */
+	uint32_t work_spent;                 /* work units charged in the current pass */
+	bool budget_exhausted;               /* a charge was denied: the pass hit its allowance */
 
 	struct camera_model *calib;
 
@@ -182,6 +189,7 @@ int
 correspondence_search_find_pose_candidates(struct correspondence_search *cs,
                                            struct t_constellation_search_model *model,
                                            enum correspondence_search_flags search_flags,
+                                           uint32_t work_allowance,
                                            struct xrt_pose *pose,
                                            struct xrt_vec3 *pos_error_thresh,
                                            struct xrt_vec3 *rot_error_thresh,

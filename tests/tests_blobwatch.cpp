@@ -15,6 +15,8 @@
 #include "catch_amalgamated.hpp"
 
 #include "internal/blobwatch.h"
+#include "internal/static_map.h"
+#include "math/m_api.h"
 #include "xrt/xrt_frame.h"
 
 #include <cmath>
@@ -24,8 +26,8 @@
 namespace {
 
 constexpr uint32_t W = 128, H = 128;
-constexpr uint8_t PIX_THR = 8;     // matches the real G2 blob_min_threshold
-constexpr uint8_t DETECT_THR = 24; // matches the real G2 blob_detect_threshold
+constexpr uint8_t PIX_THR = 8; // matches the real G2 blob_min_threshold
+constexpr uint8_t DIM_REF = 24; // dim-blob reference these retention tests assert against
 constexpr uint8_t SAT = 255;
 
 // A self-owned 8-bit greyscale frame (stride == width, single plane) for blobwatch_process.
@@ -101,7 +103,7 @@ struct TestFrame
 std::vector<blob>
 detect(TestFrame &tf)
 {
-	blobwatch *bw = blobwatch_new(PIX_THR, DETECT_THR, 0);
+	blobwatch *bw = blobwatch_new(PIX_THR, 0);
 	blobservation *ob = nullptr;
 	blobwatch_process(bw, &tf.f, /*exposure=*/100, /*gain=*/0, &ob);
 	std::vector<blob> out;
@@ -114,7 +116,7 @@ detect(TestFrame &tf)
 std::vector<blob>
 detect_roi(TestFrame &tf, int x, int y, int w, int h)
 {
-	blobwatch *bw = blobwatch_new(PIX_THR, DETECT_THR, 0);
+	blobwatch *bw = blobwatch_new(PIX_THR, 0);
 	blobservation *ob = nullptr;
 	blobwatch_process_roi(bw, &tf.f, /*exposure=*/100, /*gain=*/0, x, y, w, h, &ob);
 	std::vector<blob> out;
@@ -127,11 +129,10 @@ detect_roi(TestFrame &tf, int x, int y, int w, int h)
 std::vector<blob>
 detect_roi_lowthresh(TestFrame &tf, int x, int y, int w, int h)
 {
-	blobwatch *bw = blobwatch_new(PIX_THR, DETECT_THR, 0);
+	blobwatch *bw = blobwatch_new(PIX_THR, 0);
 	blobservation *ob = nullptr;
 	blobwatch_process_roi_lowthresh(bw, &tf.f, /*exposure=*/100, /*gain=*/0, x, y, w, h,
-	                                /*roi_pixel_threshold=*/4, /*roi_adapt_margin=*/3,
-	                                /*roi_required_threshold=*/12, &ob);
+	                                /*roi_pixel_threshold=*/4, /*roi_adapt_margin=*/3, &ob);
 	std::vector<blob> out;
 	if (ob != nullptr)
 		out.assign(ob->blobs, ob->blobs + ob->num_blobs);
@@ -212,7 +213,7 @@ TEST_CASE("blobwatch: ROI scans and finalizes the bottom row")
 	REQUIRE(std::abs(b.y - 71.5) < 0.35);
 }
 
-TEST_CASE("blobwatch: compact dim LED below detect threshold is retained inside an ROI")
+TEST_CASE("blobwatch: compact dim LED is retained inside an ROI")
 {
 	TestFrame tf;
 	tf.at(63, 64) = 12;
@@ -223,7 +224,7 @@ TEST_CASE("blobwatch: compact dim LED below detect threshold is retained inside 
 
 	auto bs = detect_roi(tf, 56, 56, 17, 17);
 	const blob b = nearest(bs, 64.0, 64.0, 1.0);
-	REQUIRE(b.brightness < DETECT_THR);
+	REQUIRE(b.brightness < DIM_REF);
 }
 
 TEST_CASE("blobwatch: ROI recovery retains compact LEDs clipped by the adaptive margin")
@@ -238,7 +239,7 @@ TEST_CASE("blobwatch: ROI recovery retains compact LEDs clipped by the adaptive 
 
 	auto bs = detect_roi(tf, 56, 56, 17, 17);
 	const blob b = nearest(bs, 64.0, 64.0, 1.0);
-	REQUIRE(b.brightness < DETECT_THR + 4);
+	REQUIRE(b.brightness < DIM_REF + 4);
 }
 
 TEST_CASE("blobwatch: ROI recovery rejects flat low-contrast patches")
@@ -328,11 +329,11 @@ TEST_CASE("blobwatch: a frame-edge blob is down-weighted (larger R) vs the same 
 	REQUIRE(be.pos_var_px2 > bc.pos_var_px2);
 }
 
-TEST_CASE("blobwatch: a much dimmer candidate gets a larger R than the bright one (intensity rank)")
+TEST_CASE("blobwatch: a much dimmer candidate gets a larger R than the bright one (fixed dim anchor)")
 {
 	TestFrame tf;
 	tf.add_gaussian(30.0, 30.0, 1.6, 230, false); // bright = strong LED candidate
-	tf.add_gaussian(90.0, 90.0, 1.6, 40, false);  // faint = weaker candidate (possible reflection)
+	tf.add_gaussian(90.0, 90.0, 1.6, 20, false);  // faint = weaker candidate (possible reflection)
 	auto bs = detect(tf);
 	const blob bright = nearest(bs, 30.0, 30.0);
 	const blob faint = nearest(bs, 90.0, 90.0);
@@ -352,4 +353,192 @@ TEST_CASE("blobwatch: a flat bright reflection/streak is rejected while a clean 
 	for (const blob &b : bs) {
 		REQUIRE(!(b.x > 55 && b.x < 115 && b.y > 65 && b.y < 75));
 	}
+}
+
+TEST_CASE("blobwatch: dim-blob R is a pure function of the blob, not the frame's brightest blob")
+{
+	// The same dim blob must carry the SAME measurement noise whether or not a brighter
+	// (window/lamp) blob shares the frame — R decoupled from room content. This was the sole
+	// live effect of the retired per-frame retention threshold and the verified mechanism of
+	// the 16<->24 margin knife-edge.
+	TestFrame alone;
+	alone.add_gaussian(90.0, 90.0, 1.6, 20, false);
+	alone.add_gaussian(30.0, 30.0, 1.6, 20, false);
+	const blob b_alone = nearest(detect(alone), 90.0, 90.0);
+
+	TestFrame with_clutter;
+	with_clutter.add_gaussian(90.0, 90.0, 1.6, 20, false);
+	with_clutter.add_gaussian(30.0, 30.0, 1.6, 230, false); // bright "window" blob
+	const blob b_clutter = nearest(detect(with_clutter), 90.0, 90.0);
+
+	INFO("alone R=" << b_alone.pos_var_px2 << " with-bright-clutter R=" << b_clutter.pos_var_px2);
+	REQUIRE(b_alone.pos_var_px2 == b_clutter.pos_var_px2);
+}
+
+TEST_CASE("blobwatch: cap-pressure retention keeps high-contrast blobs over scanline order")
+{
+	// 130 qualifying blobs: 30 dim ones FIRST in scanline order (top rows), 100 bright below.
+	// The old code kept the first 100 in scanline order (all 30 dim + only 70 bright); priority
+	// retention must keep all 100 bright ones and account for the dropped dim ones.
+	TestFrame tf(320, 320);
+	int placed_dim = 0, placed_bright = 0;
+	for (int gy = 0; gy < 20 && placed_dim + placed_bright < 130; gy++) {
+		for (int gx = 0; gx < 20 && placed_dim + placed_bright < 130; gx++) {
+			const double x = 12.0 + gx * 15.0, y = 12.0 + gy * 15.0;
+			if (placed_dim < 30) {
+				tf.add_gaussian(x, y, 1.2, 30, false);
+				placed_dim++;
+			} else {
+				tf.add_gaussian(x, y, 1.2, 200, false);
+				placed_bright++;
+			}
+		}
+	}
+	REQUIRE(placed_dim == 30);
+	REQUIRE(placed_bright == 100);
+
+	blobwatch *bw = blobwatch_new(PIX_THR, 0);
+	blobservation *ob = nullptr;
+	blobwatch_process(bw, &tf.f, /*exposure=*/100, /*gain=*/0, &ob);
+	REQUIRE(ob != nullptr);
+	REQUIRE(ob->num_blobs == MAX_BLOBS_PER_FRAME);
+	REQUIRE(ob->dropped_capacity == 30);
+	int bright_kept = 0;
+	for (int i = 0; i < ob->num_blobs; i++) {
+		if (ob->blobs[i].brightness > 100) {
+			bright_kept++;
+		}
+	}
+	REQUIRE(bright_kept == 100);
+	blobwatch_free(bw);
+}
+
+namespace {
+
+// Distortion-free RADTAN8 camera (all coefficients zero) for static-map geometry tests.
+camera_model
+test_camera()
+{
+	camera_model cm = {};
+	cm.width = 640;
+	cm.height = 480;
+	cm.calib.fx = 300.0f;
+	cm.calib.fy = 300.0f;
+	cm.calib.cx = 320.0f;
+	cm.calib.cy = 240.0f;
+	cm.calib.model = T_DISTORTION_OPENCV_RADTAN_8;
+	return cm;
+}
+
+// One-blob observation at the projection of `world_point` through P_cam_world.
+blobservation
+observe_world_point(const camera_model &cm, const xrt_pose &P_cam_world, const xrt_vec3 &world_point)
+{
+	xrt_vec3 cam_pt;
+	math_pose_transform_point(&P_cam_world, &world_point, &cam_pt);
+	float u = 0, v = 0;
+	REQUIRE(t_camera_models_project(&cm.calib, cam_pt.x, cam_pt.y, cam_pt.z, &u, &v));
+	blobservation ob = {};
+	ob.num_blobs = 1;
+	ob.blobs[0].x = u;
+	ob.blobs[0].y = v;
+	ob.blobs[0].brightness = 30;
+	return ob;
+}
+
+constexpr uint64_t FRAME_DT_NS = 50000000; // 20 Hz
+
+} // namespace
+
+TEST_CASE("static_map: a world-still spot under camera motion accumulates dwell and goes STATIC_CLUTTER")
+{
+	const camera_model cm = test_camera();
+	static_map sm = {};
+	const xrt_vec3 world_point = {0.3f, -0.2f, 2.5f};
+
+	uint64_t ts = 1000000000;
+	int frames_to_static = -1;
+	for (int f = 0; f < 30; f++, ts += FRAME_DT_NS) {
+		// Camera translates AND the spot stays put in the world: image position moves,
+		// the world anchor does not.
+		xrt_pose P_world_cam = XRT_POSE_IDENTITY;
+		P_world_cam.position.x = 0.02f * (float)f; // 2 cm/frame lateral head motion
+		xrt_pose P_cam_world;
+		math_pose_invert(&P_world_cam, &P_cam_world);
+
+		blobservation ob = observe_world_point(cm, P_cam_world, world_point);
+		static_map_update(&sm, &ob, &cm, &P_world_cam, &P_cam_world, ts, nullptr, 0);
+
+		if (ob.blobs[0].retention_class == BLOB_RETENTION_STATIC_CLUTTER && frames_to_static < 0) {
+			frames_to_static = f;
+		}
+		if ((double)(ts - 1000000000) < STATIC_MAP_STATIC_DWELL_S * 1e9) {
+			REQUIRE(ob.blobs[0].retention_class == BLOB_RETENTION_FRESH);
+		}
+	}
+	// Dwell crosses 1 s at frame 20 (20 x 50 ms).
+	REQUIRE(frames_to_static == 20);
+	REQUIRE(sm.num_entries == 1);
+}
+
+TEST_CASE("static_map: the device exemption overrides static dwell (resting hands are never demoted)")
+{
+	const camera_model cm = test_camera();
+	static_map sm = {};
+	const xrt_vec3 world_point = {0.0f, 0.0f, 2.0f};
+	const xrt_pose identity = XRT_POSE_IDENTITY;
+
+	uint64_t ts = 1000000000;
+	blobservation ob = {};
+	for (int f = 0; f < 30; f++, ts += FRAME_DT_NS) {
+		ob = observe_world_point(cm, identity, world_point);
+		// A projected device LED sits within the exemption radius of the blob.
+		const xrt_vec2 exempt = {ob.blobs[0].x + 10.0f, ob.blobs[0].y};
+		static_map_update(&sm, &ob, &cm, &identity, &identity, ts, &exempt, 1);
+		REQUIRE(ob.blobs[0].retention_class == BLOB_RETENTION_DEVICE_NEAR);
+	}
+	// Dwell still accumulated underneath: the entry is ready the moment the device moves away.
+	REQUIRE(ob.blobs[0].static_dwell_s > STATIC_MAP_STATIC_DWELL_S);
+}
+
+TEST_CASE("static_map: an over-gap disappearance expires the entry and dwell restarts")
+{
+	const camera_model cm = test_camera();
+	static_map sm = {};
+	const xrt_vec3 world_point = {0.0f, 0.0f, 2.0f};
+	const xrt_pose identity = XRT_POSE_IDENTITY;
+
+	uint64_t ts = 1000000000;
+	for (int f = 0; f < 25; f++, ts += FRAME_DT_NS) {
+		blobservation ob = observe_world_point(cm, identity, world_point);
+		static_map_update(&sm, &ob, &cm, &identity, &identity, ts, nullptr, 0);
+		if (f == 24) {
+			REQUIRE(ob.blobs[0].retention_class == BLOB_RETENTION_STATIC_CLUTTER);
+		}
+	}
+	// Spot vanishes for longer than the gap tolerance (e.g. occluded), then returns.
+	ts += STATIC_MAP_GAP_NS + 2 * FRAME_DT_NS;
+	blobservation ob = observe_world_point(cm, identity, world_point);
+	static_map_update(&sm, &ob, &cm, &identity, &identity, ts, nullptr, 0);
+	REQUIRE(ob.blobs[0].retention_class == BLOB_RETENTION_FRESH);
+	REQUIRE(ob.blobs[0].static_dwell_s == 0.0f);
+}
+
+TEST_CASE("static_map: a sub-gap flicker keeps the dwell accumulating")
+{
+	const camera_model cm = test_camera();
+	static_map sm = {};
+	const xrt_vec3 world_point = {0.1f, 0.1f, 3.0f};
+	const xrt_pose identity = XRT_POSE_IDENTITY;
+
+	uint64_t ts = 1000000000;
+	blobservation ob = {};
+	for (int f = 0; f < 30; f++, ts += FRAME_DT_NS) {
+		if (f % 3 == 1 && f < 25) {
+			continue; // detection flicker: the spot misses every third frame
+		}
+		ob = observe_world_point(cm, identity, world_point);
+		static_map_update(&sm, &ob, &cm, &identity, &identity, ts, nullptr, 0);
+	}
+	REQUIRE(ob.blobs[0].retention_class == BLOB_RETENTION_STATIC_CLUTTER);
 }

@@ -32,6 +32,7 @@
 
 #include "wmr_common.h"
 #include "wmr_controller_base.h"
+#include "wmr_g2_timing.h"
 #include "wmr_config_key.h"
 #include "wmr_hmd.h"
 
@@ -880,9 +881,9 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 
 	// Constant controller-IMU vs headset-camera clock offset (ns), added to optical timestamps before
 	// fusion. The OOSM handles the variable processing lag; this is the residual fixed sensor-pair
-	// skew. Default 0 (no value assumed) — calibratable via G2_CTRL_TD_NS.
+	// skew, measured at +4.8 ms (see wmr_g2_timing.h); recalibratable via G2_CTRL_TD_NS.
 	const char *td_env = getenv("G2_CTRL_TD_NS");
-	wcb->ctrl_optical_td_ns = (td_env != NULL) ? (int64_t)atoll(td_env) : 0;
+	wcb->ctrl_optical_td_ns = (td_env != NULL) ? (int64_t)atoll(td_env) : WMR_CTRL_OPTICAL_TD_DEFAULT_NS;
 
 	if (controller_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
 		snprintf(wcb->base.str, ARRAY_SIZE(wcb->base.str), "WMR Left Controller");

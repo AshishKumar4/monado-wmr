@@ -191,14 +191,20 @@ apply_pose(struct xrt_space_relation *rel, vr::DriverPose_t *m_pose)
 		m_pose->poseIsValid = false;
 	}
 
-	if ((rel->relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0) {
+	// Forward the position whenever it is VALID, not only while TRACKED: the fusion's out-of-view
+	// report (body-anchored coast, reach-clamped, follow-smoothed) is strictly better than holding the
+	// last tracked pose — the silent hold is what felt like a hard ceiling above the cameras' FOV.
+	if ((rel->relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
 		copy_vec3(&rel->pose.position, m_pose->vecPosition);
-	} else {
 	}
 
 	if ((rel->relation_flags & XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT) != 0) {
 		// linear velocity in world space
 		copy_vec3(&rel->linear_velocity, m_pose->vecVelocity);
+	} else {
+		// m_pose persists across pulls: without this, SteamVR keeps photon-extrapolating on the last
+		// velocity (~0.5 m/s median at freeze entry on the 2026-06-11 capture) while the pose holds.
+		m_pose->vecVelocity[0] = m_pose->vecVelocity[1] = m_pose->vecVelocity[2] = 0.0;
 	}
 
 	if ((rel->relation_flags & XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT) != 0) {
@@ -211,6 +217,8 @@ apply_pose(struct xrt_space_relation *rel, vr::DriverPose_t *m_pose)
 		math_quat_rotate_derivative(&orientation_inv, &rel->angular_velocity, &vel);
 
 		copy_vec3(&vel, m_pose->vecAngularVelocity);
+	} else {
+		m_pose->vecAngularVelocity[0] = m_pose->vecAngularVelocity[1] = m_pose->vecAngularVelocity[2] = 0.0;
 	}
 }
 

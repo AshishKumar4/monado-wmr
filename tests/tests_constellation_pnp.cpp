@@ -19,6 +19,7 @@
 #include "internal/correspondence_search.h"
 #include "internal/blobwatch.h"
 #include "internal/camera_model.h"
+#include "internal/work_budget.h"
 #include "tracking/t_led_models.h"
 #include "math/m_api.h"
 
@@ -1095,9 +1096,9 @@ TEST_CASE("ab-initio prune: skips flipped hypotheses without changing the accept
 	struct xrt_pose found = prior; // seeds mi.pose_prior
 	struct correspondence_search_result results[CORRESPONDENCE_SEARCH_MAX_RESULTS] = {};
 	const int n_results =
-	    correspondence_search_find_pose_candidates(cs, smodel, flags, &found, &pos_thresh, &rot_thresh, &up,
-	                                               SIGMA_TILT, SIGMA_YAW, HUBER_KNEE, COST_WEIGHT, results,
-	                                               CORRESPONDENCE_SEARCH_MAX_RESULTS);
+	    correspondence_search_find_pose_candidates(cs, smodel, flags, UINT32_MAX, &found, &pos_thresh,
+	                                               &rot_thresh, &up, SIGMA_TILT, SIGMA_YAW, HUBER_KNEE,
+	                                               COST_WEIGHT, results, CORRESPONDENCE_SEARCH_MAX_RESULTS);
 	REQUIRE(n_results > 0);
 	REQUIRE((results[0].score.match_flags & POSE_MATCH_GOOD) != 0);
 
@@ -1146,9 +1147,9 @@ TEST_CASE("ab-initio prune: skips flipped hypotheses without changing the accept
 	    (enum correspondence_search_flags)(CS_FLAG_SHALLOW_SEARCH | CS_FLAG_HAVE_POSE_PRIOR);
 	struct xrt_pose found_cold = prior;
 	struct correspondence_search_result results_cold[CORRESPONDENCE_SEARCH_MAX_RESULTS] = {};
-	correspondence_search_find_pose_candidates(cs_cold, smodel, cold_flags, &found_cold, &pos_thresh,
-	                                           &rot_thresh, &up, SIGMA_TILT, SIGMA_YAW, HUBER_KNEE, COST_WEIGHT,
-	                                           results_cold, CORRESPONDENCE_SEARCH_MAX_RESULTS);
+	correspondence_search_find_pose_candidates(cs_cold, smodel, cold_flags, UINT32_MAX, &found_cold,
+	                                           &pos_thresh, &rot_thresh, &up, SIGMA_TILT, SIGMA_YAW, HUBER_KNEE,
+	                                           COST_WEIGHT, results_cold, CORRESPONDENCE_SEARCH_MAX_RESULTS);
 	CHECK(cs_cold->num_pose_checks_pruned == 0u);
 
 	correspondence_search_free(cs_cold);
@@ -1231,4 +1232,86 @@ TEST_CASE("joint contention: split is bounded and favours the better-fitting own
 	CHECK(r.dev_marginal[0] <= r.dev_hard_rho[0] + 1e-12);
 	CHECK(r.dev_marginal[1] <= r.dev_hard_rho[1] + 1e-12);
 	CHECK(r.dev_marginal[0] < r.dev_marginal[1]);
+}
+
+TEST_CASE("work budget: proportional largest-remainder split is exact and deterministic")
+{
+	// Exact proportional case: no remainder to distribute.
+	{
+		const uint32_t w[3] = {1, 1, 2};
+		uint32_t a[3] = {};
+		g2_work_budget_split(100, w, 3, a);
+		CHECK(a[0] == 25);
+		CHECK(a[1] == 25);
+		CHECK(a[2] == 50);
+	}
+
+	// Largest remainder wins the leftover unit: weights {4,5,1} of 11 floor to {4,5,1}
+	// with remainders {4,5,1}/10 — the middle scope (largest remainder) gets the extra.
+	{
+		const uint32_t w[3] = {4, 5, 1};
+		uint32_t a[3] = {};
+		g2_work_budget_split(11, w, 3, a);
+		CHECK(a[0] == 4);
+		CHECK(a[1] == 6);
+		CHECK(a[2] == 1);
+	}
+
+	// Equal remainders tie-break to the LOWER scope index.
+	{
+		const uint32_t w[3] = {3, 3, 3};
+		uint32_t a[3] = {};
+		g2_work_budget_split(10, w, 3, a);
+		CHECK(a[0] == 4);
+		CHECK(a[1] == 3);
+		CHECK(a[2] == 3);
+	}
+
+	// All-zero weights fall back to an equal split (remainder again to the lowest index).
+	{
+		const uint32_t w[3] = {0, 0, 0};
+		uint32_t a[3] = {};
+		g2_work_budget_split(10, w, 3, a);
+		CHECK(a[0] == 4);
+		CHECK(a[1] == 3);
+		CHECK(a[2] == 3);
+	}
+
+	// A zero-weight scope among nonzero weights gets exactly zero.
+	{
+		const uint32_t w[2] = {0, 5};
+		uint32_t a[2] = {};
+		g2_work_budget_split(9, w, 2, a);
+		CHECK(a[0] == 0);
+		CHECK(a[1] == 9);
+	}
+
+	// Same inputs -> same splits, and the assignment always sums to the total (the wave-B/C
+	// pre-assignment invariant: the per-frame budget can never be oversubscribed).
+	{
+		const uint32_t w[5] = {7, 0, 13, 13, 2};
+		uint32_t a1[5] = {};
+		uint32_t a2[5] = {};
+		g2_work_budget_split(40000, w, 5, a1);
+		g2_work_budget_split(40000, w, 5, a2);
+		uint32_t sum = 0;
+		for (int i = 0; i < 5; i++) {
+			CHECK(a1[i] == a2[i]);
+			sum += a1[i];
+		}
+		CHECK(sum == 40000);
+	}
+}
+
+TEST_CASE("work budget: wave-D takes are capped, drain the remainder, and never go negative")
+{
+	uint32_t remaining = 6000;
+	CHECK(g2_work_budget_take(&remaining, 2560) == 2560); // full slice
+	CHECK(remaining == 3440);
+	CHECK(g2_work_budget_take(&remaining, 2560) == 2560);
+	CHECK(remaining == 880);
+	CHECK(g2_work_budget_take(&remaining, 2560) == 880); // clipped to what's left
+	CHECK(remaining == 0);
+	CHECK(g2_work_budget_take(&remaining, 2560) == 0); // exhausted stays at zero
+	CHECK(remaining == 0);
 }

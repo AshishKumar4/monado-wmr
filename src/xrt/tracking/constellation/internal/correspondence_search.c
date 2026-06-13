@@ -15,7 +15,6 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <math.h>
-#include <limits.h>
 
 #include "math/m_vec3.h"
 #include "os/os_time.h"
@@ -31,7 +30,14 @@
 #define CHECK_ALL_PROJECTIONS 0
 
 #define MAX_LED_SEARCH_DEPTH 6
-#define BOUNDED_SEARCH_MAX_TRIALS 512
+
+/* Deterministic work-unit budget currency. 1 unit = 1 P3P trial (measured 228ns/trial on the
+ * band-2 clutter capture: assoc_ms = 4.22ms + 228ns/trial, R²=0.987); a full pose check
+ * (projection + blob match) costs 5 units (measured 1095ns ≈ 4.8 trial-equivalents; the
+ * admissible-bound pruned exits stay free). A charge is denied — never partially granted —
+ * when it would exceed the pass's pre-assigned allowance, so a pass can NEVER overspend and
+ * the caller's per-frame budget holds exactly. */
+#define CS_WORK_UNITS_PER_POSE_CHECK 5
 
 /* This file implements a brute-force correspondence search between LED models and observed IR LED blobs.
  *
@@ -97,6 +103,20 @@ correspondence_search_new(struct camera_model *camera_calib)
 #else
 #define LOG(s, ...)
 #endif
+
+/* Charge @units against the pass allowance. Denial latches cs->budget_exhausted, which the
+ * search recursion seams consult to unwind; the spend depends only on the pass inputs +
+ * allowance, so identical inputs charge identically (the determinism contract). */
+static bool
+cs_charge_work(struct correspondence_search *cs, const struct cs_model_info *mi, uint32_t units)
+{
+	if (units > mi->work_allowance - cs->work_spent) {
+		cs->budget_exhausted = true;
+		return false;
+	}
+	cs->work_spent += units;
+	return true;
+}
 
 static void
 undistort_blob_points(struct blob *blobs, int num_blobs, struct xrt_vec2 *out_points, struct camera_model *calib)
@@ -455,6 +475,10 @@ correspondence_search_project_pose(struct correspondence_search *cs,
 		}
 	}
 
+	if (!cs_charge_work(cs, mi, CS_WORK_UNITS_PER_POSE_CHECK)) {
+		return false;
+	}
+
 	/* Increment stats */
 	cs->num_pose_checks++;
 
@@ -607,7 +631,7 @@ check_led_against_model_subset(struct correspondence_search *cs,
 	y2 = blobs[1]->point_homog;
 	y3 = blobs[2]->point_homog;
 
-	if (cs->num_trials >= mi->max_trials) {
+	if (!cs_charge_work(cs, mi, 1)) {
 		return;
 	}
 	cs->num_trials++;
@@ -769,7 +793,7 @@ select_k_blobs_from_n(struct correspondence_search *cs,
 	/* Short circuit if we found a strong pose match already */
 	if ((mi->match_flags & POSE_MATCH_STRONG) && (mi->search_flags & CS_FLAG_STOP_FOR_STRONG_MATCH))
 		return;
-	if (cs->num_trials >= mi->max_trials)
+	if (cs->budget_exhausted)
 		return;
 
 	if (n > k)
@@ -819,7 +843,7 @@ check_led_match(struct correspondence_search *cs,
 	mi->led_depth = depth;
 
 	for (b = 0; b < cs->num_points; b++) {
-		if (cs->num_trials >= mi->max_trials) {
+		if (cs->budget_exhausted) {
 			return;
 		}
 		struct cs_image_point *anchor = cs->points + b;
@@ -849,7 +873,7 @@ select_k_leds_from_n(struct correspondence_search *cs,
 		/* Short circuit if we found a strong pose match already */
 		if ((mi->match_flags & POSE_MATCH_STRONG) && (mi->search_flags & CS_FLAG_STOP_FOR_STRONG_MATCH))
 			return;
-		if (cs->num_trials >= mi->max_trials)
+		if (cs->budget_exhausted)
 			return;
 
 		/* Check the other orientation of blob 2/3, without
@@ -878,7 +902,7 @@ select_k_leds_from_n(struct correspondence_search *cs,
 	/* Short circuit if we found a strong pose match already */
 	if ((mi->match_flags & POSE_MATCH_STRONG) && (mi->search_flags & CS_FLAG_STOP_FOR_STRONG_MATCH))
 		return;
-	if (cs->num_trials >= mi->max_trials)
+	if (cs->budget_exhausted)
 		return;
 
 	if (n > k)
@@ -938,6 +962,8 @@ search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi
 
 	/* Clear stats */
 	cs->num_trials = cs->num_pose_checks = cs->num_pose_checks_pruned = 0;
+	cs->work_spent = 0;
+	cs->budget_exhausted = false;
 	memset(&cs->last_diag, 0, sizeof(cs->last_diag));
 	cs->last_diag.input_blobs = (uint32_t)cs->num_points;
 	cs->last_diag.best_pose_blob_depth = -1;
@@ -1048,12 +1074,15 @@ finish_search_diagnostics(struct correspondence_search *cs, const struct cs_mode
 	cs->last_diag.best_any_blobs_matched = mi->best_any_score.matched_blobs;
 	cs->last_diag.best_any_unmatched_blobs = mi->best_any_score.unmatched_blobs;
 	cs->last_diag.best_any_reproj_err_px = mi->best_any_score.reprojection_error;
+	cs->last_diag.work_spent = cs->work_spent;
+	cs->last_diag.budget_exhausted = cs->budget_exhausted ? 1 : 0;
 }
 
 int
 correspondence_search_find_pose_candidates(struct correspondence_search *cs,
                                            struct t_constellation_search_model *model,
                                            enum correspondence_search_flags search_flags,
+                                           uint32_t work_allowance,
                                            struct xrt_pose *pose,
                                            struct xrt_vec3 *pos_error_thresh,
                                            struct xrt_vec3 *rot_error_thresh,
@@ -1083,7 +1112,7 @@ correspondence_search_find_pose_candidates(struct correspondence_search *cs,
 	mi.model = model;
 	mi.search_flags = search_flags;
 	mi.match_flags = 0;
-	mi.max_trials = (search_flags & CS_FLAG_BOUNDED_SEARCH) ? BOUNDED_SEARCH_MAX_TRIALS : UINT_MAX;
+	mi.work_allowance = work_allowance;
 
 	if (search_flags & CS_FLAG_HAVE_POSE_PRIOR) {
 		assert(pos_error_thresh != NULL);

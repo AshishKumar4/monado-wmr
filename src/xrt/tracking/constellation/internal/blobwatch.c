@@ -95,6 +95,24 @@
 #define EDGE_R_INFLATE 3.0f
 #define DIM_R_INFLATE_MAX 4.0f
 
+/* Cap-pressure retention: all qualifying extents are staged (bound below), and when more than
+ * MAX_BLOBS_PER_FRAME qualify the survivors are chosen by priority (device-near class first,
+ * then non-static-clutter, by descending local contrast) instead of silently dropping
+ * everything past the cap in scanline order — which evicted bottom-of-frame (hand-height)
+ * LEDs exactly in the clutter-storm frames that hit the cap. */
+#define BLOB_STAGE_MAX 256
+/* Radius for transferring the previous frame's retention class onto a staged blob (the same
+ * spot, allowing for centroid noise — static clutter does not move in the image between
+ * consecutive frames). Matches the static map's image-space match gate. */
+#define STAGE_CLASS_MATCH_PX 3.0f
+
+/* Low end of the dimness-rank span: a blob this far below the frame's brightest LED-credible
+ * blob carries the full DIM_R_INFLATE_MAX. These are the long-validated operating points of the
+ * retired per-frame retention threshold (24 full-frame / 12 inside the gentler predictive-ROI
+ * pass), kept as fixed internal constants — no config plumbing left to flip them mid-session. */
+#define DIM_SPAN_FLOOR 24
+#define DIM_SPAN_FLOOR_ROI 12
+
 #define QUEUE_ENTRIES (NUM_FRAMES_HISTORY + 1)
 
 #define G2_PGM_DUMP_QUEUE_CAP 64
@@ -319,10 +337,10 @@ POP_QUEUE(blobservation_queue *q)
 struct blobwatch
 {
 	uint32_t next_blob_id;
-	uint8_t pixel_threshold;         /* Minimum pixel magnitude considered non-black */
-	uint8_t blob_required_threshold; /* Minimum pixel magnitude a blob must contain somewhere to be retained */
-	uint8_t adapt_margin;            /* Minimum contrast above the local adaptive background */
-	uint8_t cam_id;                  /* Camera index this blobwatch processes (for telemetry) */
+	uint8_t pixel_threshold; /* Minimum pixel magnitude considered non-black */
+	uint8_t adapt_margin;    /* Minimum contrast above the local adaptive background */
+	uint8_t dim_span_floor;  /* Low end of the dimness-rank R-inflation span */
+	uint8_t cam_id;          /* Camera index this blobwatch processes (for telemetry) */
 	int blob_max_wh;
 
 	/* Blob qualification: reject elongated non-LED shapes (window edges, reflections, streaks). An LED
@@ -343,6 +361,11 @@ struct blobwatch
 	 * per pixel (adaptive threshold). Lazily (re)allocated to frame size. */
 	uint32_t *integral;
 	int integral_w, integral_h; /* allocated dims = frame (w+1) x (h+1) */
+
+	/* Per-frame staging for cap-pressure priority retention (single producer; reset by
+	 * process_frame_roi, consumed by finalize_staged_blobs before any other ob consumer). */
+	struct blob stage[BLOB_STAGE_MAX];
+	int num_staged;
 };
 
 /*
@@ -351,7 +374,7 @@ struct blobwatch
  * Returns the newly allocated blobwatch structure.
  */
 blobwatch *
-blobwatch_new(uint8_t pixel_threshold, uint8_t blob_required_threshold, uint8_t cam_id)
+blobwatch_new(uint8_t pixel_threshold, uint8_t cam_id)
 {
 	blobwatch *bw = malloc(sizeof(*bw));
 	int i;
@@ -366,11 +389,7 @@ blobwatch_new(uint8_t pixel_threshold, uint8_t blob_required_threshold, uint8_t 
 	/* Minimum pixel magnitude to be included in a blob at all */
 	bw->pixel_threshold = pixel_threshold;
 	bw->adapt_margin = ADAPT_MARGIN;
-
-	/* Require at least 1 pixel over this threshold in a blob -
-	 * allows for collecting fainter blobs, as long as they have a bright
-	 * point somewhere, and helps to eliminate generally faint background noise */
-	bw->blob_required_threshold = blob_required_threshold;
+	bw->dim_span_floor = DIM_SPAN_FLOOR;
 
 	bw->blob_max_wh = MAX_BLOB_WH;
 	bw->blob_min_aspect = MIN_BLOB_ASPECT;
@@ -661,7 +680,8 @@ store_blob(struct extent *e,
            float led_x,
            float led_y,
            float pos_var_px2,
-           uint8_t brightness)
+           uint8_t brightness,
+           float contrast)
 {
 	b += index;
 	b->blob_id = blob_id;
@@ -681,14 +701,14 @@ store_blob(struct extent *e,
 	b->id_age = 0;
 	b->prev_led_id = b->led_id = LED_INVALID_ID;
 	b->brightness = brightness;
+	b->contrast = contrast;
+	b->retention_class = BLOB_RETENTION_FRESH;
+	b->static_dwell_s = 0.0f;
 }
 
 static void
 extent_to_blobs(blobwatch *bw, blobservation *ob, struct extent *e, int y, struct xrt_frame *frame)
 {
-	const int max_blobs = MAX_BLOBS_PER_FRAME;
-	struct blob *blobs = ob->blobs;
-
 	const uint8_t admission_threshold = bw->pixel_threshold > BLOB_ADMISSION_NOISE_FLOOR
 	                                        ? bw->pixel_threshold
 	                                        : BLOB_ADMISSION_NOISE_FLOOR;
@@ -745,15 +765,20 @@ extent_to_blobs(blobwatch *bw, blobservation *ob, struct extent *e, int y, struc
 
 	/* In the future we could generate multiple blobs from one extent if we detect
 	 * it as multiple LEDs */
-	while (ob->num_blobs < max_blobs) {
+	if (bw->num_staged >= BLOB_STAGE_MAX) {
+		ob->dropped_capacity++;
+		return;
+	}
+
+	{
 		float led_x, led_y, pos_var_px2;
 
 		compute_greysum(bw, frame, e, y, saturated, &led_x, &led_y, &pos_var_px2);
 
 		/* Inflate R for centroid information lost to clipping and to frame-border truncation. The
 		 * saturated fraction (clipped pixels / area) interpolates toward SAT_R_INFLATE_MAX; touching
-		 * the frame border multiplies by EDGE_R_INFLATE (its skirt/contour is one-sided). The remaining
-		 * dimness term is applied in process_frame once the brightest blob is known. */
+		 * the frame border multiplies by EDGE_R_INFLATE (its skirt/contour is one-sided). The
+		 * dimness term is applied in process_frame_roi over the final blob set. */
 		const float sat_frac = (float)e->sat_count / (float)e->area;
 		float infl = 1.0f + sat_frac * (SAT_R_INFLATE_MAX - 1.0f);
 		const bool on_edge = e->left == 0 || e->top == 0 || (int)e->right == (int)frame->width - 1 ||
@@ -762,10 +787,94 @@ extent_to_blobs(blobwatch *bw, blobservation *ob, struct extent *e, int y, struc
 			infl *= EDGE_R_INFLATE;
 		pos_var_px2 *= infl;
 
-		store_blob(e, ob->num_blobs++, y, blobs, bw->next_blob_id++, led_x, led_y, pos_var_px2,
-		           e->max_pixel);
-		break;
+		const float contrast =
+		    (float)e->max_pixel -
+		    (float)local_bg_mean(bw, (int)led_x, (int)led_y, (int)frame->width, (int)frame->height);
+
+		store_blob(e, bw->num_staged++, y, bw->stage, bw->next_blob_id++, led_x, led_y, pos_var_px2,
+		           e->max_pixel, contrast);
 	}
+}
+
+/* Priority retention at the frame blob cap: copy the staged blobs into the observation,
+ * and when more qualified than MAX_BLOBS_PER_FRAME keep by (device-near class first, then
+ * non-static-clutter, then descending contrast; staging order breaks ties) instead of the
+ * old silent scanline-order truncation. The retention class is the PREVIOUS frame's (the
+ * tracker's static map writes it after extraction), transferred by same-spot proximity —
+ * one frame stale is fine for budget ordering and FRESH (never demoted) on any miss.
+ * Survivors keep staging (scanline) order so under-cap frames are byte-identical. */
+static uint8_t
+stale_retention_class(const blobservation *last_ob, float x, float y)
+{
+	if (last_ob == NULL) {
+		return BLOB_RETENTION_FRESH;
+	}
+	float best_distsq = STAGE_CLASS_MATCH_PX * STAGE_CLASS_MATCH_PX;
+	uint8_t cls = BLOB_RETENTION_FRESH;
+	for (int i = 0; i < last_ob->num_blobs; i++) {
+		const struct blob *b = &last_ob->blobs[i];
+		const float dx = (b->x + b->vx) - x;
+		const float dy = (b->y + b->vy) - y;
+		const float distsq = dx * dx + dy * dy;
+		if (distsq <= best_distsq) {
+			best_distsq = distsq;
+			cls = b->retention_class;
+		}
+	}
+	return cls;
+}
+
+struct stage_rank
+{
+	uint8_t class_rank;
+	float contrast;
+	int idx;
+};
+
+static int
+stage_rank_cmp(const void *va, const void *vb)
+{
+	const struct stage_rank *a = va, *b = vb;
+	if (a->class_rank != b->class_rank) {
+		return a->class_rank < b->class_rank ? -1 : 1;
+	}
+	if (a->contrast != b->contrast) {
+		return a->contrast > b->contrast ? -1 : 1;
+	}
+	return a->idx < b->idx ? -1 : 1;
+}
+
+static void
+finalize_staged_blobs(blobwatch *bw, blobservation *ob)
+{
+	if (bw->num_staged <= MAX_BLOBS_PER_FRAME) {
+		memcpy(ob->blobs, bw->stage, (size_t)bw->num_staged * sizeof(struct blob));
+		ob->num_blobs = bw->num_staged;
+		return;
+	}
+
+	struct stage_rank rank[BLOB_STAGE_MAX];
+	for (int i = 0; i < bw->num_staged; i++) {
+		const uint8_t cls = stale_retention_class(bw->last_observation, bw->stage[i].x, bw->stage[i].y);
+		rank[i].class_rank = cls == BLOB_RETENTION_DEVICE_NEAR ? 0
+		                     : cls != BLOB_RETENTION_STATIC_CLUTTER ? 1
+		                                                            : 2;
+		rank[i].contrast = bw->stage[i].contrast;
+		rank[i].idx = i;
+	}
+	qsort(rank, (size_t)bw->num_staged, sizeof(rank[0]), stage_rank_cmp);
+
+	bool keep[BLOB_STAGE_MAX] = {false};
+	for (int k = 0; k < MAX_BLOBS_PER_FRAME; k++) {
+		keep[rank[k].idx] = true;
+	}
+	ob->num_blobs = 0;
+	for (int i = 0; i < bw->num_staged; i++) {
+		if (keep[i]) {
+			ob->blobs[ob->num_blobs++] = bw->stage[i];
+		}
+	}
+	ob->dropped_capacity += bw->num_staged - MAX_BLOBS_PER_FRAME;
 }
 
 /*
@@ -936,6 +1045,9 @@ copy_matching_blob(struct blob *to, struct blob *from)
 	to->id_age = from->id_age;
 	to->led_id = from->led_id;
 	to->age = from->age + 1;
+	/* One-frame-stale retention evidence; the tracker's static map rewrites it post-extraction. */
+	to->retention_class = from->retention_class;
+	to->static_dwell_s = from->static_dwell_s;
 }
 
 static void
@@ -1169,6 +1281,9 @@ recover_dim_blobs(blobwatch *bw,
 			b->id_age = 0;
 			b->prev_led_id = b->led_id = LED_INVALID_ID;
 			b->brightness = (uint8_t)peak;
+			b->contrast = (float)contrast;
+			b->retention_class = BLOB_RETENTION_FRESH;
+			b->static_dwell_s = 0.0f;
 			ob->num_blobs++;
 		}
 	}
@@ -1204,6 +1319,8 @@ process_frame_roi(blobwatch *bw,
 	ob->num_blobs = 0;
 	ob->dropped_dark_blobs = 0;
 	ob->dropped_shape_blobs = 0;
+	ob->dropped_capacity = 0;
+	bw->num_staged = 0;
 
 	build_integral(bw, frame);
 
@@ -1234,25 +1351,32 @@ process_frame_roi(blobwatch *bw,
 		}
 	}
 
+	finalize_staged_blobs(bw, ob);
+
 	const bool is_full_frame = roi_x == 0 && roi_y == 0 && roi_x_end == frame->width && roi_y_end == frame->height;
 	if (!is_full_frame) {
 		recover_dim_blobs(bw, ob, frame, roi_x, roi_y, roi_x_end, roi_y_end);
 	}
 
-	/* Dimness-rank R inflation: identical to process_frame, scoped to the ROI blobs found. */
-	if (ob->num_blobs >= 2) {
-		uint8_t bmax = 0;
-		for (int i = 0; i < ob->num_blobs; i++)
-			bmax = MAX(bmax, ob->blobs[i].brightness);
-		const float span = (float)bmax - (float)bw->blob_required_threshold;
-		if (span > 0.0f) {
-			for (int i = 0; i < ob->num_blobs; i++) {
-				struct blob *b = &ob->blobs[i];
-				float dim = ((float)bmax - (float)b->brightness) / span;
-				if (dim < 0.0f)
-					dim = 0.0f;
-				b->pos_var_px2 *= 1.0f + dim * (DIM_R_INFLATE_MAX - 1.0f);
-			}
+	/* Dimness R inflation, anchored at the FIXED saturation reference — never at the frame's
+	 * brightest blob: the brightest blob is room clutter (a window/lamp) in ~1/5 of cluttered
+	 * frames, which inflated every LED's R by x3.5 median (p90 x5.7) and coupled the matcher's
+	 * measurement noise — and so the association margins — to room content. A blob at the
+	 * clipping level is a fully credible LED (dim ~= 0); one at the span floor carries the
+	 * full inflation. Legacy frames were dominated by a saturated/near-saturated anchor, so
+	 * the fixed reference reproduces the validated R operating point across the dim band
+	 * while making R a pure function of the blob itself; the [0,1] clamp removes the legacy
+	 * collapsed-span pathology (implied inflation up to x46 for sub-floor blobs). */
+	{
+		const float span = (float)SATURATION_LEVEL - (float)bw->dim_span_floor;
+		for (int i = 0; i < ob->num_blobs; i++) {
+			struct blob *b = &ob->blobs[i];
+			float dim = ((float)SATURATION_LEVEL - (float)b->brightness) / span;
+			if (dim < 0.0f)
+				dim = 0.0f;
+			if (dim > 1.0f)
+				dim = 1.0f;
+			b->pos_var_px2 *= 1.0f + dim * (DIM_R_INFLATE_MAX - 1.0f);
 		}
 	}
 }
@@ -1283,12 +1407,11 @@ blobwatch_process_roi_lowthresh(blobwatch *bw,
                                 int roi_h,
                                 uint8_t roi_pixel_threshold,
                                 uint8_t roi_adapt_margin,
-                                uint8_t roi_required_threshold,
                                 blobservation **output)
 {
 	const uint8_t saved_pixel = bw->pixel_threshold;
 	const uint8_t saved_adapt = bw->adapt_margin;
-	const uint8_t saved_required = bw->blob_required_threshold;
+	const uint8_t saved_span_floor = bw->dim_span_floor;
 
 	if (roi_pixel_threshold != 0 && roi_pixel_threshold < saved_pixel) {
 		bw->pixel_threshold = roi_pixel_threshold;
@@ -1296,15 +1419,13 @@ blobwatch_process_roi_lowthresh(blobwatch *bw,
 	if (roi_adapt_margin != 0 && roi_adapt_margin < saved_adapt) {
 		bw->adapt_margin = roi_adapt_margin;
 	}
-	if (roi_required_threshold != 0 && roi_required_threshold < saved_required) {
-		bw->blob_required_threshold = roi_required_threshold;
-	}
+	bw->dim_span_floor = DIM_SPAN_FLOOR_ROI;
 
 	blobwatch_process_roi(bw, frame, exposure, gain, roi_x, roi_y, roi_w, roi_h, output);
 
 	bw->pixel_threshold = saved_pixel;
 	bw->adapt_margin = saved_adapt;
-	bw->blob_required_threshold = saved_required;
+	bw->dim_span_floor = saved_span_floor;
 }
 
 void
@@ -1361,7 +1482,7 @@ blobwatch_process_roi(blobwatch *bw,
 	 * exposure is the authoritative per-frame value read from the camera's pixel header
 	 * (plumbed in by the caller); gain is the commanded value (0 if unknown). */
 	g2_telem_frame(bw->cam_id, (uint64_t)frame->timestamp, (uint32_t)frame->source_sequence,
-	               (uint16_t)ob->num_blobs, exposure, gain, 0);
+	               (uint16_t)ob->num_blobs, exposure, gain, 0, (uint16_t)ob->dropped_capacity);
 
 	/* Return observed blobs */
 	if (output) {

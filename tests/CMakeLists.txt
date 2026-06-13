@@ -105,7 +105,8 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 		offline_vio_replay
 		PRIVATE constellation_tracker aux_tracking aux_util aux_math aux_os xrt-interfaces
 				Threads::Threads ${OpenCV_LIBRARIES})
-	target_include_directories(offline_vio_replay PRIVATE ${OpenCV_INCLUDE_DIRS})
+	target_include_directories(offline_vio_replay PRIVATE ${OpenCV_INCLUDE_DIRS}
+							  ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/drivers)
 	set_target_properties(offline_vio_replay PROPERTIES FOLDER monado_tests)
 
 	# Standing regression guardrail: replays the faithful capture through offline_vio_replay and fails if a

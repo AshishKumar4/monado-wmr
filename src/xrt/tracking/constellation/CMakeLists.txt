@@ -29,6 +29,9 @@ add_library(
 	internal/ransac_pnp.h
 	internal/sample.c
 	internal/sample.h
+	internal/static_map.c
+	internal/static_map.h
+	internal/work_budget.h
 	)
 
 target_include_directories(constellation_tracker PRIVATE ${OpenCV_INCLUDE_DIRS})

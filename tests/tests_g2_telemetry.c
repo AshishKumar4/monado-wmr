@@ -69,6 +69,7 @@ struct g2_telem_frame
 	uint16_t exposure;
 	uint16_t gain;
 	uint16_t led_intensity;
+	uint16_t dropped_capacity;
 } G2_PACKED;
 
 struct g2_telem_pose_attempt
@@ -148,6 +149,8 @@ struct g2_telem_search
 	float reproj_err_per_match;
 	float unmatched_per_match;
 	float matched_visible_ratio;
+	uint32_t work_spent;
+	uint8_t budget_exhausted;
 } G2_PACKED;
 
 struct g2_telem_fusion
@@ -183,6 +186,19 @@ struct g2_telem_getpose
 	float px, py, pz, qx, qy, qz, qw;
 	float vx, vy, vz;
 	float wx, wy, wz;
+} G2_PACKED;
+
+struct g2_telem_blob
+{
+	uint64_t t_mono_ns;
+	uint64_t hw_ts_ns;
+	uint8_t cam_id;
+	float x;
+	float y;
+	uint8_t brightness;
+	uint8_t retention_class;
+	float static_dwell_s;
+	float pos_var_px2;
 } G2_PACKED;
 
 #if defined(_MSC_VER)
@@ -335,6 +351,7 @@ slurp(const char *dir, const char *name)
 #define N_FUSION 60000
 #define N_HEAD_POSE 30000
 #define N_GETPOSE 60000
+#define N_BLOB 200000
 
 // Emit in chunks well below each ring's capacity, with a yield between chunks so
 // the continuously-draining writer always frees slots ahead of the producer.
@@ -380,7 +397,7 @@ test_peak(const char *dir)
 	float opt[7] = {1, 2, 3, 0, 0, 0, 1};
 	float pred[7] = {1, 2, 3, 0, 0, 0, 1};
 	for (long i = 0; i < N_FRAME; i++) {
-		g2_telem_frame((uint8_t)(i % 4), (uint64_t)i, (uint32_t)i, 12, 1000, 8, 200);
+		g2_telem_frame((uint8_t)(i % 4), (uint64_t)i, (uint32_t)i, 12, 1000, 8, 200, 3);
 		if ((i % CHUNK) == (CHUNK - 1)) {
 			pace();
 		}
@@ -390,7 +407,7 @@ test_peak(const char *dir)
 		g2_telem_candidate(0, 0, (uint64_t)i, 3, 0, 1, 1, 1, 0x31, 10, 8, 2, 7, 0.5f, 1.0f, 1.5f, 1,
 		                  0.2f, 0.1f, 0.15f, err3, err3, 0.1f, 120.0f, 4.0f, pose);
 		g2_telem_search(0, 0, (uint64_t)i, 1, 6, 0x35, 1, 12, 8, 4, 6, 32, 100, 50, 2, 1, 8, 5, 4, 7,
-		               0x31, 10, 8, 2, 0.5f, G2_SEARCH_BNG_REPROJ_FAIL, 0.0625f, 0.25f, 0.8f);
+		               0x31, 10, 8, 2, 0.5f, G2_SEARCH_BNG_REPROJ_FAIL, 0.0625f, 0.25f, 0.8f, 612, 1);
 		if ((i % CHUNK) == (CHUNK - 1)) {
 			pace();
 		}
@@ -415,6 +432,12 @@ test_peak(const char *dir)
 			pace();
 		}
 	}
+	for (long i = 0; i < N_BLOB; i++) {
+		g2_telem_blob((uint8_t)(i % 4), (uint64_t)i, 320.5f, 240.25f, 30, (uint8_t)(i % 3), 1.5f, 0.75f);
+		if ((i % CHUNK) == (CHUNK - 1)) {
+			pace();
+		}
+	}
 	g2_telem_event(0, g2_telem_now_ns(), G2_TELEM_EV_LOCK_ACQUIRED, 1.0f);
 
 	for (int t = 0; t < N_IMU_THREADS; t++) {
@@ -434,6 +457,7 @@ test_peak(const char *dir)
 	long event_bytes = file_size(dir, "event.bin");
 	long head_pose_bytes = file_size(dir, "head_pose.bin");
 	long getpose_bytes = file_size(dir, "getpose.bin");
+	long blob_bytes = file_size(dir, "blob.bin");
 
 	char *m = slurp(dir, "manifest.json");
 	CHECK(m != NULL, "manifest present");
@@ -446,6 +470,7 @@ test_peak(const char *dir)
 	long event_rs = find_row_size(m, "event");
 	long head_pose_rs = find_row_size(m, "head_pose");
 	long getpose_rs = find_row_size(m, "getpose");
+	long blob_rs = find_row_size(m, "blob");
 
 	long imu_rows = imu_bytes / imu_rs;
 	long frame_rows = frame_bytes / frame_rs;
@@ -456,6 +481,7 @@ test_peak(const char *dir)
 	long event_rows = event_bytes / event_rs;
 	long head_pose_rows = head_pose_bytes / head_pose_rs;
 	long getpose_rows = getpose_bytes / getpose_rs;
+	long blob_rows = blob_bytes / blob_rs;
 
 	fprintf(stderr, "  imu: emitted=%ld written=%ld\n", imu_total, imu_rows);
 	fprintf(stderr, "  frame: emitted=%d written=%ld\n", N_FRAME, frame_rows);
@@ -466,6 +492,7 @@ test_peak(const char *dir)
 	fprintf(stderr, "  event: emitted=1 written=%ld\n", event_rows);
 	fprintf(stderr, "  head_pose: emitted=%d written=%ld\n", N_HEAD_POSE, head_pose_rows);
 	fprintf(stderr, "  getpose: emitted=%d written=%ld\n", N_GETPOSE, getpose_rows);
+	fprintf(stderr, "  blob: emitted=%d written=%ld\n", N_BLOB, blob_rows);
 
 	CHECK(imu_rows == imu_total, "imu count matches (%ld != %ld)", imu_rows, imu_total);
 	CHECK(frame_rows == N_FRAME, "frame count matches");
@@ -475,6 +502,7 @@ test_peak(const char *dir)
 	CHECK(fusion_rows == N_FUSION, "fusion count matches");
 	CHECK(head_pose_rows == N_HEAD_POSE, "head_pose count matches");
 	CHECK(getpose_rows == N_GETPOSE, "getpose count matches");
+	CHECK(blob_rows == N_BLOB, "blob count matches");
 	// event = 1 emitted; with zero overflow there must be NO ring_overflow rows.
 	CHECK(event_rows == 1, "event count matches (zero overflow expected), got %ld", event_rows);
 
@@ -568,6 +596,7 @@ test_offsets(const char *dir)
 	CHKOFF("frame", g2_telem_frame, cam_id);
 	CHKOFF("frame", g2_telem_frame, frame_seq);
 	CHKOFF("frame", g2_telem_frame, led_intensity);
+	CHKOFF("frame", g2_telem_frame, dropped_capacity);
 	CHKOFF("pose_attempt", g2_telem_pose_attempt, outcome);
 	CHKOFF("pose_attempt", g2_telem_pose_attempt, reproj_err_px);
 	CHKOFF("pose_attempt", g2_telem_pose_attempt, qw);
@@ -586,6 +615,8 @@ test_offsets(const char *dir)
 	CHKOFF("search", g2_telem_search, reproj_err_px);
 	CHKOFF("search", g2_telem_search, bng_reason_flags);
 	CHKOFF("search", g2_telem_search, matched_visible_ratio);
+	CHKOFF("search", g2_telem_search, work_spent);
+	CHKOFF("search", g2_telem_search, budget_exhausted);
 	CHKOFF("fusion", g2_telem_fusion, pos_residual_m);
 	CHKOFF("fusion", g2_telem_fusion, opt_px);
 	CHKOFF("fusion", g2_telem_fusion, opt_qw);
@@ -602,6 +633,11 @@ test_offsets(const char *dir)
 	CHKOFF("getpose", g2_telem_getpose, qw);
 	CHKOFF("getpose", g2_telem_getpose, vx);
 	CHKOFF("getpose", g2_telem_getpose, wz);
+	CHKOFF("blob", g2_telem_blob, cam_id);
+	CHKOFF("blob", g2_telem_blob, x);
+	CHKOFF("blob", g2_telem_blob, retention_class);
+	CHKOFF("blob", g2_telem_blob, static_dwell_s);
+	CHKOFF("blob", g2_telem_blob, pos_var_px2);
 
 	// row_size in manifest must equal sizeof the packed struct.
 	CHECK(find_row_size(m, "imu") == (long)sizeof(struct g2_telem_imu), "imu row_size");
@@ -613,6 +649,7 @@ test_offsets(const char *dir)
 	CHECK(find_row_size(m, "event") == (long)sizeof(struct g2_telem_event), "event row_size");
 	CHECK(find_row_size(m, "head_pose") == (long)sizeof(struct g2_telem_head_pose), "head_pose row_size");
 	CHECK(find_row_size(m, "getpose") == (long)sizeof(struct g2_telem_getpose), "getpose row_size");
+	CHECK(find_row_size(m, "blob") == (long)sizeof(struct g2_telem_blob), "blob row_size");
 
 #undef CHKOFF
 	free(m);

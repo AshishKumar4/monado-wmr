@@ -33,7 +33,18 @@ extern "C" {
  * tracking LEDs */
 #define BLOB_PIXEL_THRESHOLD_CV1 0x24
 #define BLOB_PIXEL_THRESHOLD_DK2 0x7f
-#define BLOB_THRESHOLD_MIN_OCULUS 0x40
+
+/* Evidence-accumulating retention class, written per blob by the tracker's per-camera
+ * world-anchored static-clutter map (static_map.h) after blob extraction. Suppression is
+ * ordering/priority only — a STATIC_CLUTTER blob is never deleted, it is searched last and
+ * evicted first at the frame blob cap. DEVICE_NEAR marks blobs inside the exemption radius
+ * of a device's predicted or last-seen LEDs (tracked or not) and is never demoted. */
+enum blob_retention_class
+{
+	BLOB_RETENTION_FRESH = 0,
+	BLOB_RETENTION_DEVICE_NEAR = 1,
+	BLOB_RETENTION_STATIC_CLUTTER = 2,
+};
 
 struct blob
 {
@@ -63,6 +74,18 @@ struct blob
 	/* The max brightness we see in the blob */
 	uint8_t brightness;
 
+	/* Peak contrast over the local adaptive background (max_pixel - local box mean), the
+	 * strongest single-frame LED-vs-clutter feature measured on the hand-GT pool (AUC 0.807
+	 * vs 0.749 for raw peak). Used for priority retention at the frame blob cap and
+	 * available to association clutter priors. */
+	float contrast;
+
+	/* Static-clutter retention evidence (enum blob_retention_class + accumulated world-static
+	 * dwell in seconds). Written by the tracker's static map each frame; carried one frame
+	 * through the blob tracker so blobwatch's cap-pressure retention can use it. */
+	uint8_t retention_class;
+	float static_dwell_s;
+
 	/* bounding box */
 	uint16_t top;
 	uint16_t left;
@@ -89,13 +112,16 @@ struct blobservation
 
 	int dropped_dark_blobs;
 	int dropped_shape_blobs;
+	/* Qualifying blobs that lost the priority selection at MAX_BLOBS_PER_FRAME (previously
+	 * dropped silently in scanline order, evicting bottom-of-frame LEDs in storm frames). */
+	int dropped_capacity;
 };
 
 typedef struct blobwatch blobwatch;
 typedef struct blobservation blobservation;
 
 blobwatch *
-blobwatch_new(uint8_t pixel_threshold, uint8_t blob_required_threshold, uint8_t cam_id);
+blobwatch_new(uint8_t pixel_threshold, uint8_t cam_id);
 void
 blobwatch_free(blobwatch *bw);
 void
@@ -131,7 +157,6 @@ blobwatch_process_roi_lowthresh(blobwatch *bw,
                                 int roi_h,
                                 uint8_t roi_pixel_threshold,
                                 uint8_t roi_adapt_margin,
-                                uint8_t roi_required_threshold,
                                 blobservation **output);
 void
 blobwatch_update_labels(blobwatch *bw, blobservation *ob, uint8_t device_id);
