@@ -88,12 +88,26 @@
  * symmetry information its centre relies on, so its variance is inflated up to these multiples. Derived as
  * worst-case multipliers on the measured spread, not absolute pixel magic numbers: at full saturation the
  * usable signal is the contour alone (~SAT_R_INFLATE_MAX wider), and a contour cut by the frame border is
- * one-sided (~EDGE_R_INFLATE wider). A blob far dimmer than the frame's brightest credible spot is a weaker
- * LED candidate (possible faint reflection), so its R is scaled up to DIM_R_INFLATE_MAX as it approaches the
- * detect floor. All are linear blends keyed to a measured fraction in [0,1] -> no abrupt cull. */
+ * one-sided (~EDGE_R_INFLATE wider). Dim blobs carry the measured brightness-noise inflation below,
+ * capped at DIM_R_INFLATE_MAX. All factors are smooth in the blob's own measurements -> no abrupt cull. */
 #define SAT_R_INFLATE_MAX 4.0f
 #define EDGE_R_INFLATE 3.0f
 #define DIM_R_INFLATE_MAX 4.0f
+
+/* Measured centroid-noise law (results/h6-rmodel-20260612, 161k held-out LED<->blob residuals
+ * across four captures, DOF-corrected): sigma^2(brightness) = S0 + A/brightness^2 px^2 — the
+ * photometric-centroid noise scales as pixel-noise / peak-signal on a near-zero short-exposure
+ * background, on top of a brightness-independent floor. R therefore carries the variance ratio
+ * g(b) = 1 + (K/b)^2, K = sqrt(A/S0): a pure function of the blob (H5 invariant: no per-frame
+ * anchor, no room-content coupling), capped at DIM_R_INFLATE_MAX (the long-validated worst case;
+ * binds below b ~ 23, where the fit under-estimates anyway). The law form replicates on every
+ * capture and device independently; K is calibrated at the production gain-16 operating point
+ * (K = 40.5 / 39.0 per device on the felt-validation capture; the calmer May-era captures give
+ * K = 21..27, i.e. the same law with less per-pixel noise). At the gain-16 dim band (b ~ 22..45)
+ * this yields x1.8..4.0 — the measured truth, matching the long-validated frame-anchored dim-band
+ * operating point without its room-content coupling, and well below the saturation-anchored flat
+ * x3.7..4.0 that deflated acceptance nats on dim clutter and bright LED spots alike. */
+#define DIM_NOISE_BRIGHTNESS_K 40.0f
 
 /* Cap-pressure retention: all qualifying extents are staged (bound below), and when more than
  * MAX_BLOBS_PER_FRAME qualify the survivors are chosen by priority (device-near class first,
@@ -105,13 +119,6 @@
  * spot, allowing for centroid noise — static clutter does not move in the image between
  * consecutive frames). Matches the static map's image-space match gate. */
 #define STAGE_CLASS_MATCH_PX 3.0f
-
-/* Low end of the dimness-rank span: a blob this far below the frame's brightest LED-credible
- * blob carries the full DIM_R_INFLATE_MAX. These are the long-validated operating points of the
- * retired per-frame retention threshold (24 full-frame / 12 inside the gentler predictive-ROI
- * pass), kept as fixed internal constants — no config plumbing left to flip them mid-session. */
-#define DIM_SPAN_FLOOR 24
-#define DIM_SPAN_FLOOR_ROI 12
 
 #define QUEUE_ENTRIES (NUM_FRAMES_HISTORY + 1)
 
@@ -339,7 +346,6 @@ struct blobwatch
 	uint32_t next_blob_id;
 	uint8_t pixel_threshold; /* Minimum pixel magnitude considered non-black */
 	uint8_t adapt_margin;    /* Minimum contrast above the local adaptive background */
-	uint8_t dim_span_floor;  /* Low end of the dimness-rank R-inflation span */
 	uint8_t cam_id;          /* Camera index this blobwatch processes (for telemetry) */
 	int blob_max_wh;
 
@@ -389,7 +395,6 @@ blobwatch_new(uint8_t pixel_threshold, uint8_t cam_id)
 	/* Minimum pixel magnitude to be included in a blob at all */
 	bw->pixel_threshold = pixel_threshold;
 	bw->adapt_margin = ADAPT_MARGIN;
-	bw->dim_span_floor = DIM_SPAN_FLOOR;
 
 	bw->blob_max_wh = MAX_BLOB_WH;
 	bw->blob_min_aspect = MIN_BLOB_ASPECT;
@@ -539,7 +544,7 @@ parabolic_subpixel_refine(float lo, float c, float hi, int peak, float *out)
  * (second central moment): a fat spot localises its centre less precisely. It is
  * the source-of-truth per-blob R that a downstream matcher can use to weight the
  * reprojection cost; @ref store_blob inflates it further for saturation, frame-edge
- * truncation and relative dimness.
+ * truncation and the measured brightness-noise law.
  */
 static void
 compute_greysum(blobwatch *bw,
@@ -778,7 +783,7 @@ extent_to_blobs(blobwatch *bw, blobservation *ob, struct extent *e, int y, struc
 		/* Inflate R for centroid information lost to clipping and to frame-border truncation. The
 		 * saturated fraction (clipped pixels / area) interpolates toward SAT_R_INFLATE_MAX; touching
 		 * the frame border multiplies by EDGE_R_INFLATE (its skirt/contour is one-sided). The
-		 * dimness term is applied in process_frame_roi over the final blob set. */
+		 * brightness-noise term is applied in process_frame_roi over the final blob set. */
 		const float sat_frac = (float)e->sat_count / (float)e->area;
 		float infl = 1.0f + sat_frac * (SAT_R_INFLATE_MAX - 1.0f);
 		const bool on_edge = e->left == 0 || e->top == 0 || (int)e->right == (int)frame->width - 1 ||
@@ -1302,7 +1307,7 @@ done:
  *
  * The integral image for the adaptive threshold is built over the full frame (the local-background
  * lookup is correct for any pixel inside the ROI); the cost saving is from not scanning rows or
- * columns outside the ROI. The dimness-rank inflation is computed only over the blobs found.
+ * columns outside the ROI. The brightness-noise inflation is applied only over the blobs found.
  */
 static void
 process_frame_roi(blobwatch *bw,
@@ -1358,26 +1363,21 @@ process_frame_roi(blobwatch *bw,
 		recover_dim_blobs(bw, ob, frame, roi_x, roi_y, roi_x_end, roi_y_end);
 	}
 
-	/* Dimness R inflation, anchored at the FIXED saturation reference — never at the frame's
-	 * brightest blob: the brightest blob is room clutter (a window/lamp) in ~1/5 of cluttered
-	 * frames, which inflated every LED's R by x3.5 median (p90 x5.7) and coupled the matcher's
-	 * measurement noise — and so the association margins — to room content. A blob at the
-	 * clipping level is a fully credible LED (dim ~= 0); one at the span floor carries the
-	 * full inflation. Legacy frames were dominated by a saturated/near-saturated anchor, so
-	 * the fixed reference reproduces the validated R operating point across the dim band
-	 * while making R a pure function of the blob itself; the [0,1] clamp removes the legacy
-	 * collapsed-span pathology (implied inflation up to x46 for sub-floor blobs). */
-	{
-		const float span = (float)SATURATION_LEVEL - (float)bw->dim_span_floor;
-		for (int i = 0; i < ob->num_blobs; i++) {
-			struct blob *b = &ob->blobs[i];
-			float dim = ((float)SATURATION_LEVEL - (float)b->brightness) / span;
-			if (dim < 0.0f)
-				dim = 0.0f;
-			if (dim > 1.0f)
-				dim = 1.0f;
-			b->pos_var_px2 *= 1.0f + dim * (DIM_R_INFLATE_MAX - 1.0f);
-		}
+	/* Brightness-honest R inflation: the MEASURED centroid-noise variance ratio
+	 * g(b) = 1 + (K/b)^2 (see DIM_NOISE_BRIGHTNESS_K). Never anchored at the frame's brightest
+	 * blob — the brightest blob is room clutter (a window/lamp) in ~1/5 of cluttered frames,
+	 * which inflated every LED's R by x3.5 median and coupled the association margins to room
+	 * content. A pure function of the blob's own peak: brightness is the peak signal the
+	 * photometric centroid is estimated from, so its noise contribution falls as 1/b^2 onto the
+	 * brightness-independent floor (g -> 1 for bright blobs). The cap keeps the worst-case dim
+	 * blob at the long-validated DIM_R_INFLATE_MAX operating point. */
+	for (int i = 0; i < ob->num_blobs; i++) {
+		struct blob *b = &ob->blobs[i];
+		const float k = DIM_NOISE_BRIGHTNESS_K / (float)b->brightness;
+		float g = 1.0f + k * k;
+		if (g > DIM_R_INFLATE_MAX)
+			g = DIM_R_INFLATE_MAX;
+		b->pos_var_px2 *= g;
 	}
 }
 
@@ -1411,7 +1411,6 @@ blobwatch_process_roi_lowthresh(blobwatch *bw,
 {
 	const uint8_t saved_pixel = bw->pixel_threshold;
 	const uint8_t saved_adapt = bw->adapt_margin;
-	const uint8_t saved_span_floor = bw->dim_span_floor;
 
 	if (roi_pixel_threshold != 0 && roi_pixel_threshold < saved_pixel) {
 		bw->pixel_threshold = roi_pixel_threshold;
@@ -1419,13 +1418,11 @@ blobwatch_process_roi_lowthresh(blobwatch *bw,
 	if (roi_adapt_margin != 0 && roi_adapt_margin < saved_adapt) {
 		bw->adapt_margin = roi_adapt_margin;
 	}
-	bw->dim_span_floor = DIM_SPAN_FLOOR_ROI;
 
 	blobwatch_process_roi(bw, frame, exposure, gain, roi_x, roi_y, roi_w, roi_h, output);
 
 	bw->pixel_threshold = saved_pixel;
 	bw->adapt_margin = saved_adapt;
-	bw->dim_span_floor = saved_span_floor;
 }
 
 void

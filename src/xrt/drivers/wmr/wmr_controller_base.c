@@ -1352,14 +1352,16 @@ static bool
 wmr_controller_base_get_pose_uncertainty(struct xrt_device *xdev,
                                          double *position_std,
                                          double *orientation_std,
-                                         double *yaw_std)
+                                         double *yaw_std,
+                                         double *tilt_std)
 {
 	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
 	if (wcb->kalman_fusion == NULL) {
 		return false;
 	}
 	// The fusion reads its published snapshot wait-free, so no data_lock is needed here.
-	return kalman_fusion_get_pose_uncertainty(wcb->kalman_fusion, position_std, orientation_std, yaw_std);
+	return kalman_fusion_get_pose_uncertainty(wcb->kalman_fusion, position_std, orientation_std, yaw_std,
+	                                          tilt_std);
 }
 
 static bool

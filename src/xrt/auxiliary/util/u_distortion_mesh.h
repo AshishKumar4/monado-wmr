@@ -210,6 +210,26 @@ u_compute_distortion_bounds_poly_3k(const struct xrt_matrix_3x3 *inv_affine_xfor
                                     struct xrt_vec2 *out_tex_x_range,
                                     struct xrt_vec2 *out_tex_y_range);
 
+/*!
+ * Compute the visibility mask for one eye of a WMR-style display: the region
+ * the lens can show is the factory-calibrated visible-area circle
+ * (@p visible_center / @p visible_radius, in full-panel pixels) clipped to
+ * the eye's half of the panel, mapped into render texture UVs through the
+ * same poly 3K distortion the render mesh samples with. @p values must have
+ * its texture ranges filled in (see u_compute_distortion_bounds_poly_3k) and
+ * @p fov must be the FoV derived from them. The caller must free the mask.
+ *
+ * @ingroup aux_distortion
+ */
+void
+u_compute_visibility_mask_poly_3k(struct u_poly_3k_eye_values *values,
+                                  uint32_t view,
+                                  struct xrt_vec2 visible_center,
+                                  float visible_radius,
+                                  const struct xrt_fov *fov,
+                                  enum xrt_visibility_mask_type type,
+                                  struct xrt_visibility_mask **out_mask);
+
 
 /*
  *

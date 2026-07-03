@@ -166,12 +166,13 @@ bool
 kalman_fusion_get_pose_uncertainty(struct KalmanFusionInterfaceWrapper *wrapper,
                                    double *position_std,
                                    double *orientation_std,
-                                   double *yaw_std)
+                                   double *yaw_std,
+                                   double *tilt_std)
 {
 	if (wrapper == nullptr) {
 		return false;
 	}
-	return wrapper->fusion->get_pose_uncertainty(position_std, orientation_std, yaw_std);
+	return wrapper->fusion->get_pose_uncertainty(position_std, orientation_std, yaw_std, tilt_std);
 }
 
 bool

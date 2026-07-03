@@ -47,6 +47,10 @@ struct tracking_sample_device_state
 	 * anisotropic yaw scale. Tight when the yaw prior is fresh (the prior term picks the prior-consistent
 	 * twin); large after a long dropout / cold start (the yaw term vanishes, reprojection decides). */
 	float prior_yaw_sigma_rad;
+	/* Live fusion horizontal-plane (gravity-observable tilt) 1-sigma, in radians, for the prior cost's
+	 * tilt scale — clamped to [FLIP_COST_TILT_SIGMA_MIN, GRAVITY_TILT_TOL]: tight when gravity-observed
+	 * (a tilt twin is decisively penalised), honestly widened during violent dynamics. */
+	float prior_tilt_sigma_rad;
 
 	bool gravity_ref_valid;
 	bool gravity_ref_clean;

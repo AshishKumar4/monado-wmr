@@ -1081,9 +1081,9 @@ cb_cache_pnp_pose_candidate(struct xrt_device *xdev, timepoint_ns t, const struc
 	kalman_fusion_cache_pnp_pose_candidate(c->kf, t + ctrl_optical_td_ns(), pose, ctrl_head_pose(c, t, &hp));
 }
 bool
-cb_get_unc(struct xrt_device *xdev, double *ps, double *os, double *ys)
+cb_get_unc(struct xrt_device *xdev, double *ps, double *os, double *ys, double *ts)
 {
-	return kalman_fusion_get_pose_uncertainty(reinterpret_cast<FakeController *>(xdev)->kf, ps, os, ys);
+	return kalman_fusion_get_pose_uncertainty(reinterpret_cast<FakeController *>(xdev)->kf, ps, os, ys, ts);
 }
 bool
 cb_get_predicted_pose(struct xrt_device *xdev, timepoint_ns when_ns, struct xrt_space_relation *out)

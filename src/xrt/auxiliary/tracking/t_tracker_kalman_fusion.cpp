@@ -497,6 +497,8 @@ namespace {
 		double position_var_max;     //!< largest eigenvalue of P[EP,EP] (m^2): worst-direction position variance
 		double orientation_var_max;  //!< largest eigenvalue of P[ET,ET] (rad^2): worst-direction orientation variance
 		double orientation_yaw_var;  //!< up'·P[ET,ET]·up: the world-up (yaw) DoF variance alone (rad^2)
+		double orientation_tilt_var; //!< largest eigenvalue of P[ET,ET] restricted to the horizontal
+		                             //!< (gravity-observable tilt) plane (rad^2)
 		double acceleration_var_max; //!< largest eigenvalue of P[EBA,EBA] ((m/s^2)^2): dominant render-accel uncertainty
 		double gravity_corrected_q[4];
 		double gravity_excess_m_s2;
@@ -655,7 +657,10 @@ namespace {
 		debug_get_nis_stats(double *mean_per_dof, double *last_per_dof) override;
 
 		bool
-		get_pose_uncertainty(double *position_std, double *orientation_std, double *yaw_std) override
+		get_pose_uncertainty(double *position_std,
+		                     double *orientation_std,
+		                     double *yaw_std,
+		                     double *tilt_std) override
 		{
 			const FilterSnapshot snap = read_snapshot();
 			if (!snap.tracked) {
@@ -677,6 +682,13 @@ namespace {
 			// dropout — tilt (gravity-anchored, observable) never widens the yaw scale.
 			if (yaw_std != nullptr) {
 				*yaw_std = std::sqrt(std::max(0.0, snap.orientation_yaw_var));
+			}
+			// tilt_std: worst-direction 1-sigma WITHIN the horizontal plane — the gravity-observable
+			// tilt DoFs alone, so the prior's tilt scale can be as tight as gravity actually makes it
+			// and widen honestly during dynamics (the filter widens tilt covariance when the accel
+			// residual can't be trusted), never inflated by an uncertain yaw.
+			if (tilt_std != nullptr) {
+				*tilt_std = std::sqrt(std::max(0.0, snap.orientation_tilt_var));
 			}
 			return true;
 		}
@@ -1860,6 +1872,17 @@ namespace {
 		{
 			const Vector3d up_w(0.0, 1.0, 0.0);
 			s.orientation_yaw_var = up_w.dot(P_theta * up_w);
+			/* Tilt variance: the worst direction WITHIN the horizontal plane (the two
+			 * gravity-observable DoFs), i.e. the largest eigenvalue of the 2x2 restriction of
+			 * P[ET,ET] to span{x,z}. Conservative for any horizontal tilt direction, and never
+			 * inflated by an uncertain yaw the way orientation_var_max is. */
+			Eigen::Matrix<double, 3, 2> H;
+			H << 1.0, 0.0, 0.0, 0.0, 0.0, 1.0;
+			const Eigen::Matrix2d P_tilt = H.transpose() * P_theta * H;
+			s.orientation_tilt_var =
+			    Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d>(P_tilt, Eigen::EigenvaluesOnly)
+			        .eigenvalues()
+			        .maxCoeff();
 		}
 		// Worst-direction accel-bias variance: the world acceleration a_world = R·T_a·(a_m−ba)+G depends on
 		// the accel bias with ∂a_world/∂ba = −R·T_a (orthonormal·scaling ≈ unit), so P[EBA] is the dominant

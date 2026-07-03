@@ -119,11 +119,12 @@ struct t_constellation_tracked_device_callbacks
 	//! position_std (m) and orientation_std (rad) are the worst-direction stds the matcher uses to size
 	//! its prior-consistency gate (tight when tracked, wide after a dropout); yaw_std (rad), when
 	//! non-null, is the orientation std about world-up ALONE — the uncertain yaw DoF, separated from the
-	//! gravity-anchored (observable) tilt — for the mirror-flip cost's yaw scale. Any out pointer may be
-	//! NULL. Optional callback — may be NULL, or return false until the fusion is tracking; the matcher
-	//! then falls back to its fixed default bounds.
+	//! gravity-anchored (observable) tilt — for the mirror-flip cost's yaw scale; tilt_std (rad), when
+	//! non-null, is the worst-direction std within the horizontal (gravity-observable) plane — for the
+	//! prior's tilt scale. Any out pointer may be NULL. Optional callback — may be NULL, or return false
+	//! until the fusion is tracking; the matcher then falls back to its fixed default bounds.
 	bool (*get_pose_uncertainty)(struct xrt_device *xdev, double *position_std, double *orientation_std,
-	                             double *yaw_std);
+	                             double *yaw_std, double *tilt_std);
 	//! Gravity-tilt-corrected held orientation (world<-body) for the matcher's absolute tilt reference.
 	//! @p out_excess_m_s2 is |||f|| - g|; small means low linear acceleration.
 	bool (*get_gravity_tilt_reference)(struct xrt_device *xdev,

@@ -13,7 +13,9 @@
 #include "util/u_debug.h"
 #include "util/u_format.h"
 #include "util/u_distortion_mesh.h"
+#include "util/u_visibility_mask.h"
 
+#include "math/m_mathinclude.h"
 #include "math/m_vec2.h"
 #include "math/m_api.h"
 
@@ -535,6 +537,66 @@ u_compute_distortion_bounds_poly_3k(const struct xrt_matrix_3x3 *inv_affine_xfor
 	out_tex_x_range->y = tanf(out_fov->angle_right);
 	out_tex_y_range->x = tanf(out_fov->angle_down);
 	out_tex_y_range->y = tanf(out_fov->angle_up);
+}
+
+void
+u_compute_visibility_mask_poly_3k(struct u_poly_3k_eye_values *values,
+                                  uint32_t view,
+                                  struct xrt_vec2 visible_center,
+                                  float visible_radius,
+                                  const struct xrt_fov *fov,
+                                  enum xrt_visibility_mask_type type,
+                                  struct xrt_visibility_mask **out_mask)
+{
+	assert(view == 0 || view == 1);
+
+	/* Expand the calibrated circle by 5%: never hide a texel the lens can
+	 * actually show (pupil position and eye relief vary between users), and
+	 * absorb the small mismatch between the crosshair-derived texture
+	 * bounds and the per-texel mapping. Conservative = less hidden area. */
+	const float radius = visible_radius * 1.05f;
+
+	const float half_w = (float)values->channels[0].display_size.x / 2.0f;
+	const float height = (float)values->channels[0].display_size.y;
+	const float x_min = view * half_w;
+	const float x_max = x_min + half_w;
+
+	/* UV of the circle center, the reference for picking the outermost
+	 * color channel on the boundary. */
+	struct xrt_uv_triplet center;
+	u_compute_distortion_poly_3k(values, view, visible_center.x / half_w - view, visible_center.y / height,
+	                             &center);
+
+	struct xrt_vec2 boundary[64];
+	for (uint32_t i = 0; i < ARRAY_SIZE(boundary); i++) {
+		const double theta = 2.0 * M_PI * i / ARRAY_SIZE(boundary);
+
+		/* Clip the circle to the eye's half of the panel: clamping a
+		 * circle point keeps it on the boundary of circle ∩ panel and
+		 * inside the polynomial's calibrated domain. */
+		const float px = fminf(fmaxf(visible_center.x + (float)cos(theta) * radius, x_min), x_max);
+		const float py = fminf(fmaxf(visible_center.y + (float)sin(theta) * radius, 0.f), height);
+
+		struct xrt_uv_triplet d;
+		u_compute_distortion_poly_3k(values, view, px / half_w - view, py / height, &d);
+
+		/* The channels differ by chromatic aberration; keep the one
+		 * farthest out so no channel ever samples a hidden texel. */
+		const struct xrt_vec2 channels[3] = {d.r, d.g, d.b};
+		struct xrt_vec2 outermost = channels[0];
+		float max_dist2 = -1.f;
+		for (uint32_t c = 0; c < ARRAY_SIZE(channels); c++) {
+			const struct xrt_vec2 rel = m_vec2_sub(channels[c], center.g);
+			const float dist2 = m_vec2_dot(rel, rel);
+			if (dist2 > max_dist2) {
+				max_dist2 = dist2;
+				outermost = channels[c];
+			}
+		}
+		boundary[i] = outermost;
+	}
+
+	u_visibility_mask_from_uv_boundary(type, boundary, ARRAY_SIZE(boundary), fov, out_mask);
 }
 
 

@@ -63,8 +63,8 @@ struct blob
 	 * LED centre. Isotropic 1-DoF (the spot is roughly round); a downstream
 	 * matcher can use it as the per-blob measurement noise to Mahalanobis-weight
 	 * reprojection cost (cost = (dx^2+dy^2)/pos_var_px2). Grows with blob spatial
-	 * spread, saturation fraction, frame-edge truncation and relative dimness, so
-	 * a fat/clipped/edge/faint blob is a less certain centre. */
+	 * spread, saturation fraction, frame-edge truncation and the measured
+	 * brightness-noise law, so a fat/clipped/edge/faint blob is a less certain centre. */
 	float pos_var_px2;
 
 	/* Motion vector from previous blob */

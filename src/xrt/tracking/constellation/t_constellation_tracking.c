@@ -83,14 +83,25 @@ DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
 #define MAX_POS_ERROR 0.60
 #define MAX_ROT_ERROR DEG_TO_RAD(60)
 
-/* The tight DRIFTLESS tilt sigma for the soft anisotropic mirror-flip cost. The mirror twin of a few-LED PnP
- * almost always TILTS the controller wrong. Gravity is
- * driftless: the fusion prior's TILT is gravity-anchored (the ESKF keeps
- * anchoring from the controller's accel even through an optical dropout) so the prior tilt is a valid
- * reference even when the yaw prior is stale (the dropout/"snap-back" case the gyro can't catch). A real
- * frame-to-frame tilt is « this within the tracked regime; a tilt flip is ~>=90 deg (>=3 sigma -> huge
- * penalty). Equal to the rotation FLOOR (one knob): the tilt scale tracks the per-axis prior bound. */
+/* Tilt scale for the soft anisotropic mirror-flip / prior-orientation cost. The mirror twin of a few-LED
+ * PnP almost always TILTS the controller wrong, and gravity is driftless: the fusion prior's TILT is
+ * gravity-anchored (the ESKF keeps anchoring from the controller's accel even through an optical dropout)
+ * so the prior tilt is a valid reference even when the yaw prior is stale. The scale is the LIVE fusion
+ * horizontal-plane 1-sigma (see get_pose_uncertainty tilt_std) clamped to
+ * [FLIP_COST_TILT_SIGMA_MIN, GRAVITY_TILT_TOL]:
+ *   - GRAVITY_TILT_TOL (30 deg = the rotation floor MIN_ROT_ERROR, the legacy fixed scale) is now the
+ *     CEILING — the worst case during violent dynamics when the accel residual widens the tilt covariance.
+ *     A fixed 30-deg sigma everywhere was unjustified physics for a gravity-observed DoF: it charged a
+ *     36.7-deg tilt twin only ~1.5 nats, letting a 5-blob single-view accept scrape through at a 0.2-nat
+ *     margin (xv1 cam1_150739624107385; results/h6-rmodel-20260612).
+ *   - FLIP_COST_TILT_SIGMA_MIN mirrors FLIP_COST_YAW_SIGMA_MIN's over-confidence guard: the covariance
+ *     cannot see optical/LED-model/timing error, so the scale never claims more tilt confidence than the
+ *     measured honest-accept envelope. Measured across the four validation captures (54k accepted fits):
+ *     honest tilt-vs-prior error p50 0.5 deg / p90 2.8 / p99 8.5 -> at a 5-deg sigma the honest p99 sits
+ *     at 1.7 sigma (quadratic zone, ~3 nats) while a 36.7-deg tilt twin lands 7.3 sigma (Huber-linear,
+ *     ~35 nats) — decisively rejected instead of margin-threaded. */
 #define GRAVITY_TILT_TOL MIN_ROT_ERROR
+#define FLIP_COST_TILT_SIGMA_MIN DEG_TO_RAD(5)
 
 /* The mirror-flip disambiguation is a SOFT cost re-rank, not a hard veto: for each candidate pose
  * and its mirror twin, cost = reproj_error_px + pose_metrics_prior_orient_cost(...), and the LOWEST-cost
@@ -568,6 +579,7 @@ struct association_cold_scope_task
 	struct xrt_vec3 prior_rot_error;
 	struct xrt_vec3 cam_gravity_vector;
 	float prior_yaw_sigma_rad;
+	float prior_tilt_sigma_rad;
 	enum correspondence_search_flags pass_flags[2];
 	uint32_t work_allowance;
 	bool run_deep;
@@ -771,13 +783,14 @@ static bool
 constellation_tracked_device_connection_get_pose_uncertainty(struct t_constellation_tracked_device_connection *ctdc,
                                                              double *position_std,
                                                              double *orientation_std,
-                                                             double *yaw_std)
+                                                             double *yaw_std,
+                                                             double *tilt_std)
 {
 	bool ret = false;
 
 	os_mutex_lock(&ctdc->lock);
 	if (!ctdc->disconnected && ctdc->cb->get_pose_uncertainty) {
-		ret = ctdc->cb->get_pose_uncertainty(ctdc->xdev, position_std, orientation_std, yaw_std);
+		ret = ctdc->cb->get_pose_uncertainty(ctdc->xdev, position_std, orientation_std, yaw_std, tilt_std);
 	}
 	os_mutex_unlock(&ctdc->lock);
 
@@ -1383,6 +1396,18 @@ association_fold_prior_leds(struct t_constellation_tracker *ct,
 }
 
 #define ASSOC_CLUTTER_NLL 0.2f
+/* Retention evidence inside scoring (H2, results/h2-design-20260703): matching a
+ * STATIC_CLUTTER blob (world-static >= STATIC_MAP_STATIC_DWELL_S outside every device's
+ * exemption, static_map.c) as an LED pays clutter-vs-LED log-odds nats, ramping smoothly from
+ * 0 at the class boundary (no knife-edge) to the per-blob price at the saturation dwell,
+ * capped per hypothesis. Measured on the clutter benchmark: 0/1114 accepted true fits match
+ * any STATIC blob vs 23.9% of wrong candidates (the t+41.519 lock-out fit: 6/7 blobs at
+ * ~3.8 s dwell). Per-blob evidence within one hypothesis is correlated (same map region and
+ * episode) and the exemption is imperfect for a still controller lost > the map gap, so the
+ * cap keeps the worst case overridable by high-evidence fits - evidence, never a veto. */
+#define ASSOC_RETENTION_STATIC_NLL 2.0f
+#define ASSOC_RETENTION_DWELL_SAT_S 3.0f
+#define ASSOC_RETENTION_TOTAL_MAX_NLL 6.0f
 #define ASSOC_POS_PRIOR_WEIGHT 0.25f
 #define ASSOC_VISUAL_LOCK_COST 10.0f
 #define ASSOC_VISUAL_SINGLE_VIEW_LOW_LED_LOCK_COST 8.0f
@@ -1841,7 +1866,7 @@ association_orientation_prior_nll(const struct tracking_sample_device_state *dev
 		return 0.0f;
 	}
 	return (float)pose_metrics_prior_orient_cost(&candidate->orientation, &prior->orientation, up,
-	                                            GRAVITY_TILT_TOL, dev_state->prior_yaw_sigma_rad,
+	                                            dev_state->prior_tilt_sigma_rad, dev_state->prior_yaw_sigma_rad,
 	                                            FLIP_COST_HUBER_KNEE_SIGMA, FLIP_COST_WEIGHT);
 }
 
@@ -1871,13 +1896,24 @@ association_head_anchor_nll(const struct constellation_tracker_device *device,
 
 /* Physical footprint of a controller's LED ring, for cross-device occlusion reasoning. */
 #define ASSOC_PARTNER_BODY_RADIUS_M 0.09
-#define ASSOC_PARTNER_SIGMA_CAP_M 0.30
+#define ASSOC_PARTNER_SIGMA_FLOOR_M 0.01
 
 /* Cross-device occlusion credit: the per-LED detection model assumes independent misses, but at
  * hands-close range the partner controller physically occludes/absorbs this device's LEDs. A
- * visible-but-unmatched LED projecting inside the partner's prior footprint is therefore expected
- * to be missing and must not count as evidence against the hypothesis (without this, the honest
- * high-visibility candidate loses to a sloppy cross-fit and the devices can swap identities). */
+ * visible-but-unmatched LED under the partner's prior footprint is expected to be missing and
+ * must not count as evidence against the hypothesis (without this, the honest high-visibility
+ * candidate loses to a sloppy cross-fit and the devices can swap identities).
+ *
+ * The excuse is weighted by the PROBABILITY the partner actually covers the LED under its prior
+ * (body disc of radius r_b, partner centre ~ isotropic Gaussian sigma_p in the image):
+ *   p_occl = (1 - exp(-r_b^2 / (2 sigma_p^2))) * exp(-max(0, d - r_b)^2 / (2 sigma_p^2))
+ * — the Gaussian mass within one body radius, decayed beyond the disc edge. A tightly-tracked
+ * partner sitting on the LED excuses it fully (p_occl -> 1); a coasting partner with a wide
+ * prior excuses almost nothing anywhere (its occupancy is spread over the whole uncertainty
+ * area). The legacy hard disc of radius r_b + sigma at FULL strength did the inverse — the more
+ * lost the partner, the larger the fully-excused region (up to ~14 nats/view on the felt-clutter
+ * capture), letting a dim-clutter fit 1 m off the true track wipe out its own miss evidence
+ * (proven frame-exact at 20260612-153651 band-2 t+41.519; results/h6-rmodel-20260612). */
 static double
 association_partner_occlusion_credit(const struct constellation_tracking_sample *sample,
                                      const struct tracking_sample_device_state *dev_state,
@@ -1886,7 +1922,8 @@ association_partner_occlusion_credit(const struct constellation_tracking_sample 
                                      const struct pose_metrics_blob_match_info *match_info)
 {
 	double centers_px[CONSTELLATION_MAX_DEVICES][2];
-	double radii_px[CONSTELLATION_MAX_DEVICES];
+	double body_r_px[CONSTELLATION_MAX_DEVICES];
+	double sigma_px[CONSTELLATION_MAX_DEVICES];
 	int n_discs = 0;
 	for (int s = 0; s < sample->n_devices; s++) {
 		const struct tracking_sample_device_state *other = sample->devices + s;
@@ -1906,18 +1943,19 @@ association_partner_occlusion_credit(const struct constellation_tracking_sample 
 		if (!isfinite(sigma) || sigma < 0.0f) {
 			continue;
 		}
-		if (sigma > ASSOC_PARTNER_SIGMA_CAP_M) {
-			sigma = ASSOC_PARTNER_SIGMA_CAP_M;
+		if (sigma < ASSOC_PARTNER_SIGMA_FLOOR_M) {
+			sigma = ASSOC_PARTNER_SIGMA_FLOOR_M;
 		}
 		float u = 0.0f, v = 0.0f;
 		if (!t_camera_models_project(&cam->camera_model.calib, P_cam_other.position.x,
 		                             P_cam_other.position.y, P_cam_other.position.z, &u, &v)) {
 			continue;
 		}
+		const double px_per_m = (double)cam->camera_model.calib.fx / (double)P_cam_other.position.z;
 		centers_px[n_discs][0] = (double)u;
 		centers_px[n_discs][1] = (double)v;
-		radii_px[n_discs] = (ASSOC_PARTNER_BODY_RADIUS_M + (double)sigma) *
-		                    (double)cam->camera_model.calib.fx / (double)P_cam_other.position.z;
+		body_r_px[n_discs] = ASSOC_PARTNER_BODY_RADIUS_M * px_per_m;
+		sigma_px[n_discs] = (double)sigma * px_per_m;
 		n_discs++;
 	}
 	if (n_discs == 0) {
@@ -1930,14 +1968,22 @@ association_partner_occlusion_credit(const struct constellation_tracking_sample 
 		if (led->matched_blob != NULL) {
 			continue;
 		}
+		double p_occl = 0.0;
 		for (int d = 0; d < n_discs; d++) {
 			const double dx = led->pos_px.x - centers_px[d][0];
 			const double dy = led->pos_px.y - centers_px[d][1];
-			if (dx * dx + dy * dy <= radii_px[d] * radii_px[d]) {
-				const double p = pose_metrics_pkf_detection_prob(led->facing_dot);
-				credit += -log(1.0 - p);
-				break;
+			const double dist = sqrt(dx * dx + dy * dy);
+			const double two_var = 2.0 * sigma_px[d] * sigma_px[d];
+			const double mass = 1.0 - exp(-(body_r_px[d] * body_r_px[d]) / two_var);
+			const double over = dist > body_r_px[d] ? dist - body_r_px[d] : 0.0;
+			const double p = mass * exp(-(over * over) / two_var);
+			if (p > p_occl) {
+				p_occl = p;
 			}
+		}
+		if (p_occl > 0.0) {
+			const double p = pose_metrics_pkf_detection_prob(led->facing_dot);
+			credit += p_occl * -log(1.0 - p);
 		}
 	}
 	return credit < match_info->data_nll_detection ? credit : match_info->data_nll_detection;
@@ -2750,6 +2796,7 @@ association_add_pose_hypothesis(struct t_constellation_tracker *ct,
 	 * are not hard negative evidence: edge-FOV and occlusion frames can be legitimate single-view observations. */
 	double total_data_nll_detection = 0.0;
 	double total_fit_nll = 0.0;
+	double total_retention_nll = 0.0;
 	double total_data_nll_missed_if_matched = 0.0;
 
 	for (int match_view_id = 0; match_view_id < sample->n_views; match_view_id++) {
@@ -2808,6 +2855,12 @@ association_add_pose_hypothesis(struct t_constellation_tracker *ct,
 			const double fdy = vled->pos_px.y - vled->matched_blob->y;
 			total_fit_nll += 0.5 * ASSOC_FIT_CAUCHY_K2 *
 			                 log1p((fdx * fdx + fdy * fdy) / (ASSOC_FIT_SIGMA2_PX2 * ASSOC_FIT_CAUCHY_K2));
+			if (vled->matched_blob->retention_class == BLOB_RETENTION_STATIC_CLUTTER) {
+				double ramp = ((double)vled->matched_blob->static_dwell_s - STATIC_MAP_STATIC_DWELL_S) /
+				              (ASSOC_RETENTION_DWELL_SAT_S - STATIC_MAP_STATIC_DWELL_S);
+				ramp = ramp < 0.0 ? 0.0 : (ramp > 1.0 ? 1.0 : ramp);
+				total_retention_nll += ASSOC_RETENTION_STATIC_NLL * ramp;
+			}
 		}
 
 		const double view_error_per_blob = score.matched_blobs > 0
@@ -2888,9 +2941,13 @@ association_add_pose_hypothesis(struct t_constellation_tracker *ct,
 	}
 	hyp.cost.head_anchor_nll = association_head_anchor_nll(device, cam, view, sample, P_cam_obj);
 	hyp.cost.fit_quality_nll = (float)total_fit_nll;
+	hyp.cost.retention_nll = (float)(total_retention_nll < ASSOC_RETENTION_TOTAL_MAX_NLL
+	                                     ? total_retention_nll
+	                                     : (double)ASSOC_RETENTION_TOTAL_MAX_NLL);
 	hyp.cost.temporal_nll = association_temporal_yaw_nll(device, dev_state, sample->timestamp, &hyp.pose_world);
 	hyp.cost.total_nll = hyp.cost.reprojection_nll + hyp.cost.missed_led_nll + hyp.cost.clutter_nll +
-	                     hyp.cost.position_prior_nll + hyp.cost.orientation_prior_nll + hyp.cost.head_anchor_nll;
+	                     hyp.cost.retention_nll + hyp.cost.position_prior_nll + hyp.cost.orientation_prior_nll +
+	                     hyp.cost.head_anchor_nll;
 
 	if ((hyp.flags & ASSOC_HYP_PARTIAL_ONLY) != 0 && association_distinct_view_count(&hyp) < 2) {
 		return false;
@@ -3381,7 +3438,7 @@ association_run_cold_scope_task(void *ptr)
 		task->n_results[pass] = correspondence_search_find_pose_candidates(
 		    task->cs, task->search_model, task->pass_flags[pass],
 		    task->work_allowance - task->work_spent, &P_cam_obj, &task->prior_pos_error,
-		    &task->prior_rot_error, &task->cam_gravity_vector, (float)GRAVITY_TILT_TOL,
+		    &task->prior_rot_error, &task->cam_gravity_vector, task->prior_tilt_sigma_rad,
 		    task->prior_yaw_sigma_rad, (float)FLIP_COST_HUBER_KNEE_SIGMA, (float)FLIP_COST_WEIGHT,
 		    task->results[pass], CORRESPONDENCE_SEARCH_MAX_RESULTS);
 		correspondence_search_get_last_diagnostics(task->cs, &task->diag[pass]);
@@ -3444,6 +3501,7 @@ association_init_cold_scope_task(struct t_constellation_tracker *ct,
 	task->prior_rot_error = dev_state->prior_rot_error;
 	task->cam_gravity_vector = view->cam_gravity_vector;
 	task->prior_yaw_sigma_rad = dev_state->prior_yaw_sigma_rad;
+	task->prior_tilt_sigma_rad = dev_state->prior_tilt_sigma_rad;
 	task->pass_flags[0] = association_cold_search_flags(dev_state, num_blobs, 0, trust_prior);
 	task->pass_flags[1] = association_cold_search_flags(dev_state, num_blobs, 1, trust_prior);
 	task->work_allowance = 0;
@@ -5292,20 +5350,24 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		 * prior-refine accepts frames it would otherwise drop to the slow search) and keeps it tight
 		 * when confident. */
 		float pos_bound = MIN_POS_ERROR, rot_bound = MIN_ROT_ERROR;
-		double pos_std = 0.0, rot_std = 0.0, yaw_std = 0.0;
+		double pos_std = 0.0, rot_std = 0.0, yaw_std = 0.0, tilt_std = 0.0;
 		bool tilt_trusted = false;
 		/* Soft mirror-flip cost's yaw scale: the live fusion YAW-AXIS 1-sigma (the orientation error about
 		 * world-up alone) when tracking, else half a turn (untracked -> the yaw term vanishes). Keyed off the
 		 * yaw DoF specifically, NOT the worst-direction orientation sigma — the gravity-anchored tilt is
 		 * observable and tight, so folding it into the yaw scale would inflate it and conflate two DoFs.
 		 * Floored at FLIP_COST_YAW_SIGMA_MIN (see its definition) so the cost cannot over-trust an
-		 * over-confident prior yaw; the live sigma widens the scale above the floor after a real dropout. */
+		 * over-confident prior yaw; the live sigma widens the scale above the floor after a real dropout.
+		 * The TILT scale is the live horizontal-plane 1-sigma the same way, clamped to
+		 * [FLIP_COST_TILT_SIGMA_MIN, GRAVITY_TILT_TOL] (see the constants' definitions). */
 		float yaw_sigma = (float)FLIP_COST_YAW_SIGMA_MAX;
+		float tilt_sigma = (float)GRAVITY_TILT_TOL;
 		if (constellation_tracked_device_connection_get_pose_uncertainty(device->connection, &pos_std,
-		                                                                 &rot_std, &yaw_std)) {
+		                                                                 &rot_std, &yaw_std, &tilt_std)) {
 			pos_bound = (float)fmin(fmax(PRIOR_GATE_SIGMA * pos_std, MIN_POS_ERROR), MAX_POS_ERROR);
 			rot_bound = (float)fmin(fmax(PRIOR_GATE_SIGMA * rot_std, MIN_ROT_ERROR), MAX_ROT_ERROR);
 			yaw_sigma = (float)fmin(fmax(yaw_std, FLIP_COST_YAW_SIGMA_MIN), FLIP_COST_YAW_SIGMA_MAX);
+			tilt_sigma = (float)fmin(fmax(tilt_std, FLIP_COST_TILT_SIGMA_MIN), GRAVITY_TILT_TOL);
 			/* TILT is driftless (gravity-anchored): trusted whenever the fusion is tracking, even through a
 			 * dropout. The soft cost's yaw scale (yaw_sigma) widens with the live yaw uncertainty, so a
 			 * stale yaw self-deweights rather than needing a binary trust flag. */
@@ -5322,6 +5384,7 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		                                                                   &last_optical_age_ms) &&
 		    last_optical_age_ms > ASSOC_STALE_PRIOR_RECOVERY_AGE_MS;
 		dev_state->prior_yaw_sigma_rad = yaw_sigma;
+		dev_state->prior_tilt_sigma_rad = tilt_sigma;
 		dev_state->prior_pos_error.x = dev_state->prior_pos_error.y = dev_state->prior_pos_error.z =
 		    pos_bound;
 		dev_state->prior_rot_error.x = dev_state->prior_rot_error.y = dev_state->prior_rot_error.z =

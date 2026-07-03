@@ -12,9 +12,11 @@
  */
 
 #include <cstring>
+#include <cstdlib>
 #include <cassert>
 #include <array>
 #include <thread>
+#include <vector>
 
 #include "math/m_api.h"
 #include "ovrd_log.hpp"
@@ -39,6 +41,7 @@ extern "C" {
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_instance.h"
+#include "xrt/xrt_visibility_mask.h"
 
 #include "b_ovrd_generated_bindings.h"
 
@@ -1389,6 +1392,8 @@ private:
 	std::thread *m_poseUpdateThread = NULL;
 	virtual void PoseUpdateThreadFunction();
 
+	void SetHiddenAreaMeshes();
+
 	// clang-format on
 };
 
@@ -1423,6 +1428,79 @@ CDeviceDriver_Monado::PoseUpdateThreadFunction()
 		                                                   sizeof(vr::DriverPose_t));
 	}
 	ovrd_log("Stopping HMD pose update thread\n");
+}
+
+void
+CDeviceDriver_Monado::SetHiddenAreaMeshes()
+{
+	static const struct
+	{
+		enum xrt_visibility_mask_type xrt_type;
+		vr::EHiddenAreaMeshType vr_type;
+	} mesh_types[] = {
+	    {XRT_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH, vr::k_eHiddenAreaMesh_Standard},
+	    {XRT_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH, vr::k_eHiddenAreaMesh_Inverse},
+	    {XRT_VISIBILITY_MASK_TYPE_LINE_LOOP, vr::k_eHiddenAreaMesh_LineLoop},
+	};
+
+	if (m_xdev->get_visibility_mask == NULL) {
+		ovrd_log("Device provides no visibility mask, not setting hidden area meshes\n");
+		return;
+	}
+
+	for (uint32_t eye = 0; eye < 2; eye++) {
+		const struct xrt_fov &fov = m_xdev->hmd->distortion.fov[eye];
+		const float tan_left = tanf(fov.angle_left);
+		const float tan_right = tanf(fov.angle_right);
+		const float tan_up = tanf(fov.angle_up);
+		const float tan_down = tanf(fov.angle_down);
+
+		for (const auto &mt : mesh_types) {
+			struct xrt_visibility_mask *mask = NULL;
+			xrt_result_t xret = xrt_device_get_visibility_mask(m_xdev, mt.xrt_type, eye, &mask);
+			if (xret != XRT_SUCCESS || mask == NULL) {
+				ovrd_log("Failed to get visibility mask type %d for eye %d: %d\n", mt.xrt_type, eye,
+				         xret);
+				continue;
+			}
+
+			const struct xrt_vec2 *verts = xrt_visibility_mask_get_vertices(mask);
+			const uint32_t *indices = xrt_visibility_mask_get_indices(mask);
+
+			// OpenVR wants per-eye render texture UVs (0,0 = upper left) and a
+			// flat non-indexed vertex list: triangle list for the standard and
+			// inverse types, vertex order for the line loop. The conversion is
+			// the exact inverse of the UV->tangent mapping the mask was built
+			// with, using the same per-eye FoV.
+			std::vector<vr::HmdVector2_t> uvs(mask->index_count);
+			for (uint32_t i = 0; i < mask->index_count; i++) {
+				const struct xrt_vec2 &v = verts[indices[i]];
+				uvs[i].v[0] = (v.x - tan_left) / (tan_right - tan_left);
+				uvs[i].v[1] = (tan_up - v.y) / (tan_up - tan_down);
+			}
+			free(mask);
+
+			if (mt.vr_type == vr::k_eHiddenAreaMesh_Standard) {
+				double area = 0;
+				for (size_t i = 0; i + 2 < uvs.size(); i += 3) {
+					const double ax = uvs[i + 1].v[0] - uvs[i].v[0];
+					const double ay = uvs[i + 1].v[1] - uvs[i].v[1];
+					const double bx = uvs[i + 2].v[0] - uvs[i].v[0];
+					const double by = uvs[i + 2].v[1] - uvs[i].v[1];
+					area += fabs(ax * by - ay * bx) / 2;
+				}
+				ovrd_log("Hidden area mesh for eye %d: %u triangles covering %.1f%%\n", eye,
+				         (uint32_t)(uvs.size() / 3), area * 100.0);
+			}
+
+			vr::ETrackedPropertyError err = vr::VRHiddenArea()->SetHiddenArea(
+			    (vr::EVREye)eye, mt.vr_type, uvs.data(), (uint32_t)uvs.size());
+			if (err != vr::TrackedProp_Success) {
+				ovrd_log("Failed to set hidden area mesh type %d for eye %d: %d\n", mt.vr_type, eye,
+				         err);
+			}
+		}
+	}
 }
 
 vr::EVRInitError
@@ -1463,6 +1541,7 @@ CDeviceDriver_Monado::Activate(vr::TrackedDeviceIndex_t unObjectId)
 
 	vr::VRServerDriverHost()->SetDisplayEyeToHead(m_trackedDeviceIndex, left, right);
 
+	SetHiddenAreaMeshes();
 
 	m_poseUpdateThread = new std::thread(&CDeviceDriver_Monado::PoseUpdateThreadFunction, this);
 	if (!m_poseUpdateThread) {

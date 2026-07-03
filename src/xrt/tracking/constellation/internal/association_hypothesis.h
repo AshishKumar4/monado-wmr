@@ -60,6 +60,9 @@ struct association_cost_terms
 	float joint_contention_delta_nll;
 	//! Per-matched-blob Cauchy reprojection NLL (nats); selection-channel only, not in total_nll.
 	float fit_quality_nll;
+	//! Static-clutter retention evidence (nats, in total_nll): dwell-scaled clutter-vs-LED
+	//! log-odds for matched STATIC_CLUTTER blobs (H5 static map), capped per hypothesis.
+	float retention_nll;
 	float total_nll;
 };
 

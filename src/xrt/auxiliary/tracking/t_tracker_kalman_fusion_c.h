@@ -154,13 +154,15 @@ kalman_fusion_predict_led_gate(struct KalmanFusionInterfaceWrapper *wrapper,
 //! Current 1-sigma uncertainty of the predicted pose from the filter covariance: position_std (m) and
 //! orientation_std (rad) are the worst-direction stds for sizing a prior-consistency gate; yaw_std (rad),
 //! when non-null, is the orientation std about world-up ALONE — the uncertain yaw DoF (tilt is
-//! gravity-anchored/observable) — for the mirror-flip cost's yaw scale. Any out may be null. Returns
-//! false until tracking.
+//! gravity-anchored/observable) — for the mirror-flip cost's yaw scale; tilt_std (rad), when non-null, is
+//! the worst-direction std within the horizontal (gravity-observable) plane — for the prior's tilt scale.
+//! Any out may be null. Returns false until tracking.
 bool
 kalman_fusion_get_pose_uncertainty(struct KalmanFusionInterfaceWrapper *wrapper,
                                    double *position_std,
                                    double *orientation_std,
-                                   double *yaw_std);
+                                   double *yaw_std,
+                                   double *tilt_std);
 
 //! Gravity-tilt-corrected held orientation (world<-body), with yaw preserved and tilt snapped to
 //! accelerometer gravity. @p out_excess_m_s2 is |||f|| - g|; small means low linear acceleration.

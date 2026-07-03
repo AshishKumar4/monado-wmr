@@ -23,6 +23,7 @@ set(tests
     tests_worker
     tests_pose
     tests_vec3_angle
+    tests_visibility_mask
 	)
 if(XRT_HAVE_OPENCV)
 	list(APPEND tests tests_kalman_fusion)
@@ -73,6 +74,7 @@ target_link_libraries(tests_pose PRIVATE aux_math)
 target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)
+target_link_libraries(tests_visibility_mask PRIVATE aux_math)
 
 add_executable(tests_association_hypothesis tests_association_hypothesis.cpp)
 target_link_libraries(tests_association_hypothesis PRIVATE xrt-external-catch2 aux_util)

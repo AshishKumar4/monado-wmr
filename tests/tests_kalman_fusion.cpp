@@ -3874,20 +3874,24 @@ TEST_CASE("kalman: reported pose uncertainty falls with tracking and rises when 
 	int64_t t = 1000000;
 	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
 
-	double p = -1.0, r = -1.0, y = -1.0;
-	CHECK(kf->get_pose_uncertainty(&p, &r, &y) == false); // not tracking yet -> unavailable
+	double p = -1.0, r = -1.0, y = -1.0, tl = -1.0;
+	CHECK(kf->get_pose_uncertainty(&p, &r, &y, &tl) == false); // not tracking yet -> unavailable
 
 	// Bootstrap, then read the (large) initial uncertainty before optical has refined it.
 	feed_pose(kf.get(), t, ZERO_VEC, IDENTITY_QUAT);
 	feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
 	t += DT_NS;
-	double pos_boot = 0.0, rot_boot = 0.0, yaw_boot = 0.0;
-	REQUIRE(kf->get_pose_uncertainty(&pos_boot, &rot_boot, &yaw_boot) == true);
+	double pos_boot = 0.0, rot_boot = 0.0, yaw_boot = 0.0, tilt_boot = 0.0;
+	REQUIRE(kf->get_pose_uncertainty(&pos_boot, &rot_boot, &yaw_boot, &tilt_boot) == true);
 	CHECK(pos_boot > 0.0);
 	CHECK(std::isfinite(pos_boot));
 	CHECK(std::isfinite(rot_boot));
 	CHECK(std::isfinite(yaw_boot));
 	CHECK(yaw_boot > 0.0);
+	CHECK(std::isfinite(tilt_boot));
+	CHECK(tilt_boot > 0.0);
+	// Tilt is a horizontal-plane restriction of the orientation error; never above the worst direction.
+	CHECK(tilt_boot <= rot_boot + 1e-9);
 	// Yaw is a single DoF of the orientation error; its std can never exceed the worst-direction one.
 	CHECK(yaw_boot <= rot_boot + 1e-9);
 
@@ -3896,10 +3900,11 @@ TEST_CASE("kalman: reported pose uncertainty falls with tracking and rises when 
 		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
 		t += DT_NS;
 	}
-	double pos_tracked = 0.0, rot_tracked = 0.0, yaw_tracked = 0.0;
-	REQUIRE(kf->get_pose_uncertainty(&pos_tracked, &rot_tracked, &yaw_tracked) == true);
+	double pos_tracked = 0.0, rot_tracked = 0.0, yaw_tracked = 0.0, tilt_tracked = 0.0;
+	REQUIRE(kf->get_pose_uncertainty(&pos_tracked, &rot_tracked, &yaw_tracked, &tilt_tracked) == true);
 	CHECK(pos_tracked < pos_boot); // measurements increase confidence -> tighter gate
 	CHECK(yaw_tracked <= rot_tracked + 1e-9);
+	CHECK(tilt_tracked <= rot_tracked + 1e-9);
 
 	// Optical lost WHILE rotating (gyro != 0 disables ZUPT), so velocity and then position drift.
 	const xrt_vec3 spin = {0.0f, 0.8f, 0.0f};
@@ -3907,13 +3912,18 @@ TEST_CASE("kalman: reported pose uncertainty falls with tracking and rises when 
 		feed_imu(kf.get(), t, accel_rest, spin);
 		t += DT_NS;
 	}
-	double pos_drop = 0.0, rot_drop = 0.0, yaw_drop = 0.0;
-	REQUIRE(kf->get_pose_uncertainty(&pos_drop, &rot_drop, &yaw_drop) == true);
+	double pos_drop = 0.0, rot_drop = 0.0, yaw_drop = 0.0, tilt_drop = 0.0;
+	REQUIRE(kf->get_pose_uncertainty(&pos_drop, &rot_drop, &yaw_drop, &tilt_drop) == true);
 	CHECK(pos_drop > pos_tracked); // unobserved motion -> wider gate (the dropout-recovery win)
 	// Yaw is unobservable without optical, so a moving optical dropout must widen the yaw std too -- the
 	// flip cost relaxes only after a REAL yaw dropout, not while well-tracked.
 	CHECK(yaw_drop > yaw_tracked);
 	CHECK(yaw_drop <= rot_drop + 1e-9);
+	// Tilt is gravity-observable: through the same moving optical dropout the accelerometer keeps
+	// anchoring it, so it must stay far tighter than the unobservable yaw -- the physical basis for the
+	// prior's live tilt scale being trusted through dropouts.
+	CHECK(tilt_drop <= rot_drop + 1e-9);
+	CHECK(tilt_drop < yaw_drop);
 }
 
 TEST_CASE("kalman: get_pose_uncertainty is null-safe and unavailable before tracking and after a reset")
@@ -3924,11 +3934,12 @@ TEST_CASE("kalman: get_pose_uncertainty is null-safe and unavailable before trac
 	REQUIRE(kf != nullptr);
 	int64_t t = 1000000;
 
-	CHECK(kf->get_pose_uncertainty(nullptr, nullptr, nullptr) == false); // untracked + NULLs: no crash, false
-	double p = -1.0, r = -1.0, y = -1.0;
-	CHECK(kf->get_pose_uncertainty(&p, nullptr, nullptr) == false);
-	CHECK(kf->get_pose_uncertainty(nullptr, &r, nullptr) == false);
-	CHECK(kf->get_pose_uncertainty(nullptr, nullptr, &y) == false);
+	CHECK(kf->get_pose_uncertainty(nullptr, nullptr, nullptr, nullptr) == false); // untracked + NULLs: no crash, false
+	double p = -1.0, r = -1.0, y = -1.0, tl = -1.0;
+	CHECK(kf->get_pose_uncertainty(&p, nullptr, nullptr, nullptr) == false);
+	CHECK(kf->get_pose_uncertainty(nullptr, &r, nullptr, nullptr) == false);
+	CHECK(kf->get_pose_uncertainty(nullptr, nullptr, &y, nullptr) == false);
+	CHECK(kf->get_pose_uncertainty(nullptr, nullptr, nullptr, &tl) == false);
 
 	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
 	for (int i = 0; i < 50; i++) {
@@ -3936,13 +3947,15 @@ TEST_CASE("kalman: get_pose_uncertainty is null-safe and unavailable before trac
 		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
 		t += DT_NS;
 	}
-	CHECK(kf->get_pose_uncertainty(nullptr, nullptr, nullptr) == true); // tracking + NULLs: still no crash
-	double pos = -1.0, rot = -1.0, yaw = -1.0;
-	REQUIRE(kf->get_pose_uncertainty(&pos, &rot, &yaw) == true);
+	CHECK(kf->get_pose_uncertainty(nullptr, nullptr, nullptr, nullptr) == true); // tracking + NULLs: still no crash
+	double pos = -1.0, rot = -1.0, yaw = -1.0, tilt = -1.0;
+	REQUIRE(kf->get_pose_uncertainty(&pos, &rot, &yaw, &tilt) == true);
 	CHECK(std::isfinite(pos));
 	CHECK(std::isfinite(rot));
 	CHECK(std::isfinite(yaw));
 	CHECK(yaw <= rot + 1e-9);
+	CHECK(std::isfinite(tilt));
+	CHECK(tilt <= rot + 1e-9);
 
 	// A sustained run of corrupt IMU samples forces a reset; uncertainty becomes unavailable again.
 	const xrt_vec3 garbage = {1.0e9f, 1.0e9f, 1.0e9f};
@@ -3950,7 +3963,7 @@ TEST_CASE("kalman: get_pose_uncertainty is null-safe and unavailable before trac
 		feed_imu(kf.get(), t, garbage, garbage);
 		t += DT_NS;
 	}
-	CHECK(kf->get_pose_uncertainty(&pos, &rot, &yaw) == false);
+	CHECK(kf->get_pose_uncertainty(&pos, &rot, &yaw, &tilt) == false);
 }
 
 TEST_CASE("kalman: get_pose_uncertainty stays finite and positive through extended unobserved motion")
@@ -3972,14 +3985,16 @@ TEST_CASE("kalman: get_pose_uncertainty stays finite and positive through extend
 		                     (float)(1.5 * std::cos(i * 0.03))};
 		feed_imu(kf.get(), t, am, spin);
 		t += DT_NS;
-		double pos = -1.0, rot = -1.0, yaw = -1.0;
-		if (kf->get_pose_uncertainty(&pos, &rot, &yaw)) {
+		double pos = -1.0, rot = -1.0, yaw = -1.0, tilt = -1.0;
+		if (kf->get_pose_uncertainty(&pos, &rot, &yaw, &tilt)) {
 			REQUIRE(std::isfinite(pos));
 			REQUIRE(std::isfinite(rot));
 			REQUIRE(std::isfinite(yaw));
 			REQUIRE(pos > 0.0);
 			REQUIRE(rot > 0.0);
 			REQUIRE(yaw > 0.0);
+			REQUIRE(std::isfinite(tilt));
+			REQUIRE(tilt > 0.0);
 			REQUIRE(yaw <= rot + 1e-9);
 		}
 	}

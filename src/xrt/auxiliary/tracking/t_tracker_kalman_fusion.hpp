@@ -204,15 +204,19 @@ public:
 	 * direction is bounded by the largest eigenvalue; used to size the prior-consistency gate (tight when
 	 * well-tracked, wide right after an optical dropout). yaw_std (rad), when non-null, is the orientation
 	 * std about world-up ALONE — the uncertain yaw DoF, separated from the gravity-anchored (observable)
-	 * tilt — for the mirror-flip cost's yaw scale, which must be sharp when yaw is confident. Any out
-	 * pointer may be null. Wait-free (reads the published snapshot). Returns false if not tracking.
+	 * tilt — for the mirror-flip cost's yaw scale, which must be sharp when yaw is confident. tilt_std
+	 * (rad), when non-null, is the worst-direction std within the horizontal plane — the gravity-observable
+	 * tilt DoFs alone — for the prior's tilt scale, tight when gravity-observed and honestly widened during
+	 * dynamics. Any out pointer may be null. Wait-free (reads the published snapshot). Returns false if not
+	 * tracking.
 	 */
 	virtual bool
-	get_pose_uncertainty(double *position_std, double *orientation_std, double *yaw_std)
+	get_pose_uncertainty(double *position_std, double *orientation_std, double *yaw_std, double *tilt_std)
 	{
 		(void)position_std;
 		(void)orientation_std;
 		(void)yaw_std;
+		(void)tilt_std;
 		return false;
 	}
 

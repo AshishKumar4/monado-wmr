@@ -1872,6 +1872,22 @@ compute_distortion_wmr(struct xrt_device *xdev, uint32_t view, float u, float v,
 }
 
 static xrt_result_t
+wmr_hmd_get_visibility_mask(struct xrt_device *xdev,
+                            enum xrt_visibility_mask_type type,
+                            uint32_t view_index,
+                            struct xrt_visibility_mask **out_mask)
+{
+	struct wmr_hmd *wh = wmr_hmd(xdev);
+	assert(view_index < 2);
+
+	struct wmr_distortion_eye_config *eye = &wh->config.eye_params[view_index];
+	u_compute_visibility_mask_poly_3k(&eye->poly_3k, view_index, eye->visible_center, (float)eye->visible_radius,
+	                                  &xdev->hmd->distortion.fov[view_index], type, out_mask);
+
+	return *out_mask != NULL ? XRT_SUCCESS : XRT_ERROR_ALLOCATION;
+}
+
+static xrt_result_t
 get_compositor_info_wmr(struct xrt_device *xdev,
                         const struct xrt_device_compositor_mode *mode,
                         struct xrt_device_compositor_info *out_info)
@@ -2071,6 +2087,7 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 	wh->base.hmd->distortion.models = XRT_DISTORTION_MODEL_COMPUTE;
 	wh->base.hmd->distortion.preferred = XRT_DISTORTION_MODEL_COMPUTE;
 	wh->base.compute_distortion = compute_distortion_wmr;
+	wh->base.get_visibility_mask = wmr_hmd_get_visibility_mask;
 	u_distortion_mesh_fill_in_compute(&wh->base);
 
 	// Set initial HMD screen power state.
