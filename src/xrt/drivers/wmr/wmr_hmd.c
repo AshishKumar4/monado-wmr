@@ -47,6 +47,7 @@
 #include "tracking/t_tracking.h"
 
 #include "wmr_hmd.h"
+#include "wmr_camera.h"
 #include "wmr_common.h"
 #include "wmr_config_key.h"
 #include "wmr_protocol.h"
@@ -1140,6 +1141,19 @@ wmr_hmd_correct_pose_from_basalt(struct xrt_pose pose)
 	return pose;
 }
 
+//! The same Basalt->WMR frame correction for a world-frame vector, e.g. the relation velocities:
+//! rotate, then the y/z sign swap. The swap equals a 180-degree rotation about x (a proper
+//! rotation), so the correction applies to the angular-velocity pseudovector too.
+XRT_MAYBE_UNUSED static inline struct xrt_vec3
+wmr_hmd_correct_vec3_from_basalt(struct xrt_vec3 v)
+{
+	struct xrt_quat q = {0.70710678, 0, 0, 0.70710678};
+	math_quat_rotate_vec3(&q, &v, &v);
+	v.y = -v.y;
+	v.z = -v.z;
+	return v;
+}
+
 static void
 wmr_hmd_get_slam_tracked_pose(struct xrt_device *xdev,
                               enum xrt_input_name name,
@@ -1154,6 +1168,10 @@ wmr_hmd_get_slam_tracked_pose(struct xrt_device *xdev,
 	int pose_bits = XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
 	bool pose_tracked = out_relation->relation_flags & pose_bits;
 
+	// Which velocity data the SLAM prediction actually provided (before the flags are
+	// narrowed to the pose bits below).
+	enum xrt_space_relation_flags slam_flags = out_relation->relation_flags;
+
 	if (pose_tracked) {
 #ifdef XRT_FEATURE_SLAM
 		// !todo Correct pose depending on the VIT system in use, this should be done in the system itself.
@@ -1164,15 +1182,46 @@ wmr_hmd_get_slam_tracked_pose(struct xrt_device *xdev,
 #endif
 	}
 
+	// Defined velocity-field contract for downstream consumers (the world re-anchor guard's IMU
+	// envelope reads the magnitudes; the dev0 getpose tap records the vectors): each field
+	// carries the SLAM prediction's velocity when it provided one — frame-corrected like the
+	// pose, Basalt frame -> WMR — else exactly zero, never the caller's uninitialized stack
+	// (predict_pose returns flags-only when the relation history is empty).
+	if ((slam_flags & XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT) != 0) {
+#ifdef XRT_FEATURE_SLAM
+		out_relation->linear_velocity = wmr_hmd_correct_vec3_from_basalt(out_relation->linear_velocity);
+#endif
+	} else {
+		out_relation->linear_velocity = (struct xrt_vec3){0, 0, 0};
+	}
+	if ((slam_flags & XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT) != 0) {
+#ifdef XRT_FEATURE_SLAM
+		out_relation->angular_velocity = wmr_hmd_correct_vec3_from_basalt(out_relation->angular_velocity);
+#endif
+	} else {
+		out_relation->angular_velocity = (struct xrt_vec3){0, 0, 0};
+	}
+
 	if (name == XRT_INPUT_GENERIC_HEAD_POSE && wh->tracking.imu2me) {
 		/* Move the pose to the middle-eye position for generic head pose, but not for generic tracker pose */
 		math_pose_transform(&wh->pose, &wh->config.sensors.transforms.P_imu_me, &wh->pose);
 	}
 
 	out_relation->pose = wh->pose;
-	out_relation->relation_flags = (enum xrt_space_relation_flags)(
+	enum xrt_space_relation_flags flags = (enum xrt_space_relation_flags)(
 	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
 	    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+	if (name == XRT_INPUT_GENERIC_TRACKER_POSE) {
+		// The raw-tracker consumer (constellation vision + its ESKF world re-anchor detector,
+		// t_constellation_tracking.c) gets the honest velocity validity. The presentation
+		// consumer (GENERIC_HEAD_POSE -> the SteamVR seam) keeps pose-only flags: forwarding
+		// head velocities into the runtime's photon-time extrapolation is the L3 decision,
+		// deliberately not taken here.
+		flags = (enum xrt_space_relation_flags)(
+		    flags | (slam_flags & (XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT |
+		                           XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT)));
+	}
+	out_relation->relation_flags = flags;
 }
 
 static xrt_result_t
@@ -1499,6 +1548,12 @@ wmr_hmd_fill_constellation_calibration(struct wmr_hmd *wh)
 	struct t_constellation_camera_group *out = &wh->tracking.constellation_calib;
 
 	out->cam_count = wh->config.tcam_count;
+
+	/* The commanded controller-slot analog gain, so the tracker's DN-denominated constants ride the
+	 * blobwatch gain law and the value lands in frame telemetry + the calibration snapshot below
+	 * (frames/PGMs do not carry gain). Resolved from the same defaults + env as wmr_camera_open —
+	 * which runs later (inside wmr_source_create), hence resolve-not-read-back. */
+	wmr_camera_get_ctrl_exposure_gain(NULL, &out->ctrl_gain);
 
 	// Fill camera 0
 	struct xrt_pose P_imu_c0 = wh->config.sensors.accel.pose;
@@ -2060,6 +2115,17 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 	// which mis-paces frames against the 90 Hz panel and causes judder.
 	wh->base.hmd->screens[0].nominal_frame_interval_ns =
 	    (uint64_t)(1000000000.0 / 90.0);
+
+	if (wh->hmd_desc->hmd_type == WMR_HEADSET_REVERB_G2) {
+		// 15.668 ms = frame scanout (11.111 ms) + LC settle + global
+		// backlight strobe (4.557 ms). Value shipped by the native
+		// direct-mode Windows WMR SteamVR driver for the G2 at 90 Hz
+		// (identical presentation architecture; reproduced across
+		// independent devices). The Windows WMR-bridge value (0.02 s)
+		// includes a compositor hop that does not exist on this path.
+		// Other WMR models stay 0 (unverified) — consumers fall back.
+		wh->base.hmd->screens[0].vsync_to_photons_ns = 15668000;
+	}
 
 	// Fill in blend mode - just opqaue, unless we get Hololens support one day.
 	size_t idx = 0;

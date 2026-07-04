@@ -36,6 +36,11 @@ struct tracking_sample_device_state
 	struct xrt_pose P_world_obj_prior;
 	struct xrt_vec3 prior_pos_error;
 	struct xrt_vec3 prior_rot_error;
+	/* Raw fusion position 1-sigma (m) behind prior_pos_error's clamped bound; <0 when the
+	 * fusion exposes no uncertainty (not tracking). The SLAM controller-mask push inflates
+	 * its prediction rect by this projected to pixels, so an untrustworthy prediction grows
+	 * past the area cap and self-disables instead of masking a wrong region. */
+	float prior_pos_std_m;
 	/* Prior-orientation trust for the soft mirror-flip cost: true whenever the fusion is tracking, so the
 	 * DRIFTLESS gravity-anchored prior TILT is a valid reference even through an optical dropout (the
 	 * gyro-blind snap-back case). False at cold start, where the search runs on reprojection alone. */

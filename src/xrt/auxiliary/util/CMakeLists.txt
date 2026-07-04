@@ -120,6 +120,8 @@ add_library(
 	u_worker.cpp
 	u_worker.h
 	u_worker.hpp
+	u_world_reanchor.c
+	u_world_reanchor.h
 	"${CMAKE_CURRENT_BINARY_DIR}/u_git_tag.c"
 	)
 target_link_libraries(

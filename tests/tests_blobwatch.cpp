@@ -98,19 +98,26 @@ struct TestFrame
 	}
 };
 
-// Run blobwatch on a single frame and return its blobs via the public interface. The exposure/gain
-// arguments only feed telemetry/frame-dump (not detection), so fixed nominal values are used here.
+// Run blobwatch on a single frame and return its blobs via the public interface. The exposure argument
+// only feeds telemetry/frame-dump; gain re-denominates the dim-blob R inflation via the K gain law
+// (0 = unknown = the gain-16 calibration point), so these tests default to the calibration point.
 std::vector<blob>
-detect(TestFrame &tf)
+detect_gain(TestFrame &tf, uint16_t gain)
 {
 	blobwatch *bw = blobwatch_new(PIX_THR, 0);
 	blobservation *ob = nullptr;
-	blobwatch_process(bw, &tf.f, /*exposure=*/100, /*gain=*/0, &ob);
+	blobwatch_process(bw, &tf.f, /*exposure=*/100, gain, &ob);
 	std::vector<blob> out;
 	if (ob != nullptr)
 		out.assign(ob->blobs, ob->blobs + ob->num_blobs);
 	blobwatch_free(bw);
 	return out;
+}
+
+std::vector<blob>
+detect(TestFrame &tf)
+{
+	return detect_gain(tf, /*gain=*/0);
 }
 
 std::vector<blob>
@@ -373,6 +380,36 @@ TEST_CASE("blobwatch: dim-blob R is a pure function of the blob, not the frame's
 
 	INFO("alone R=" << b_alone.pos_var_px2 << " with-bright-clutter R=" << b_clutter.pos_var_px2);
 	REQUIRE(b_alone.pos_var_px2 == b_clutter.pos_var_px2);
+}
+
+TEST_CASE("blobwatch: dim-noise K follows the commanded-gain law; gain 0/16 stay bit-identical")
+{
+	// The K gain law's regression tooth (B3): "unknown" (0) and the gain-16 calibration point must
+	// yield EXACTLY the calibrated K16 = 40 so pre-gain-plumbing captures replay bit-identically,
+	// while the production gain-32 point re-denominates K binary-exactly to the felt-room point
+	// estimate K(2) = 65 (f_pre = 0.546875, both representable).
+	REQUIRE(blobwatch_dim_noise_k(0) == 40.0f);
+	REQUIRE(blobwatch_dim_noise_k(16) == 40.0f);
+	REQUIRE(blobwatch_dim_noise_k(32) == 65.0f);
+	REQUIRE(blobwatch_gain_multiplier(0) == 1.0f);
+	REQUIRE(blobwatch_gain_multiplier(16) == 1.0f);
+	REQUIRE(blobwatch_gain_multiplier(32) == 2.0f);
+	REQUIRE(blobwatch_gain_multiplier(48) == 3.0f);
+
+	// And through the public detection interface: R at gain 0 == gain 16 EXACTLY; at gain 32 the
+	// same image-DN blob is physically dimmer, so its R rises by exactly the g(b) ratio of the two
+	// K values (blob chosen in the uncapped band under both).
+	TestFrame tf;
+	tf.add_gaussian(90.0, 90.0, 1.6, 60, false);
+	const blob b0 = nearest(detect_gain(tf, 0), 90.0, 90.0);
+	const blob b16 = nearest(detect_gain(tf, 16), 90.0, 90.0);
+	const blob b32 = nearest(detect_gain(tf, 32), 90.0, 90.0);
+	REQUIRE(b0.pos_var_px2 == b16.pos_var_px2);
+	const float bright = (float)b0.brightness;
+	const float g16 = 1.0f + (40.0f / bright) * (40.0f / bright);
+	const float g32 = 1.0f + (65.0f / bright) * (65.0f / bright);
+	INFO("brightness=" << bright << " R0=" << b0.pos_var_px2 << " R32=" << b32.pos_var_px2);
+	REQUIRE(b32.pos_var_px2 == Catch::Approx(b0.pos_var_px2 / g16 * g32).epsilon(1e-5));
 }
 
 TEST_CASE("blobwatch: cap-pressure retention keeps high-contrast blobs over scanline order")

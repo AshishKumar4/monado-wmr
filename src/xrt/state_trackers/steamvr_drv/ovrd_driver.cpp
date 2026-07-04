@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cassert>
 #include <array>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -34,6 +35,7 @@ extern "C" {
 #include "util/u_builders.h"
 #include "util/u_hand_tracking.h"
 #include "util/u_g2_telemetry.h"
+#include "util/u_world_reanchor.h"
 
 #include "xrt/xrt_config_have.h"
 #include "xrt/xrt_space.h"
@@ -62,7 +64,15 @@ extern "C" {
 //! controllers, but input mapping may be incomplete or not ideal.
 DEBUG_GET_ONCE_BOOL_OPTION(emulate_index_controller, "STEAMVR_EMULATE_INDEX_CONTROLLER", false)
 
-DEBUG_GET_ONCE_NUM_OPTION(scale_percentage, "XRT_COMPOSITOR_SCALE_PERCENTAGE", 140)
+/*
+ * Render-target scale (render-program L1). The 2026-07-03 session rebased the
+ * GPU ledger (SteamVR's "serialized GPU" double-counts the compositor pass):
+ * true app GPU is 4.23 ms at 140 %, modeled ~3.1 ms at 120 % and ~2.6 ms at
+ * 110 % (pixels scale with (pct/100)^2). 120 is the quality-conservative step
+ * toward the <=5 ms pipeline mandate; a live A/B decides whether 110 holds up
+ * visually. SteamVR's per-app resolution override still applies on top.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(scale_percentage, "XRT_COMPOSITOR_SCALE_PERCENTAGE", 120)
 
 #define MODELNUM_LEN (XRT_DEVICE_NAME_LEN + 9) // "[Monado] "
 
@@ -168,7 +178,7 @@ struct SteamVRDriverControlOutput : SteamVRDriverControl
 };
 
 static void
-copy_vec3(struct xrt_vec3 *from, double *to)
+copy_vec3(const struct xrt_vec3 *from, double *to)
 {
 	to[0] = from->x;
 	to[1] = from->y;
@@ -176,7 +186,7 @@ copy_vec3(struct xrt_vec3 *from, double *to)
 }
 
 static void
-copy_quat(struct xrt_quat *from, vr::HmdQuaternion_t *to)
+copy_quat(const struct xrt_quat *from, vr::HmdQuaternion_t *to)
 {
 	to->x = from->x;
 	to->y = from->y;
@@ -184,11 +194,61 @@ copy_quat(struct xrt_quat *from, vr::HmdQuaternion_t *to)
 	to->w = from->w;
 }
 
+/*
+ * World re-anchor glide (the B2 head resnap guard). ONE correction delta owned by the driver
+ * provider and shared by all three devices, applied at this — the single uniform tracking->
+ * presentation seam, AFTER every internal consumer (constellation vision, ESKF, telemetry taps)
+ * has been served the raw pose. The HMD pull drives detection + decay (it has the freshest
+ * relation and its IMU-derived velocities for the envelope); controller pulls apply the current
+ * delta without re-decaying, so the result is device-order independent and hand/world/head stay
+ * coherent through a glide. Design + offline validation: results/b2-resnap-design-20260704/.
+ */
+namespace {
+struct WorldReanchorGuard
+{
+	std::mutex lock;
+	struct u_world_reanchor wr;
+	bool have_prev = false;
+	timepoint_ns prev_ns = 0;
+	struct xrt_pose prev_pose = {};
+	double prev_gyro_dps = 0.0;
+
+	WorldReanchorGuard()
+	{
+		u_world_reanchor_init(&wr);
+	}
+};
+WorldReanchorGuard g_world_guard;
+
+void
+world_guard_pack_delta(const struct u_world_reanchor &wr, float out_delta7[7])
+{
+	out_delta7[0] = (float)wr.dp[0];
+	out_delta7[1] = (float)wr.dp[1];
+	out_delta7[2] = (float)wr.dp[2];
+	out_delta7[3] = (float)wr.dq[0];
+	out_delta7[4] = (float)wr.dq[1];
+	out_delta7[5] = (float)wr.dq[2];
+	out_delta7[6] = (float)wr.dq[3];
+}
+} // namespace
+
+/*
+ * Convert the resolved relation into a SteamVR DriverPose. @p presented is the pose to present —
+ * the world re-anchor delta composed with rel->pose (== rel->pose bit-identically while no glide
+ * is active). The velocities deliberately stay the relation's TRACKED velocities: the glide rate
+ * is EXCLUDED, because the runtime extrapolates to photon time from them and including it would
+ * re-inject a velocity discontinuity at the absorption instant — the very artifact being removed.
+ * The angular-velocity device-space conversion keeps the RAW orientation: with
+ * presented_q = dq*raw_q and the presented-world angular velocity dq*w, the device-space value
+ * (presented_q)^-1 * (dq*w) == raw_q^-1 * w exactly, so using the raw orientation on the raw
+ * velocity IS the correct presented-world conversion.
+ */
 static void
-apply_pose(struct xrt_space_relation *rel, vr::DriverPose_t *m_pose)
+apply_pose(const struct xrt_space_relation *rel, const struct xrt_pose *presented, vr::DriverPose_t *m_pose)
 {
 	if ((rel->relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT) != 0) {
-		copy_quat(&rel->pose.orientation, &m_pose->qRotation);
+		copy_quat(&presented->orientation, &m_pose->qRotation);
 	} else {
 		m_pose->result = vr::TrackingResult_Running_OutOfRange;
 		m_pose->poseIsValid = false;
@@ -198,7 +258,7 @@ apply_pose(struct xrt_space_relation *rel, vr::DriverPose_t *m_pose)
 	// report (body-anchored coast, reach-clamped, follow-smoothed) is strictly better than holding the
 	// last tracked pose — the silent hold is what felt like a hard ceiling above the cameras' FOV.
 	if ((rel->relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
-		copy_vec3(&rel->pose.position, m_pose->vecPosition);
+		copy_vec3(&presented->position, m_pose->vecPosition);
 	}
 
 	if ((rel->relation_flags & XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT) != 0) {
@@ -1102,7 +1162,17 @@ public:
 		m_relation_chain_push_pose_if_not_identity(&chain, offset);
 		m_relation_chain_resolve(&chain, &rel);
 
-		apply_pose(&rel, &m_pose);
+		// Apply the CURRENT world re-anchor delta (no detection/decay here — the HMD pull owns
+		// that), so hands glide coherently with the world through a head re-anchor.
+		struct xrt_pose presented = rel.pose;
+		float delta7[7] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 1.f};
+		{
+			std::lock_guard<std::mutex> lk(g_world_guard.lock);
+			u_world_reanchor_apply(&g_world_guard.wr, &rel.pose, &presented);
+			world_guard_pack_delta(g_world_guard.wr, delta7);
+		}
+
+		apply_pose(&rel, &presented, &m_pose);
 
 		if (g2_telem_enabled()) {
 			const uint8_t dev_id =
@@ -1110,16 +1180,16 @@ public:
 			    : m_xdev->device_type == XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER ? 2
 			                                                                   : 0;
 			if (dev_id != 0) {
-				const float pose7[7] = {rel.pose.position.x,    rel.pose.position.y,
-				                        rel.pose.position.z,    rel.pose.orientation.x,
-				                        rel.pose.orientation.y, rel.pose.orientation.z,
-				                        rel.pose.orientation.w};
+				const float pose7[7] = {presented.position.x,    presented.position.y,
+				                        presented.position.z,    presented.orientation.x,
+				                        presented.orientation.y, presented.orientation.z,
+				                        presented.orientation.w};
 				const float lv[3] = {rel.linear_velocity.x, rel.linear_velocity.y,
 				                     rel.linear_velocity.z};
 				const float av[3] = {rel.angular_velocity.x, rel.angular_velocity.y,
 				                     rel.angular_velocity.z};
 				g2_telem_getpose(dev_id, (uint64_t)now_ns, pose7, lv, av,
-				                 (uint32_t)rel.relation_flags);
+				                 (uint32_t)rel.relation_flags, delta7);
 			}
 		}
 
@@ -1318,8 +1388,12 @@ class CDeviceDriver_Monado : public vr::ITrackedDeviceServerDriver, public vr::I
 public:
 	CDeviceDriver_Monado(struct xrt_instance *xinst, struct xrt_device *xdev) : m_xdev(xdev)
 	{
-		//! @todo latency
-		m_flSecondsFromVsyncToPhotons = 0.011f;
+		// Photon latency from the device when it knows its panel;
+		// OpenVR predicts poses this far past vsync, so an error here
+		// is a per-frame motion-to-photon mispredict. 0.011 f is the
+		// legacy fallback for devices that do not report it.
+		uint64_t photons_ns = m_xdev->hmd->screens[0].vsync_to_photons_ns;
+		m_flSecondsFromVsyncToPhotons = photons_ns != 0 ? (float)(photons_ns * 1e-9) : 0.011f;
 
 		float ns = (float)m_xdev->hmd->screens->nominal_frame_interval_ns;
 		m_flDisplayFrequency = 1.f / ns * 1000.f * 1000.f * 1000.f;
@@ -1603,12 +1677,59 @@ CDeviceDriver_Monado::GetPose()
 	struct xrt_space_relation rel;
 	xrt_device_get_tracked_pose(m_xdev, XRT_INPUT_GENERIC_HEAD_POSE, now_ns, &rel);
 
+	// Motion signals for the re-anchor guard, from the raw device relation BEFORE the
+	// origin-offset chain (magnitudes are rotation-invariant; the chain may drop unflagged
+	// fields). On the SLAM path the velocity FIELDS carry the frame-corrected, IMU-derived
+	// prediction velocities while the relation flags stay pose-only (wmr_hmd.c: forwarding head
+	// velocities to the runtime is the L3 decision, not taken here) — exactly the design's
+	// contamination rule: the envelope and caps key on the IMU-derived stream, never on a
+	// raw-position finite difference the snap itself would inflate.
+	const struct xrt_vec3 gv = rel.angular_velocity;
+	const struct xrt_vec3 lv3 = rel.linear_velocity;
+	const double gyro_dps =
+	    sqrt((double)gv.x * gv.x + (double)gv.y * gv.y + (double)gv.z * gv.z) * (180.0 / M_PI);
+	const double speed_mps = sqrt((double)lv3.x * lv3.x + (double)lv3.y * lv3.y + (double)lv3.z * lv3.z);
+
 	struct xrt_pose *offset = &m_xdev->tracking_origin->initial_offset;
 
 	struct xrt_relation_chain chain = {};
 	m_relation_chain_push_relation(&chain, &rel);
 	m_relation_chain_push_pose_if_not_identity(&chain, offset);
 	m_relation_chain_resolve(&chain, &rel);
+
+	// World re-anchor guard: detect a SLAM relocalization/reset step (innovation beyond the IMU
+	// envelope), absorb only the excess into the shared delta, decay it (the glide). Zero-excess
+	// pulls leave the delta untouched and present the raw pose bit-identically.
+	struct xrt_pose presented = rel.pose;
+	bool absorbed = false;
+	double abs_ang_deg = 0.0;
+	double abs_pos_m = 0.0;
+	float delta7[7] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 1.f};
+	{
+		std::lock_guard<std::mutex> lk(g_world_guard.lock);
+		const enum xrt_space_relation_flags pose_valid = (enum xrt_space_relation_flags)(
+		    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT);
+		if ((rel.relation_flags & pose_valid) == pose_valid) {
+			if (g_world_guard.have_prev && now_ns > g_world_guard.prev_ns) {
+				const double dt_s = (double)(now_ns - g_world_guard.prev_ns) * 1e-9;
+				const double gyro_int_deg =
+				    0.5 * (g_world_guard.prev_gyro_dps + gyro_dps) * dt_s;
+				absorbed = u_world_reanchor_update(
+				    &g_world_guard.wr, &u_world_reanchor_default_params, &g_world_guard.prev_pose,
+				    &rel.pose, dt_s, gyro_int_deg, gyro_dps, speed_mps, &abs_ang_deg, &abs_pos_m);
+			}
+			g_world_guard.prev_pose = rel.pose;
+			g_world_guard.prev_ns = now_ns;
+			g_world_guard.prev_gyro_dps = gyro_dps;
+			g_world_guard.have_prev = true;
+		}
+		u_world_reanchor_apply(&g_world_guard.wr, &rel.pose, &presented);
+		world_guard_pack_delta(g_world_guard.wr, delta7);
+	}
+	if (absorbed && g2_telem_enabled()) {
+		g2_telem_event(0, (uint64_t)now_ns, G2_TELEM_EV_WORLD_REANCHOR_ANG_DEG, (float)abs_ang_deg);
+		g2_telem_event(0, (uint64_t)now_ns, G2_TELEM_EV_WORLD_REANCHOR_POS_M, (float)abs_pos_m);
+	}
 
 	vr::DriverPose_t t = {
 	    // monado predicts pose "now", see xrt_device_get_tracked_pose
@@ -1635,7 +1756,20 @@ CDeviceDriver_Monado::GetPose()
 	    .shouldApplyHeadModel = !m_xdev->supported.position_tracking,
 	    .deviceIsConnected = true,
 	};
-	apply_pose(&rel, &t);
+	apply_pose(&rel, &presented, &t);
+
+	// S2's dev0 getpose tap: the presented head pose (the felt signal, post-guard — the
+	// head_pose.bin telemetry tap stays PRE-guard by design so SLAM regressions can never hide
+	// behind the glide) + the raw relation velocities/flags + the glide delta at this pull.
+	if (g2_telem_enabled()) {
+		const float pose7[7] = {presented.position.x,    presented.position.y,
+		                        presented.position.z,    presented.orientation.x,
+		                        presented.orientation.y, presented.orientation.z,
+		                        presented.orientation.w};
+		const float lv[3] = {rel.linear_velocity.x, rel.linear_velocity.y, rel.linear_velocity.z};
+		const float av[3] = {rel.angular_velocity.x, rel.angular_velocity.y, rel.angular_velocity.z};
+		g2_telem_getpose(0, (uint64_t)now_ns, pose7, lv, av, (uint32_t)rel.relation_flags, delta7);
+	}
 
 #ifdef DUMP_POSE
 	ovrd_log("get hmd pose %f %f %f %f, %f %f %f\n", t.qRotation.x, t.qRotation.y, t.qRotation.z, t.qRotation.w,

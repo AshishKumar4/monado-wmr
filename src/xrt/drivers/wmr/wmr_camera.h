@@ -37,6 +37,16 @@ struct wmr_camera_open_config
 };
 
 #ifdef XRT_HAVE_LIBUSB
+/*!
+ * Resolve the controller-tracking (short LED-exposure slot) operating point that @ref wmr_camera_open
+ * will program: the compile-time defaults plus the G2_CTRL_EXPOSURE / G2_CTRL_GAIN env overrides.
+ * Pure and callable before any camera exists, so the constellation tracker calibration can be
+ * denominated in the exact commanded gain (t_constellation_camera_group::ctrl_gain). Either output
+ * may be NULL.
+ */
+void
+wmr_camera_get_ctrl_exposure_gain(uint16_t *out_exposure, uint16_t *out_gain);
+
 struct wmr_camera *
 wmr_camera_open(struct wmr_camera_open_config *config);
 void
@@ -64,6 +74,17 @@ wmr_camera_set_exposure_gain(struct wmr_camera *cam, uint8_t camera_id, uint16_t
 #else
 
 /* Stubs to disable camera functions without libusb */
+static inline void
+wmr_camera_get_ctrl_exposure_gain(uint16_t *out_exposure, uint16_t *out_gain)
+{
+	/* No camera support: report "unknown" (0), which the tracker maps to its calibration point. */
+	if (out_exposure != NULL) {
+		*out_exposure = 0;
+	}
+	if (out_gain != NULL) {
+		*out_gain = 0;
+	}
+}
 static inline struct wmr_camera *
 wmr_camera_open(struct wmr_camera_open_config *config)
 {

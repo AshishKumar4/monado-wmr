@@ -69,6 +69,74 @@ require_uv_in_unit_square(const std::vector<xrt_vec2> &uv)
 	}
 }
 
+// Real WMR display calibration, the same JSON shape wmr_config.c parses.
+// Layout per eye: row-major affine, then (cx, cy, k1, k2, k3) for
+// red/green/blue, then the factory visible-area circle.
+struct display_calib
+{
+	float affine[9];
+	double channels[3][5];
+	xrt_vec2 visible_center;
+	float visible_radius;
+};
+
+struct mask_areas
+{
+	double hidden;
+	double visible;
+	uint32_t hidden_triangles;
+};
+
+// Derive the poly-3k hidden/visible masks for one eye exactly like
+// wmr_hmd_get_visibility_mask does, convert them to render-texture UV the way
+// the SteamVR plugin serves them, and measure their areas. Verifies the
+// square partition invariant.
+mask_areas
+derive_poly_3k_areas(const display_calib &dc, uint32_t view, const xrt_vec2_i32 &display_size)
+{
+	u_poly_3k_eye_values values = {};
+	xrt_matrix_3x3 affine;
+	std::memcpy(affine.v, dc.affine, sizeof(affine.v));
+	math_matrix_3x3_inverse(&affine, &values.inv_affine_xform);
+	for (uint32_t c = 0; c < 3; c++) {
+		values.channels[c].display_size = display_size;
+		values.channels[c].eye_center = {(float)dc.channels[c][0], (float)dc.channels[c][1]};
+		values.channels[c].k[0] = dc.channels[c][2];
+		values.channels[c].k[1] = dc.channels[c][3];
+		values.channels[c].k[2] = dc.channels[c][4];
+	}
+
+	xrt_fov fov = {};
+	u_compute_distortion_bounds_poly_3k(&values.inv_affine_xform, values.channels, view, &fov,
+	                                    &values.tex_x_range, &values.tex_y_range);
+
+	xrt_visibility_mask *hidden = NULL;
+	xrt_visibility_mask *visible = NULL;
+	u_compute_visibility_mask_poly_3k(&values, view, dc.visible_center, dc.visible_radius, &fov,
+	                                  XRT_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH, &hidden);
+	u_compute_visibility_mask_poly_3k(&values, view, dc.visible_center, dc.visible_radius, &fov,
+	                                  XRT_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH, &visible);
+	REQUIRE(hidden != NULL);
+	REQUIRE(visible != NULL);
+
+	const std::vector<xrt_vec2> hidden_uv = mask_to_uv(hidden, fov);
+	const std::vector<xrt_vec2> visible_uv = mask_to_uv(visible, fov);
+	require_uv_in_unit_square(hidden_uv);
+	require_uv_in_unit_square(visible_uv);
+
+	mask_areas areas = {};
+	areas.hidden = triangle_list_area(hidden_uv);
+	areas.visible = triangle_list_area(visible_uv);
+	areas.hidden_triangles = hidden->index_count / 3;
+
+	// Hidden ring + visible fan must exactly partition the unit square.
+	CHECK_THAT(areas.hidden + areas.visible, Catch::Matchers::WithinAbs(1.0, 1e-5));
+
+	free(hidden);
+	free(visible);
+	return areas;
+}
+
 } // namespace
 
 TEST_CASE("u_visibility_mask_from_uv_boundary partitions the unit square")
@@ -145,18 +213,8 @@ TEST_CASE("u_visibility_mask_from_uv_boundary partitions the unit square")
 
 TEST_CASE("u_compute_visibility_mask_poly_3k on Odyssey+ factory calibration")
 {
-	// Real WMR display calibration read from a Samsung Odyssey+ (source:
-	// CIFASIS/basalt-xr data/monado/wmr-tools/odysseyplus_wmrcalib_example.json),
-	// the same JSON shape wmr_config.c parses. Layout per eye: row-major
-	// affine, then (cx, cy, k1, k2, k3) for red/green/blue.
-	struct display_calib
-	{
-		float affine[9];
-		double channels[3][5];
-		xrt_vec2 visible_center;
-		float visible_radius;
-	};
-
+	// Read from a Samsung Odyssey+ (source: CIFASIS/basalt-xr
+	// data/monado/wmr-tools/odysseyplus_wmrcalib_example.json).
 	static const display_calib eyes[2] = {
 	    {
 	        {907.9921264648438f, -0.5576117634773254f, 785.1776123046875f, //
@@ -195,50 +253,83 @@ TEST_CASE("u_compute_visibility_mask_poly_3k on Odyssey+ factory calibration")
 	static const double expected_hidden[2] = {0.0191, 0.0144};
 
 	for (uint32_t view = 0; view < 2; view++) {
-		const display_calib &dc = eyes[view];
-
-		u_poly_3k_eye_values values = {};
-		xrt_matrix_3x3 affine;
-		std::memcpy(affine.v, dc.affine, sizeof(affine.v));
-		math_matrix_3x3_inverse(&affine, &values.inv_affine_xform);
-		for (uint32_t c = 0; c < 3; c++) {
-			values.channels[c].display_size = {2880, 1600};
-			values.channels[c].eye_center = {(float)dc.channels[c][0], (float)dc.channels[c][1]};
-			values.channels[c].k[0] = dc.channels[c][2];
-			values.channels[c].k[1] = dc.channels[c][3];
-			values.channels[c].k[2] = dc.channels[c][4];
-		}
-
-		xrt_fov fov = {};
-		u_compute_distortion_bounds_poly_3k(&values.inv_affine_xform, values.channels, view, &fov,
-		                                    &values.tex_x_range, &values.tex_y_range);
-
-		xrt_visibility_mask *hidden = NULL;
-		xrt_visibility_mask *visible = NULL;
-		u_compute_visibility_mask_poly_3k(&values, view, dc.visible_center, dc.visible_radius, &fov,
-		                                  XRT_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH, &hidden);
-		u_compute_visibility_mask_poly_3k(&values, view, dc.visible_center, dc.visible_radius, &fov,
-		                                  XRT_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH, &visible);
-		REQUIRE(hidden != NULL);
-		REQUIRE(visible != NULL);
-
-		const std::vector<xrt_vec2> hidden_uv = mask_to_uv(hidden, fov);
-		const std::vector<xrt_vec2> visible_uv = mask_to_uv(visible, fov);
-		require_uv_in_unit_square(hidden_uv);
-		require_uv_in_unit_square(visible_uv);
-
-		const double hidden_area = triangle_list_area(hidden_uv);
-		const double visible_area = triangle_list_area(visible_uv);
+		const mask_areas areas = derive_poly_3k_areas(eyes[view], view, {2880, 1600});
 		printf("Odyssey+ eye %u: hidden area %.2f%% of the render texture (%u triangles)\n", view,
-		       hidden_area * 100.0, hidden->index_count / 3);
+		       areas.hidden * 100.0, areas.hidden_triangles);
 
 		// Sane band plus agreement with the independent reimplementation.
-		CHECK(hidden_area > 0.005);
-		CHECK(hidden_area < 0.25);
-		CHECK_THAT(hidden_area, Catch::Matchers::WithinAbs(expected_hidden[view], 0.002));
-		CHECK_THAT(hidden_area + visible_area, Catch::Matchers::WithinAbs(1.0, 1e-5));
+		CHECK(areas.hidden > 0.005);
+		CHECK(areas.hidden < 0.25);
+		CHECK_THAT(areas.hidden, Catch::Matchers::WithinAbs(expected_hidden[view], 0.002));
+	}
+}
 
-		free(hidden);
-		free(visible);
+TEST_CASE("u_compute_visibility_mask_poly_3k on HP Reverb G2 factory calibration")
+{
+	/*
+	 * Read from the author's HP Reverb G2 ("HP Inc." / "VR3000") over the
+	 * HoloLens Sensors config protocol on 2026-07-03; the derived render
+	 * texture ranges match the live driver's logged values to 6 decimals.
+	 *
+	 * The G2's factory visible-area circle is a per-model constant
+	 * (exactly 1500 px on both eyes, like the Odyssey+'s exactly-820) and
+	 * nearly circumscribes the 2160x2160 eye half: the corner distances
+	 * from the visible center are only 1460..1597 px, so the circle -
+	 * clipped to the panel - leaves just two sub-0.1% corner slivers
+	 * hidden per eye. The ~0.1% coverage vrcompositor reports for the G2
+	 * is therefore the truth of the factory calibration, not a mask bug;
+	 * a bigger hidden area would require a tighter-than-factory lens
+	 * measurement, which would break the never-hide-a-showable-texel
+	 * guarantee (the Windows WMR driver's G2 mesh is known to clip
+	 * visible pixels - "flickering white border" reports).
+	 */
+	static const display_calib eyes[2] = {
+	    {
+	        {1466.44580078125f, 0.f, 1169.4061279296875f, //
+	         0.f, 1465.9482421875f, 1087.2423095703125f,  //
+	         0.f, 0.f, 1.f},
+	        {
+	            {1172.953490988828, 1085.7965335491783, 1.6333618337827383e-07, 4.343595083860181e-14,
+	             6.219229630665049e-20},
+	            {1171.383270015505, 1084.642101769391, 2.1596093938725873e-07, -4.535899034103364e-14,
+	             1.1609784194905573e-19},
+	            {1169.5913669344795, 1082.7566593543102, 3.176960281446575e-07, -2.2138264134511981e-13,
+	             2.255624598701172e-19},
+	        },
+	        {1169.4060807072074f, 1087.242308805553f},
+	        1500.f,
+	    },
+	    {
+	        {1466.4517822265625f, 0.f, 3153.2578125f,     //
+	         0.f, 1465.5523681640625f, 1086.53271484375f, //
+	         0.f, 0.f, 1.f},
+	        {
+	            {3150.4083540203696, 1086.7598872478957, 1.6164004973252982e-07, 4.3120350941757986e-14,
+	             6.225155194820832e-20},
+	            {3149.4778380412718, 1085.618040122373, 2.1395771317706862e-07, -4.2673949250790335e-14,
+	             1.1294025461691487e-19},
+	            {3149.118917488526, 1083.5261118079088, 3.139159043699129e-07, -2.1167881880253464e-13,
+	             2.16276587174974e-19},
+	        },
+	        {3153.257894079328f, 1086.5327180216593f},
+	        1500.f,
+	    },
+	};
+
+	// Independently re-derived with numpy from the same calibration
+	// (results/render-l2-ham-20260612/g2_ham_crosscheck.py in the research
+	// tree): hidden 0.09% / 0.11% including the 5% conservative margin.
+	static const double expected_hidden[2] = {0.0009, 0.0011};
+
+	for (uint32_t view = 0; view < 2; view++) {
+		const mask_areas areas = derive_poly_3k_areas(eyes[view], view, {4320, 2160});
+		printf("Reverb G2 eye %u: hidden area %.3f%% of the render texture (%u triangles)\n", view,
+		       areas.hidden * 100.0, areas.hidden_triangles);
+
+		// The mask must stay nonzero (the left-edge corner slivers are
+		// real) but tiny: the factory circle shows ~everything.
+		CHECK(areas.hidden > 0.0);
+		CHECK(areas.hidden < 0.005);
+		CHECK_THAT(areas.hidden, Catch::Matchers::WithinAbs(expected_hidden[view], 0.0005));
 	}
 }

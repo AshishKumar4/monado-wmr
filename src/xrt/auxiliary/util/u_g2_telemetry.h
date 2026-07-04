@@ -93,6 +93,12 @@ enum g2_telem_event_type
 	 * Deterministic: <= ASSOC_FRAME_WORK_BUDGET by construction; pairs with TRACKER_FAST_MS
 	 * so units->ms drift on other machines is observable offline. */
 	G2_TELEM_EV_TRACKER_WORK_UNITS = 23,
+	/*! World re-anchor guard absorbed a SLAM discontinuity (B2): the orientation / position
+	 * excess beyond the IMU envelope composed into the presentation glide delta this pull.
+	 * Emitted as a pair (device 0, same ts): _ANG_DEG = absorbed angle (deg), _POS_M =
+	 * absorbed translation (m). The per-pull delta itself is recorded in the dev0 getpose rows. */
+	G2_TELEM_EV_WORLD_REANCHOR_ANG_DEG = 24,
+	G2_TELEM_EV_WORLD_REANCHOR_POS_M = 25,
 };
 
 /* ---- Stream emit functions (POD rows; lock-free; safe from any single producer) ---- */
@@ -248,16 +254,48 @@ g2_telem_event(uint8_t device_id, uint64_t ts_ns, uint16_t event_type, float val
 void
 g2_telem_head_pose(uint64_t ts_ns, const float pose[7]);
 
-/*! The resolved relation a SteamVR GetPose pull consumed for a controller: pose [px,py,pz,
- *  qx,qy,qz,qw], linear + angular velocity, and the xrt relation flags. The signal the user
- *  physically feels (vrserver predicts photon time from this pose+velocity). */
+/*! Flags for a mask stream row. A rect can be built from the live prediction, the last
+ *  optically-seen pose, or both; ENABLED means the rect was actually pushed to SLAM
+ *  (AREA_CAPPED marks a rect the per-camera area cap disabled instead). */
+enum g2_telem_mask_flags
+{
+	G2_TELEM_MASK_ENABLED = 1u << 0,
+	G2_TELEM_MASK_FROM_PREDICTION = 1u << 1,
+	G2_TELEM_MASK_FROM_LAST_SEEN = 1u << 2,
+	G2_TELEM_MASK_AREA_CAPPED = 1u << 3,
+};
+
+/*! SLAM controller-mask rect pushed for one device on one SLAM camera at one controller
+ *  frame (B5 mask-repair observability: rect age / steal / leak are scored offline from
+ *  this stream). @p ts_ns is the frame (exposure) time the rect was computed for,
+ *  @p cam_id the SLAM camera index the rect applies to. @p rect is [x0,y0,x1,y1] pixels
+ *  (valid when ENABLED). @p sigma_px is the projected PRIOR_GATE_SIGMA position
+ *  uncertainty the prediction rect was inflated by (<0 when the fusion exposes no
+ *  uncertainty). @p optical_age_ms is the age of the device's last accepted optical pose
+ *  (<0 before the first accept). */
+void
+g2_telem_mask(uint8_t cam_id,
+              uint64_t ts_ns,
+              uint8_t device_id,
+              uint8_t flags,
+              const float rect[4],
+              float sigma_px,
+              float optical_age_ms);
+
+/*! The PRESENTED pose a SteamVR GetPose pull returned for a device (0=HMD, 1=left, 2=right):
+ *  pose [px,py,pz,qx,qy,qz,qw], linear + angular velocity, and the xrt relation flags. The
+ *  signal the user physically feels (vrserver predicts photon time from this pose+velocity).
+ *  @p delta (optional, [dpx,dpy,dpz,dqx,dqy,dqz,dqw]) is the world re-anchor glide correction
+ *  composed into the presented pose at this pull (identity/zeros while no glide is active), so
+ *  the raw tracker pose is recoverable offline as delta^-1 composed with the presented pose. */
 void
 g2_telem_getpose(uint8_t device_id,
                  uint64_t ts_ns,
                  const float pose[7],
                  const float lin_vel[3],
                  const float ang_vel[3],
-                 uint32_t relation_flags);
+                 uint32_t relation_flags,
+                 const float delta[7]);
 
 #ifdef __cplusplus
 }

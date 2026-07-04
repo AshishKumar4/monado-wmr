@@ -206,6 +206,13 @@ kalman_fusion_get_imu_intrinsics(struct KalmanFusionInterfaceWrapper *wrapper,
 void
 kalman_fusion_update_body_anchor(struct KalmanFusionInterfaceWrapper *wrapper, const struct xrt_pose *hmd_pose);
 
+//! World re-anchor: the head tracker's world frame moved by the rigid transform @p delta
+//! (x' = delta.q * x + delta.p) in one detected step (SLAM relocalization/reset). Transforms the
+//! filter's world-frame state so the prior lives in the new world; body-frame state is untouched.
+//! See KalmanFusionInterface::re_anchor_world.
+void
+kalman_fusion_re_anchor_world(struct KalmanFusionInterfaceWrapper *wrapper, const struct xrt_pose *delta);
+
 //! Diagnostics: named report regime from the last kalman_fusion_get_prediction call. Codes:
 //! 0 Invalid, 1 VisualAccuracy, 2 InertialFastMotion, 3 WorldLocked, 4 BodyLocked, 5 ConfusedPosition.
 int

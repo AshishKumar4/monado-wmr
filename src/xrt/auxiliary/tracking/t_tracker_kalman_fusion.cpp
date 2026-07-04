@@ -821,6 +821,32 @@ namespace {
 			}
 		}
 
+		//! World re-anchor (see KalmanFusionInterface::re_anchor_world): transform every world-frame
+		//! member by the detected rigid world step so the prior lives in the new world.
+		void
+		re_anchor_world(const struct xrt_pose *delta) override
+		{
+			if (delta == nullptr) {
+				return;
+			}
+			const Quaterniond R = Quaterniond{delta->orientation.w, delta->orientation.x,
+			                                  delta->orientation.y, delta->orientation.z}
+			                          .normalized();
+			const Vector3d t{delta->position.x, delta->position.y, delta->position.z};
+			{
+				std::lock_guard<std::mutex> lock(m_filter_lock);
+				apply_world_delta(R, t);
+				publish_snapshot();
+			}
+			{
+				// Re-entry render ease state is world-frame too. Leaf lock; the filter->leaf
+				// nesting above released first, and no path takes leaf->filter, so no cycle.
+				std::lock_guard<std::mutex> lock(m_reentry_render_lock);
+				m_reentry_cur_pos = R * m_reentry_cur_pos + t;
+				m_reentry_cur_orient = (R * m_reentry_cur_orient).normalized();
+			}
+		}
+
 		int
 		debug_get_fusion_state(char *name_out, size_t name_cap) override
 		{
@@ -1285,6 +1311,13 @@ namespace {
 		fresh_optical_velocity_or_zero() const;
 		void
 		reanchor(const Vector3d &p, const Quaterniond &q);
+		//! Apply the detected rigid world step (world re-anchor) to every world-frame member:
+		//! points x' = R x + t, vectors v' = R v, world<-body orientations q' = R q, and the
+		//! covariance's position/velocity/orientation blocks P' = J P J^T with
+		//! J = blkdiag(R, R, R, I, I). Body-frame state (biases) is untouched. Includes the OOSM
+		//! checkpoint so a rewind-replay stays in the new world. Caller holds m_filter_lock.
+		void
+		apply_world_delta(const Quaterniond &R, const Vector3d &t);
 		//! The gyro flip-veto DECISION (single source of truth for every flip-arbitration site). Returns true
 		//! iff @p cand should be rejected as a likely optical mirror-flip and the gyro orientation @p q_filter
 		//! kept. A flip is vetoed only while the gyro is fresh (optical recent) AND was confirmed by an
@@ -1634,6 +1667,65 @@ namespace {
 		reset_covariance_block(m_P, ET, REANCHOR_ORI_VAR);
 		last_good_position = p;
 		seed_optical_position_history(p, Vector3d::Constant(REANCHOR_POS_VAR));
+	}
+
+	void
+	EskfFusion::apply_world_delta(const Quaterniond &R, const Vector3d &t)
+	{
+		const auto xform_point = [&](Vector3d &p) { p = R * p + t; };
+		const auto rot_vec = [&](Vector3d &v) { v = R * v; };
+		const auto rot_quat = [&](Quaterniond &q) { q = (R * q).normalized(); };
+
+		xform_point(m_x.p);
+		rot_vec(m_x.v);
+		rot_quat(m_x.q);
+
+		Mat15 J = Mat15::Identity();
+		const Mat3 Rm = R.toRotationMatrix();
+		J.block<3, 3>(EP, EP) = Rm;
+		J.block<3, 3>(EV, EV) = Rm;
+		J.block<3, 3>(ET, ET) = Rm;
+		m_P = J * m_P * J.transpose();
+
+		rot_vec(m_accel_world);
+		rot_vec(m_angvel_world);
+		rot_quat(m_gravity_corrected_q);
+		xform_point(last_good_position);
+		rot_vec(m_optical_velocity_world);
+		for (int i = 0; i < m_optical_pos_history_count; i++) {
+			xform_point(m_optical_pos_history[i]);
+		}
+		rot_vec(m_body_offset_world);
+		rot_vec(m_v_at_loss);
+		if (m_hmd_pos_valid) {
+			xform_point(m_hmd_pos);
+			rot_quat(m_hmd_quat);
+		}
+		if (m_pnp_valid) {
+			Vector3d pp = map_vec3(m_pnp_pose.position).cast<double>();
+			Quaterniond pq = map_quat(m_pnp_pose.orientation).cast<double>();
+			xform_point(pp);
+			rot_quat(pq);
+			map_vec3(m_pnp_pose.position) = pp.cast<float>();
+			map_quat(m_pnp_pose.orientation) = pq.cast<float>();
+		}
+
+		if (m_anchor_valid) {
+			FilterCheckpoint &c = m_anchor;
+			xform_point(c.nominal.p);
+			rot_vec(c.nominal.v);
+			rot_quat(c.nominal.q);
+			c.P = J * c.P * J.transpose();
+			rot_vec(c.accel_world);
+			rot_vec(c.angvel_world);
+			xform_point(c.last_good_position);
+			rot_vec(c.optical_velocity_world);
+			for (int i = 0; i < c.optical_pos_history_count; i++) {
+				xform_point(c.optical_pos_history[i]);
+			}
+			rot_vec(c.body_offset_world);
+			rot_quat(c.gravity_corrected_q);
+		}
 	}
 
 	Vector3d

@@ -351,6 +351,23 @@ public:
 	}
 
 	/*!
+	 * World re-anchor: the head tracker's world frame moved by the rigid transform @p delta
+	 * (x' = delta.q * x + delta.p, world coords) in one detected step — a SLAM relocalization /
+	 * reset (the B2 head resnap guard's detector, pivoted at the pre-step head position so
+	 * head-relative geometry is preserved). The filter's world-frame state — mean, covariance
+	 * orientation, cached world points/vectors and the out-of-sequence checkpoint — is
+	 * transformed by delta so the prior lands in the NEW world and the next optical accepts
+	 * continue seamlessly, instead of disagreeing with the covariance gate by the full jump.
+	 * A frame-exact linear transform: body-frame state (IMU biases, intrinsics) and
+	 * head-relative logic are untouched, and delta == identity is a no-op.
+	 */
+	virtual void
+	re_anchor_world(const struct xrt_pose *delta)
+	{
+		(void)delta;
+	}
+
+	/*!
 	 * Diagnostics / tests: the named regime of the last get_prediction report, as a stable integer code so a
 	 * test can assert FSM<->flags parity without the implementation enum. Codes:
 	 * 0 Invalid, 1 VisualAccuracy, 2 InertialFastMotion, 3 WorldLocked, 4 BodyLocked, 5 ConfusedPosition.

@@ -305,6 +305,9 @@ load_camera_group(const std::string &path, struct t_constellation_camera_group *
 	bool ok = true;
 	const cJSON *cams = cJSON_GetObjectItemCaseSensitive(root, "cameras");
 	out->cam_count = cJSON_GetArraySize(cams);
+	/* Commanded controller-slot gain (self-describing snapshots only); absent on pre-gain-plumbing
+	 * snapshots -> 0 -> the tracker replays at the gain-16 calibration point, bit-identical to before. */
+	out->ctrl_gain = (uint16_t)jnum(root, "ctrl_gain");
 	int i = 0;
 	const cJSON *c = nullptr;
 	cJSON_ArrayForEach(c, cams)
@@ -935,7 +938,11 @@ hmd_get_pose(struct xrt_device *xdev, enum xrt_input_name, int64_t t, struct xrt
 		}
 		pose = h->gt[best].pose;
 	}
+	*rel = {};
 	rel->pose = pose;
+	// Pose-only flags, zero velocities: the recorded head stream carries no gyro signal, so the
+	// tracker's world re-anchor detector (IMU-envelope-relative) stays structurally inert in
+	// replay — replays of the same capture remain byte-identical across that feature.
 	rel->relation_flags = (enum xrt_space_relation_flags)(
 	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
 	    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
@@ -1079,6 +1086,13 @@ cb_cache_pnp_pose_candidate(struct xrt_device *xdev, timepoint_ns t, const struc
 	FakeController *c = reinterpret_cast<FakeController *>(xdev);
 	struct xrt_pose hp;
 	kalman_fusion_cache_pnp_pose_candidate(c->kf, t + ctrl_optical_td_ns(), pose, ctrl_head_pose(c, t, &hp));
+}
+void
+cb_notify_world_reanchor(struct xrt_device *xdev, timepoint_ns t, const struct xrt_pose *delta)
+{
+	// Mirrors wmr_controller_base: the detected head-world step re-anchors the fusion world state.
+	(void)t;
+	kalman_fusion_re_anchor_world(reinterpret_cast<FakeController *>(xdev)->kf, delta);
 }
 bool
 cb_get_unc(struct xrt_device *xdev, double *ps, double *os, double *ys, double *ts)
@@ -1600,6 +1614,7 @@ main(int argc, char **argv)
 	cbs.push_brightness_update = cb_noop_bright;
 	cbs.push_observed_leds = cb_push_leds;
 	cbs.cache_pnp_pose_candidate = cb_cache_pnp_pose_candidate;
+	cbs.notify_world_reanchor = cb_notify_world_reanchor;
 	cbs.get_pose_uncertainty = cb_get_unc;
 	cbs.get_predicted_pose = cb_get_predicted_pose;
 	cbs.get_last_optical_age_ms = cb_get_last_optical_age_ms;

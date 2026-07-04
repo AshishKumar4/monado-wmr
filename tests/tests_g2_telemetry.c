@@ -186,6 +186,8 @@ struct g2_telem_getpose
 	float px, py, pz, qx, qy, qz, qw;
 	float vx, vy, vz;
 	float wx, wy, wz;
+	float dpx, dpy, dpz;
+	float dqx, dqy, dqz, dqw;
 } G2_PACKED;
 
 struct g2_telem_blob
@@ -199,6 +201,18 @@ struct g2_telem_blob
 	uint8_t retention_class;
 	float static_dwell_s;
 	float pos_var_px2;
+} G2_PACKED;
+
+struct g2_telem_mask
+{
+	uint64_t t_mono_ns;
+	uint64_t hw_ts_ns;
+	uint8_t cam_id;
+	uint8_t device_id;
+	uint8_t flags;
+	float x0, y0, x1, y1;
+	float sigma_px;
+	float optical_age_ms;
 } G2_PACKED;
 
 #if defined(_MSC_VER)
@@ -352,6 +366,7 @@ slurp(const char *dir, const char *name)
 #define N_HEAD_POSE 30000
 #define N_GETPOSE 60000
 #define N_BLOB 200000
+#define N_MASK 100000
 
 // Emit in chunks well below each ring's capacity, with a yield between chunks so
 // the continuously-draining writer always frees slots ahead of the producer.
@@ -426,14 +441,23 @@ test_peak(const char *dir)
 	}
 	float lin_vel[3] = {0.1f, 0.2f, 0.3f};
 	float ang_vel[3] = {0.01f, 0.02f, 0.03f};
+	float delta[7] = {0.001f, 0.002f, 0.003f, 0.0f, 0.0f, 0.0f, 1.0f};
 	for (long i = 0; i < N_GETPOSE; i++) {
-		g2_telem_getpose(1, g2_telem_now_ns(), pose, lin_vel, ang_vel, 0x3f);
+		g2_telem_getpose(1, g2_telem_now_ns(), pose, lin_vel, ang_vel, 0x3f, delta);
 		if ((i % CHUNK) == (CHUNK - 1)) {
 			pace();
 		}
 	}
 	for (long i = 0; i < N_BLOB; i++) {
 		g2_telem_blob((uint8_t)(i % 4), (uint64_t)i, 320.5f, 240.25f, 30, (uint8_t)(i % 3), 1.5f, 0.75f);
+		if ((i % CHUNK) == (CHUNK - 1)) {
+			pace();
+		}
+	}
+	float mrect[4] = {10.0f, 20.0f, 110.0f, 220.0f};
+	for (long i = 0; i < N_MASK; i++) {
+		g2_telem_mask((uint8_t)(i % 4), (uint64_t)i, (uint8_t)(1 + i % 2),
+		              G2_TELEM_MASK_ENABLED | G2_TELEM_MASK_FROM_PREDICTION, mrect, 12.5f, 16.6f);
 		if ((i % CHUNK) == (CHUNK - 1)) {
 			pace();
 		}
@@ -458,6 +482,7 @@ test_peak(const char *dir)
 	long head_pose_bytes = file_size(dir, "head_pose.bin");
 	long getpose_bytes = file_size(dir, "getpose.bin");
 	long blob_bytes = file_size(dir, "blob.bin");
+	long mask_bytes = file_size(dir, "mask.bin");
 
 	char *m = slurp(dir, "manifest.json");
 	CHECK(m != NULL, "manifest present");
@@ -471,6 +496,7 @@ test_peak(const char *dir)
 	long head_pose_rs = find_row_size(m, "head_pose");
 	long getpose_rs = find_row_size(m, "getpose");
 	long blob_rs = find_row_size(m, "blob");
+	long mask_rs = find_row_size(m, "mask");
 
 	long imu_rows = imu_bytes / imu_rs;
 	long frame_rows = frame_bytes / frame_rs;
@@ -482,6 +508,7 @@ test_peak(const char *dir)
 	long head_pose_rows = head_pose_bytes / head_pose_rs;
 	long getpose_rows = getpose_bytes / getpose_rs;
 	long blob_rows = blob_bytes / blob_rs;
+	long mask_rows = mask_bytes / mask_rs;
 
 	fprintf(stderr, "  imu: emitted=%ld written=%ld\n", imu_total, imu_rows);
 	fprintf(stderr, "  frame: emitted=%d written=%ld\n", N_FRAME, frame_rows);
@@ -493,6 +520,7 @@ test_peak(const char *dir)
 	fprintf(stderr, "  head_pose: emitted=%d written=%ld\n", N_HEAD_POSE, head_pose_rows);
 	fprintf(stderr, "  getpose: emitted=%d written=%ld\n", N_GETPOSE, getpose_rows);
 	fprintf(stderr, "  blob: emitted=%d written=%ld\n", N_BLOB, blob_rows);
+	fprintf(stderr, "  mask: emitted=%d written=%ld\n", N_MASK, mask_rows);
 
 	CHECK(imu_rows == imu_total, "imu count matches (%ld != %ld)", imu_rows, imu_total);
 	CHECK(frame_rows == N_FRAME, "frame count matches");
@@ -503,6 +531,7 @@ test_peak(const char *dir)
 	CHECK(head_pose_rows == N_HEAD_POSE, "head_pose count matches");
 	CHECK(getpose_rows == N_GETPOSE, "getpose count matches");
 	CHECK(blob_rows == N_BLOB, "blob count matches");
+	CHECK(mask_rows == N_MASK, "mask count matches");
 	// event = 1 emitted; with zero overflow there must be NO ring_overflow rows.
 	CHECK(event_rows == 1, "event count matches (zero overflow expected), got %ld", event_rows);
 
@@ -633,11 +662,20 @@ test_offsets(const char *dir)
 	CHKOFF("getpose", g2_telem_getpose, qw);
 	CHKOFF("getpose", g2_telem_getpose, vx);
 	CHKOFF("getpose", g2_telem_getpose, wz);
+	CHKOFF("getpose", g2_telem_getpose, dpx);
+	CHKOFF("getpose", g2_telem_getpose, dqw);
 	CHKOFF("blob", g2_telem_blob, cam_id);
 	CHKOFF("blob", g2_telem_blob, x);
 	CHKOFF("blob", g2_telem_blob, retention_class);
 	CHKOFF("blob", g2_telem_blob, static_dwell_s);
 	CHKOFF("blob", g2_telem_blob, pos_var_px2);
+	CHKOFF("mask", g2_telem_mask, cam_id);
+	CHKOFF("mask", g2_telem_mask, device_id);
+	CHKOFF("mask", g2_telem_mask, flags);
+	CHKOFF("mask", g2_telem_mask, x0);
+	CHKOFF("mask", g2_telem_mask, y1);
+	CHKOFF("mask", g2_telem_mask, sigma_px);
+	CHKOFF("mask", g2_telem_mask, optical_age_ms);
 
 	// row_size in manifest must equal sizeof the packed struct.
 	CHECK(find_row_size(m, "imu") == (long)sizeof(struct g2_telem_imu), "imu row_size");
@@ -650,6 +688,7 @@ test_offsets(const char *dir)
 	CHECK(find_row_size(m, "head_pose") == (long)sizeof(struct g2_telem_head_pose), "head_pose row_size");
 	CHECK(find_row_size(m, "getpose") == (long)sizeof(struct g2_telem_getpose), "getpose row_size");
 	CHECK(find_row_size(m, "blob") == (long)sizeof(struct g2_telem_blob), "blob row_size");
+	CHECK(find_row_size(m, "mask") == (long)sizeof(struct g2_telem_mask), "mask row_size");
 
 #undef CHKOFF
 	free(m);

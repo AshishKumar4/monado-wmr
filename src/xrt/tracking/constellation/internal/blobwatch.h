@@ -120,6 +120,23 @@ struct blobservation
 typedef struct blobwatch blobwatch;
 typedef struct blobservation blobservation;
 
+/*! Commanded analog gain register -> linear image-brightness multiplier m. The controller-tracking
+ *  sensor gain register is in 1/16 fine-gain units (valid 16..255); 16 is the calibration operating
+ *  point every DN-denominated constant in this tracker was measured at, so m = gain/16. A gain of 0
+ *  means "unknown" (drivers/recordings that predate gain plumbing) and maps to the calibration point,
+ *  keeping old-capture replays bit-identical. */
+static inline float
+blobwatch_gain_multiplier(uint16_t gain)
+{
+	return (float)(gain == 0 ? 16 : gain) / 16.0f;
+}
+
+/*! The commanded-gain-aware centroid brightness-noise constant K(m) = K16 * sqrt(f_pre * m^2 + f_post)
+ *  (derivation at DIM_NOISE_BRIGHTNESS_K16 in blobwatch.c). Exposed so the associator can denominate
+ *  its own DN/variance constants in the same law instead of growing a second photometric path. */
+float
+blobwatch_dim_noise_k(uint16_t gain);
+
 blobwatch *
 blobwatch_new(uint8_t pixel_threshold, uint8_t cam_id);
 void

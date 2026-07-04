@@ -29,6 +29,22 @@
 
 #include "blobwatch.h"
 
+/* AVX2 row kernels for the two per-pixel passes (integral-image accumulation
+ * and the dark-pixel scan): pure integer ops computing exactly the same values
+ * element-for-element as the scalar remainder loops they sit above, so the
+ * output is bit-identical to the scalar build by construction. AVX2 is assumed
+ * present at runtime on x86-64 (x86-64-v3; every deployment/CI machine of this
+ * project, incl. the production i9-12900K) — no runtime dispatch. Non-x86
+ * builds compile the scalar loops only. */
+#if defined(__x86_64__) && defined(__GNUC__)
+#include <immintrin.h>
+#define BW_HAVE_AVX2 1
+#define BW_TARGET_AVX2 __attribute__((target("avx2")))
+#else
+#define BW_HAVE_AVX2 0
+#define BW_TARGET_AVX2
+#endif
+
 /* Keep enough history frames that the caller can keep hold
  * of a previous blobservation and pass it to the long term
  * tracker while we still have 2 left to ping-pong between */
@@ -106,8 +122,21 @@
  * K = 21..27, i.e. the same law with less per-pixel noise). At the gain-16 dim band (b ~ 22..45)
  * this yields x1.8..4.0 — the measured truth, matching the long-validated frame-anchored dim-band
  * operating point without its room-content coupling, and well below the saturation-anchored flat
- * x3.7..4.0 that deflated acceptance nats on dim clutter and bright LED spots alike. */
-#define DIM_NOISE_BRIGHTNESS_K 40.0f
+ * x3.7..4.0 that deflated acceptance nats on dim clutter and bright LED spots alike.
+ *
+ * K under commanded analog gain (B3, results/b3-signal-design-20260704 §1a + analysis-d §1): the
+ * per-pixel noise splits into a pre-gain share (read + dark + photon shot + scene-IR, electron-referred,
+ * so it scales with the brightness multiplier m = gain/16 in DN) and a post-gain share (ADC read +
+ * quantization >= 1/sqrt(12) DN, fixed in DN — measured dark sigma 0.276 DN ~= the quantizer floor, so
+ * this share is real). Centroid noise A ~ sigma_pix^2 and S0 is gain-invariant (bright-blob geometric
+ * floor in px^2, constant across captures whose A varies 3x), hence
+ *     K(m) = K16 * sqrt(f_pre * m^2 + f_post),  f_pre + f_post = 1  (variance shares at gain 16).
+ * f_pre below is analyst D's felt-room point estimate (band 0.5..0.8), expressed binary-exactly so that
+ * K(2) = 65.0 (the predicted 60..70 band) and K(1) = K16 exactly — gain-16 (or unknown-gain) replays
+ * stay bit-identical. It is a provisional physical constant: the S3 gain-sweep re-fit (dual-model
+ * S0 + A1/b + A2/b^2, f_pre backed out as (A'/A - 1)/(m^2 - 1)) replaces it with the measured split. */
+#define DIM_NOISE_BRIGHTNESS_K16 40.0f
+#define DIM_NOISE_GAIN_F_PRE 0.546875f
 
 /* Cap-pressure retention: all qualifying extents are staged (bound below), and when more than
  * MAX_BLOBS_PER_FRAME qualify the survivors are chosen by priority (device-near class first,
@@ -418,6 +447,85 @@ blobwatch_free(blobwatch *bw)
 }
 
 /*
+ * First index in [x, x_max) whose pixel value exceeds @p threshold, or x_max.
+ * The pixels skipped over have no side effects in any caller, so vectorizing
+ * this scan cannot change any output.
+ */
+BW_TARGET_AVX2 static uint32_t
+next_pixel_above(const uint8_t *line, uint32_t x, uint32_t x_max, uint8_t threshold)
+{
+#if BW_HAVE_AVX2
+	const __m256i thr = _mm256_set1_epi8((char)threshold);
+	const __m256i zero = _mm256_setzero_si256();
+	while (x + 32 <= x_max) {
+		const __m256i v = _mm256_loadu_si256((const __m256i *)(line + x));
+		/* No unsigned byte compare in AVX2: v > thr  <=>  saturating v - thr != 0. */
+		const __m256i le = _mm256_cmpeq_epi8(_mm256_subs_epu8(v, thr), zero);
+		const uint32_t above = ~(uint32_t)_mm256_movemask_epi8(le);
+		if (above != 0) {
+			return x + (uint32_t)__builtin_ctz(above);
+		}
+		x += 32;
+	}
+#endif
+	while (x < x_max && line[x] <= threshold) {
+		x++;
+	}
+	return x;
+}
+
+/*
+ * One row of the integral image: row[x+1] = prev[x+1] + sum(src[0..x]).
+ * uint32 addition is associative, so the in-register prefix scan produces
+ * exactly the scalar running sum in every element.
+ */
+BW_TARGET_AVX2 static void
+integral_row(const uint8_t *src, const uint32_t *prev, uint32_t *row, int w)
+{
+	uint32_t run = 0;
+	int x = 0;
+	row[0] = 0; /* left border column */
+#if BW_HAVE_AVX2
+	const __m128i zero128 = _mm_setzero_si128();
+	__m256i vrun = _mm256_setzero_si256(); /* running total, broadcast in all 8 lanes */
+	for (; x + 16 <= w; x += 16) {
+		const __m128i b = _mm_loadu_si128((const __m128i *)(src + x));
+		__m256i v0 = _mm256_cvtepu8_epi32(b);
+		__m256i v1 = _mm256_cvtepu8_epi32(_mm_srli_si128(b, 8));
+		/* psadbw gives the exact byte sums of each 8-byte half; the
+		 * loop-carried total advances through this short chain, kept in
+		 * the vector domain, independent of the two prefix scans below. */
+		const __m128i sad = _mm_sad_epu8(b, zero128); /* u64[0]=sum(low 8), u64[1]=sum(high 8) */
+		const __m128i tot16 = _mm_add_epi64(sad, _mm_srli_si128(sad, 8));
+		/* Inclusive prefix scan of 8 lanes: two shift-add steps within each
+		 * 128-bit half, then add the low half's total into every high-half lane. */
+		v0 = _mm256_add_epi32(v0, _mm256_slli_si256(v0, 4));
+		v1 = _mm256_add_epi32(v1, _mm256_slli_si256(v1, 4));
+		v0 = _mm256_add_epi32(v0, _mm256_slli_si256(v0, 8));
+		v1 = _mm256_add_epi32(v1, _mm256_slli_si256(v1, 8));
+		const __m256i t0 = _mm256_shuffle_epi32(v0, _MM_SHUFFLE(3, 3, 3, 3));
+		const __m256i t1 = _mm256_shuffle_epi32(v1, _MM_SHUFFLE(3, 3, 3, 3));
+		v0 = _mm256_add_epi32(v0, _mm256_permute2x128_si256(t0, t0, 0x08)); /* low half = 0 */
+		v1 = _mm256_add_epi32(v1, _mm256_permute2x128_si256(t1, t1, 0x08));
+		/* v1 additionally carries v0's full total (sad u32[0] = sum of the low 8 bytes). */
+		v1 = _mm256_add_epi32(v1, _mm256_broadcastd_epi32(sad));
+		v0 = _mm256_add_epi32(v0, vrun);
+		v1 = _mm256_add_epi32(v1, vrun);
+		vrun = _mm256_add_epi32(vrun, _mm256_broadcastd_epi32(tot16));
+		_mm256_storeu_si256((__m256i *)(row + x + 1),
+		                    _mm256_add_epi32(v0, _mm256_loadu_si256((const __m256i *)(prev + x + 1))));
+		_mm256_storeu_si256((__m256i *)(row + x + 9),
+		                    _mm256_add_epi32(v1, _mm256_loadu_si256((const __m256i *)(prev + x + 9))));
+	}
+	run = (uint32_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(vrun));
+#endif
+	for (; x < w; x++) {
+		run += src[x];
+		row[x + 1] = prev[x + 1] + run;
+	}
+}
+
+/*
  * Builds an integral image of the frame (single pass), so the mean of any
  * box can be read in O(1). Used for the local adaptive threshold.
  */
@@ -450,12 +558,7 @@ build_integral(blobwatch *bw, struct xrt_frame *frame)
 		const uint8_t *src = frame->data + (size_t)frame->stride * y;
 		uint32_t *row = I + (size_t)(y + 1) * iw;
 		const uint32_t *prev = I + (size_t)y * iw;
-		uint32_t run = 0;
-		row[0] = 0; /* left border column */
-		for (int x = 0; x < w; x++) {
-			run += src[x];
-			row[x + 1] = prev[x + 1] + run;
-		}
+		integral_row(src, prev, row, w);
 	}
 }
 
@@ -920,12 +1023,15 @@ process_scanline(uint8_t *line,
 		uint32_t intensity_sum = 0;
 		uint32_t sat_count = 0;
 
-		/* Adaptive threshold: a pixel must clear the global floor AND stand
-		 * out from its local background. Cheap (one integral-image lookup),
-		 * separates dim LEDs from bright reflections and stops a uniformly
-		 * bright background from forming blobs. */
-		if (line[x] <= bw->pixel_threshold ||
-		    line[x] < local_bg_mean(bw, x, y, frame->width, frame->height) + bw->adapt_margin)
+		/* Adaptive threshold: a pixel must clear the global floor (SIMD
+		 * skip-scan over the dark majority) AND stand out from its local
+		 * background. Cheap (one integral-image lookup), separates dim LEDs
+		 * from bright reflections and stops a uniformly bright background
+		 * from forming blobs. */
+		x = next_pixel_above(line, x, x_max, bw->pixel_threshold);
+		if (x >= x_max)
+			break;
+		if (line[x] < local_bg_mean(bw, x, y, frame->width, frame->height) + bw->adapt_margin)
 			continue;
 
 		start = x;
@@ -1075,14 +1181,17 @@ recover_dim_blobs(blobwatch *bw,
 	for (int y = y_lo; y < y_hi; y++) {
 		const uint8_t *row = frame->data + (size_t)frame->stride * y;
 		for (int x = x_lo; x < x_hi; x++) {
+			/* SIMD skip-scan to the next candidate; checking the frame cap only
+			 * at candidates is equivalent, as dark pixels never add blobs. */
+			x = (int)next_pixel_above(row, (uint32_t)x, (uint32_t)x_hi, bw->pixel_threshold);
+			if (x >= x_hi) {
+				break;
+			}
 			if (ob->num_blobs >= MAX_BLOBS_PER_FRAME) {
 				goto done;
 			}
 
 			const int peak = row[x];
-			if (peak <= bw->pixel_threshold) {
-				continue;
-			}
 			const double contrast = (double)peak - local_bg_mean(bw, x, y, w, h);
 			if (contrast < RECOVER_MARGIN_LO || contrast > (double)bw->adapt_margin) {
 				continue;
@@ -1313,6 +1422,7 @@ static void
 process_frame_roi(blobwatch *bw,
                   blobservation *ob,
                   struct xrt_frame *frame,
+                  uint16_t gain,
                   uint32_t roi_x,
                   uint32_t roi_y,
                   uint32_t roi_x_end,
@@ -1364,21 +1474,30 @@ process_frame_roi(blobwatch *bw,
 	}
 
 	/* Brightness-honest R inflation: the MEASURED centroid-noise variance ratio
-	 * g(b) = 1 + (K/b)^2 (see DIM_NOISE_BRIGHTNESS_K). Never anchored at the frame's brightest
+	 * g(b) = 1 + (K/b)^2 (see DIM_NOISE_BRIGHTNESS_K16; K follows the commanded gain via
+	 * blobwatch_dim_noise_k). Never anchored at the frame's brightest
 	 * blob — the brightest blob is room clutter (a window/lamp) in ~1/5 of cluttered frames,
 	 * which inflated every LED's R by x3.5 median and coupled the association margins to room
 	 * content. A pure function of the blob's own peak: brightness is the peak signal the
 	 * photometric centroid is estimated from, so its noise contribution falls as 1/b^2 onto the
 	 * brightness-independent floor (g -> 1 for bright blobs). The cap keeps the worst-case dim
 	 * blob at the long-validated DIM_R_INFLATE_MAX operating point. */
+	const float dim_noise_k = blobwatch_dim_noise_k(gain);
 	for (int i = 0; i < ob->num_blobs; i++) {
 		struct blob *b = &ob->blobs[i];
-		const float k = DIM_NOISE_BRIGHTNESS_K / (float)b->brightness;
+		const float k = dim_noise_k / (float)b->brightness;
 		float g = 1.0f + k * k;
 		if (g > DIM_R_INFLATE_MAX)
 			g = DIM_R_INFLATE_MAX;
 		b->pos_var_px2 *= g;
 	}
+}
+
+float
+blobwatch_dim_noise_k(uint16_t gain)
+{
+	const float m = blobwatch_gain_multiplier(gain);
+	return DIM_NOISE_BRIGHTNESS_K16 * sqrtf(DIM_NOISE_GAIN_F_PRE * m * m + (1.0f - DIM_NOISE_GAIN_F_PRE));
 }
 
 /*
@@ -1451,7 +1570,7 @@ blobwatch_process_roi(blobwatch *bw,
 		rx = 0; ry = 0; rx_end = frame->width; ry_end = frame->height;
 	}
 
-	process_frame_roi(bw, ob, frame, rx, ry, rx_end, ry_end);
+	process_frame_roi(bw, ob, frame, gain, rx, ry, rx_end, ry_end);
 
 	/* Optional: dump the actual controller-tracking frame (what the constellation tracker sees) as
 	 * PGM — the real short-exposure LED images, which the EuRoC recorder does NOT capture (it taps the

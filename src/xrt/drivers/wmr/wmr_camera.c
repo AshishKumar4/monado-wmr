@@ -66,10 +66,15 @@ wmr_camera_set_ctrl_exposure_gain(struct wmr_camera *cam, uint8_t camera_id, uin
 #define DEFAULT_SLAM_EXPOSURE 6000
 #define DEFAULT_SLAM_GAIN 127
 #define DEFAULT_CTRL_EXPOSURE 0x0190
-/* The sensor's documented minimum usable gain (valid range 16-255). Below this floor the constellation
- * reads too dim (~54 peak, barely above the blob threshold) even at full LED drive. */
-#define WMR_MIN_GAIN 16
-#define DEFAULT_CTRL_GAIN WMR_MIN_GAIN
+/* Analog gain register for the short controller/LED exposure slot, in 1/16 fine-gain units (valid range
+ * WMR_MIN_GAIN 16 .. WMR_MAX_GAIN 255, so 16 = the unity floor). 16 was the long-standing operating point
+ * every DN-denominated tracker constant was calibrated at; B3 (results/b3-signal-design-20260704) moved
+ * production to 32 (m = 2): LED contrast scales x2 against the blobwatch admission margin, which stays
+ * FIXED in DN by design, eliminating the measured near-extinction shoulder and recovering the
+ * admission-censored top-edge band, at ~1-2 % clipping cost. The tracker's DN constants follow the
+ * commanded gain via the blobwatch gain law (blobwatch_dim_noise_k), plumbed through
+ * t_constellation_camera_group::ctrl_gain. */
+#define DEFAULT_CTRL_GAIN 32
 
 #define WMR_FRAMETYPE_SLAM 0x0
 #define WMR_FRAMETYPE_CONTROLLER 0x2
@@ -478,6 +483,29 @@ out:
  *
  */
 
+void
+wmr_camera_get_ctrl_exposure_gain(uint16_t *out_exposure, uint16_t *out_gain)
+{
+	uint16_t exposure = DEFAULT_CTRL_EXPOSURE;
+	uint16_t gain = DEFAULT_CTRL_GAIN;
+	const char *exp_env = getenv("G2_CTRL_EXPOSURE");
+	const char *gain_env = getenv("G2_CTRL_GAIN");
+	if (exp_env && *exp_env) {
+		exposure = (uint16_t)atoi(exp_env);
+	}
+	if (gain_env && *gain_env) {
+		/* The register is 8-bit; truncate exactly like the programming path so the value the
+		 * tracker denominates its constants in is the value the sensor actually runs. */
+		gain = (uint8_t)atoi(gain_env);
+	}
+	if (out_exposure != NULL) {
+		*out_exposure = exposure;
+	}
+	if (out_gain != NULL) {
+		*out_gain = gain;
+	}
+}
+
 struct wmr_camera *
 wmr_camera_open(struct wmr_camera_open_config *config)
 {
@@ -558,22 +586,18 @@ wmr_camera_open(struct wmr_camera_open_config *config)
 	// controller/LED exposure was never programmed, leaving controller frames at the long
 	// SLAM exposure (room-bright), which starved constellation tracking. Start from 0.
 	// Exposure/gain are env-overridable (G2_CTRL_EXPOSURE / G2_CTRL_GAIN) so the LED-vs-room
-	// balance can be swept at runtime without a rebuild. Default 400us / gain 1.
-	uint16_t ctrl_exposure = DEFAULT_CTRL_EXPOSURE;
-	uint8_t ctrl_gain = DEFAULT_CTRL_GAIN;
-	const char *exp_env = getenv("G2_CTRL_EXPOSURE");
-	const char *gain_env = getenv("G2_CTRL_GAIN");
-	if (exp_env && *exp_env) {
-		ctrl_exposure = (uint16_t)atoi(exp_env);
-	}
-	if (gain_env && *gain_env) {
-		ctrl_gain = (uint8_t)atoi(gain_env);
-	}
+	// balance can be swept at runtime without a rebuild. Default 400 us / gain 32
+	// (DEFAULT_CTRL_EXPOSURE / DEFAULT_CTRL_GAIN), resolved by the same helper that fills the
+	// constellation tracker's gain so the commanded and denominated values cannot drift.
+	uint16_t ctrl_exposure;
+	uint16_t ctrl_gain;
+	wmr_camera_get_ctrl_exposure_gain(&ctrl_exposure, &ctrl_gain);
 	WMR_CAM_INFO(cam, "Controller-tracking exposure=%u gain=%u", ctrl_exposure, ctrl_gain);
 	for (int i = 0; i < cam->tcam_count; i++) {
 		const struct wmr_camera_config *config = &cam->tcam_confs[i];
 
-		bool status = wmr_camera_set_ctrl_exposure_gain(cam, config->location, ctrl_exposure, ctrl_gain);
+		bool status =
+		    wmr_camera_set_ctrl_exposure_gain(cam, config->location, ctrl_exposure, (uint8_t)ctrl_gain);
 		if (status != 0) {
 			WMR_CAM_ERROR(cam,
 			              "Failed to set exposure and gain for controller tracking frames on camera %d", i);

@@ -14,6 +14,7 @@
 
 #include "util/u_debug.h"
 #include "util/u_g2_telemetry.h"
+#include "util/u_world_reanchor.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "util/u_sink.h"
@@ -806,7 +807,7 @@ flush_poses(TrackerSlam &t)
 		// Last relation
 		xrt_space_relation lr = XRT_SPACE_RELATION_ZERO;
 		int64_t lts;
-		t.slam_rels.get_latest(&lts, &lr);
+		bool have_last = t.slam_rels.get_latest(&lts, &lr);
 		xrt_quat lrot = lr.pose.orientation;
 
 		double dt = time_ns_to_s(nts - lts);
@@ -820,6 +821,49 @@ flush_poses(TrackerSlam &t)
 		rel.pose = {nrot, npos};
 		rel.linear_velocity = nvel;
 		math_quat_finite_difference(&lrot, &nrot, dt, &rel.angular_velocity);
+
+		// A relocalization/reset step turns this finite difference into an angular-velocity
+		// artifact (worst recorded event: 59.3 deg over 66.8 ms = a ~890 dps "velocity" for one
+		// sample) that consumers would extrapolate by. Clamp it to the IMU-envelope-consistent
+		// rate when the step's rotation exceeds the envelope (the same innovation test the world
+		// re-anchor guard uses); the true post-step angular velocity is re-established by the
+		// next sample pair.
+		if (have_last && dt > 0.0) {
+			double gyro_int_deg = 0.0;
+			os_mutex_lock(&t.lock_ff);
+			uint64_t seg_end_ns = (uint64_t)nts;
+			struct xrt_vec3 g;
+			uint64_t g_ts;
+			for (size_t i = 0; m_ff_vec3_f32_get(t.gyro_ff, i, &g, &g_ts); i++) {
+				if ((int64_t)g_ts >= (int64_t)seg_end_ns) {
+					continue; // not yet inside [lts, nts]
+				}
+				int64_t seg_start = (int64_t)g_ts > lts ? (int64_t)g_ts : lts;
+				gyro_int_deg +=
+				    (double)m_vec3_len(g) * (180.0 / M_PI) * time_ns_to_s(seg_end_ns - seg_start);
+				if ((int64_t)g_ts <= lts) {
+					break;
+				}
+				seg_end_ns = (uint64_t)g_ts;
+			}
+			os_mutex_unlock(&t.lock_ff);
+
+			struct u_world_reanchor_step st;
+			if (u_world_reanchor_compute_excess(&u_world_reanchor_default_params, &lr.pose, &rel.pose,
+			                                    dt, gyro_int_deg, &st) &&
+			    st.exc_ang_deg > 0.0) {
+				float av_len = m_vec3_len(rel.angular_velocity);
+				double env_rate = (st.dang_deg - st.exc_ang_deg) * (M_PI / 180.0) / dt;
+				if (av_len > 0.0f && (double)av_len > env_rate) {
+					rel.angular_velocity =
+					    m_vec3_mul_scalar(rel.angular_velocity, (float)(env_rate / av_len));
+					SLAM_INFO("Clamped re-anchor angular-velocity artifact %.0f -> %.0f dps "
+					          "(step %.2f deg, envelope %.2f deg over %.1f ms)",
+					          (double)av_len * 180.0 / M_PI, env_rate * 180.0 / M_PI, st.dang_deg,
+					          st.dang_deg - st.exc_ang_deg, dt * 1e3);
+				}
+			}
+		}
 
 		// Push to relationship history unless we are debugging prediction
 		if (t.dbg_pred_counter % t.dbg_pred_every == 0) {

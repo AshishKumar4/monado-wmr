@@ -24,6 +24,7 @@ set(tests
     tests_pose
     tests_vec3_angle
     tests_visibility_mask
+    tests_world_reanchor
 	)
 if(XRT_HAVE_OPENCV)
 	list(APPEND tests tests_kalman_fusion)
@@ -75,6 +76,9 @@ target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)
 target_link_libraries(tests_visibility_mask PRIVATE aux_math)
+# Recorded-head-stream fixture (b2_reanchor_head_streams.bin, generated from the B2 design's
+# reference simulator); the test warns + skips the recorded-stream sections if it is absent.
+target_compile_definitions(tests_world_reanchor PRIVATE G2_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 
 add_executable(tests_association_hypothesis tests_association_hypothesis.cpp)
 target_link_libraries(tests_association_hypothesis PRIVATE xrt-external-catch2 aux_util)

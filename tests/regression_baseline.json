@@ -8,44 +8,44 @@
   "metrics": {
     "1": {
       "opt": {
-        "yield_pct": 63.207416632074164,
-        "pos_med_cm": 0.49331930120722484,
-        "wrong_branch_pct": 19.22596754057428,
-        "flip_rate_pct": 9.209363957597173,
-        "fly_max_jump_m": 1.092651323433052,
-        "anchor_tilt_flip_pct": 9.768270944741532,
-        "anchor_yaw_flip_pct": 0.8912655971479501
+        "yield_pct": 70.45800470458005,
+        "pos_med_cm": 0.3448611048885831,
+        "wrong_branch_pct": 3.9361702127659575,
+        "flip_rate_pct": 0.01977848101265823,
+        "fly_max_jump_m": 0.21461180978688008,
+        "anchor_tilt_flip_pct": 0.0,
+        "anchor_yaw_flip_pct": 0.0
       },
       "pred": {
-        "yield_pct": 89.8989898989899,
-        "pos_med_cm": 1.605510929319753,
-        "wrong_branch_pct": 18.854550609583214,
-        "flip_rate_pct": 0.06168080185042406,
-        "fly_max_jump_m": 1.2266022531774512,
+        "yield_pct": 79.45205479452055,
+        "pos_med_cm": 0.3046913305059879,
+        "wrong_branch_pct": 4.818059299191375,
+        "flip_rate_pct": 0.03497114880223815,
+        "fly_max_jump_m": 0.4242557609508679,
         "reentry_snap_m": 0.0,
-        "anchor_tilt_flip_pct": 1.7660995046306267,
-        "anchor_yaw_flip_pct": 0.0646133965108766
+        "anchor_tilt_flip_pct": 0.0,
+        "anchor_yaw_flip_pct": 0.018355359765051395
       }
     },
     "2": {
       "opt": {
-        "yield_pct": 73.49179872115651,
-        "pos_med_cm": 0.9052614499651817,
-        "wrong_branch_pct": 11.751930501930502,
-        "flip_rate_pct": 7.2491415490270885,
-        "fly_max_jump_m": 3.501841206765378,
-        "anchor_tilt_flip_pct": 4.431540342298288,
-        "anchor_yaw_flip_pct": 1.4364303178484108
+        "yield_pct": 74.49840874498409,
+        "pos_med_cm": 0.5497489569146666,
+        "wrong_branch_pct": 2.4063439978124146,
+        "flip_rate_pct": 0.01863932898415657,
+        "fly_max_jump_m": 1.194294820008862,
+        "anchor_tilt_flip_pct": 0.0,
+        "anchor_yaw_flip_pct": 0.019417475728155338
       },
       "pred": {
-        "yield_pct": 96.02446483180428,
-        "pos_med_cm": 1.0944662543358206,
-        "wrong_branch_pct": 9.389884327511908,
-        "flip_rate_pct": 0.02897291032884253,
-        "fly_max_jump_m": 1.18776747913891,
+        "yield_pct": 81.65213781652137,
+        "pos_med_cm": 0.43834200798555806,
+        "wrong_branch_pct": 2.826201796090861,
+        "flip_rate_pct": 0.016975046681378374,
+        "fly_max_jump_m": 1.1854419990872602,
         "reentry_snap_m": 0.0,
-        "anchor_tilt_flip_pct": 0.2071563088512241,
-        "anchor_yaw_flip_pct": 0.32015065913371
+        "anchor_tilt_flip_pct": 0.0,
+        "anchor_yaw_flip_pct": 0.017812611328820806
       }
     }
   }

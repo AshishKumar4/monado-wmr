@@ -241,6 +241,15 @@ kalman_fusion_update_body_anchor(struct KalmanFusionInterfaceWrapper *wrapper, c
 	wrapper->fusion->update_body_anchor(hmd_pose);
 }
 
+void
+kalman_fusion_re_anchor_world(struct KalmanFusionInterfaceWrapper *wrapper, const struct xrt_pose *delta)
+{
+	if (wrapper == nullptr) {
+		return;
+	}
+	wrapper->fusion->re_anchor_world(delta);
+}
+
 int
 kalman_fusion_debug_get_fusion_state(struct KalmanFusionInterfaceWrapper *wrapper, char *name_out, size_t name_cap)
 {

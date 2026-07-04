@@ -1403,12 +1403,14 @@ wmr_controller_base_get_last_optical_age_ms(struct xrt_device *xdev, timepoint_n
 }
 
 /* Observed LED peak-brightness band (0-255 image counts) the LED-drive control loop rides toward.
- * Was 30-70 -- far too dim: detected LEDs peaked at a median of ~54, right on top of the blob
- * retention threshold (24), so dim/angled/far LEDs fell below it and only ~5 of ~13 visible LEDs were
- * matched -> degenerate few-point PnP -> mirror flips + fly-off. Drive the LEDs as bright as the
- * detector can actually use instead: most LEDs then clear the threshold and the sub-pixel centroids
- * stay crisp. Saturated cores are fine (blobwatch centroids them edge-symmetrically); the only regime
- * this band backs off from is gross bloom/merge of adjacent LEDs at very close range. */
+ * Was 30-70 -- far too dim: detected LEDs peaked at a median of ~54, barely above the blob admission
+ * cut (pixel floor 8 + local background + 6 margin), so dim/angled/far LEDs fell below it and only ~5
+ * of ~13 visible LEDs were matched -> degenerate few-point PnP -> mirror flips + fly-off. Drive the
+ * LEDs as bright as the detector can actually use instead: most LEDs then clear the cut and the
+ * sub-pixel centroids stay crisp. Saturated cores are fine (blobwatch centroids them edge-symmetrically);
+ * the only regime this band backs off from is gross bloom/merge of adjacent LEDs at very close range.
+ * The band is denominated in image DN on purpose: its remaining job is anti-bloom backoff near the 255
+ * ADC clip, which does not move with camera gain (B3 design §1c) -- do not scale it. */
 #define LED_BRIGHT_TARGET_LO 160
 #define LED_BRIGHT_TARGET_HI 200
 
@@ -1681,6 +1683,24 @@ wmr_controller_base_cache_pnp_pose_candidate(struct xrt_device *xdev,
 	os_mutex_unlock(&wcb->data_lock);
 }
 
+/* The head tracker's world re-anchored (SLAM relocalization/reset, detected at the constellation
+ * tracker's head-pose sample): transform the fusion's world-frame state by the rigid delta so the
+ * prior lands in the new world the same camera frame the optical observations do. */
+static void
+wmr_controller_base_notify_world_reanchor(struct xrt_device *xdev,
+                                          timepoint_ns frame_mono_ns,
+                                          const struct xrt_pose *delta)
+{
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
+	if (wcb->kalman_fusion == NULL || delta == NULL) {
+		return;
+	}
+	(void)frame_mono_ns;
+	os_mutex_lock(&wcb->data_lock);
+	kalman_fusion_re_anchor_world(wcb->kalman_fusion, delta);
+	os_mutex_unlock(&wcb->data_lock);
+}
+
 static struct t_constellation_tracked_device_callbacks tracking_callbacks = {
     .get_led_model = wmr_controller_base_get_led_model,
     .notify_frame_received = wmr_controller_base_notify_frame,
@@ -1694,6 +1714,7 @@ static struct t_constellation_tracked_device_callbacks tracking_callbacks = {
 	.get_last_optical_age_ms = wmr_controller_base_get_last_optical_age_ms,
 	.predict_led_gate = wmr_controller_base_predict_led_gate,
 	.cache_pnp_pose_candidate = wmr_controller_base_cache_pnp_pose_candidate,
+	.notify_world_reanchor = wmr_controller_base_notify_world_reanchor,
 };
 
 void

@@ -127,6 +127,14 @@ struct xrt_hmd_parts
 		int h_pixels;
 		//! Nominal frame interval
 		uint64_t nominal_frame_interval_ns;
+		/*!
+		 * Time from a flip's vsync until the panel emits photons
+		 * (mid-persistence), for pose-prediction lead time. On
+		 * global-flash low-persistence panels this exceeds the frame
+		 * interval: scanout fills the LC over the full frame, then the
+		 * backlight strobes. 0 = unknown; consumers keep their fallback.
+		 */
+		uint64_t vsync_to_photons_ns;
 	} screens[1];
 
 	/*!

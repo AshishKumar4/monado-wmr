@@ -59,6 +59,12 @@ struct t_constellation_camera
 struct t_constellation_camera_group
 {
 	int cam_count; //!< Number of cameras
+	/*! Commanded analog-gain register for the controller-tracking (short LED exposure) slot, shared by
+	 * all cameras (one operating point per session). 1/16 fine-gain units, valid 16..255; 0 = unknown
+	 * (drivers/recordings that predate gain plumbing) and is treated as the gain-16 calibration point,
+	 * so old-capture replays are bit-identical. The tracker's DN-denominated constants are scaled by
+	 * the resulting brightness multiplier m = gain/16 (see blobwatch_dim_noise_k). */
+	uint16_t ctrl_gain;
 	struct t_constellation_camera cams[XRT_TRACKING_MAX_SLAM_CAMS];
 };
 
@@ -72,7 +78,8 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
 
 /*!
  * Serialise a camera group (per-camera intrinsics, distortion model + params, IMU->camera extrinsic,
- * mosaic ROI and blob thresholds) to JSON. Lets the exact calibration the tracker is built from be
+ * mosaic ROI, blob thresholds and the commanded controller-slot gain) to JSON. Lets the exact
+ * calibration the tracker is built from be
  * persisted for OFFLINE replay of the full controller VIO against recorded raw frames — the per-unit
  * camera calibration otherwise lives only in headset flash. Self-describing ("g2-constellation-cameras"
  * v1). No-op on NULL args.
@@ -163,6 +170,14 @@ struct t_constellation_tracked_device_callbacks
 	//! are seen but the stale prior gates them out.
 	void (*cache_pnp_pose_candidate)(struct xrt_device *xdev, timepoint_ns frame_mono_ns,
 	                                 const struct xrt_pose *pose);
+	//! World re-anchor (the head resnap guard's detector): the sampled HMD world pose stepped
+	//! beyond its IMU envelope at @p frame_mono_ns — a SLAM relocalization/reset re-anchored the
+	//! world by the rigid transform @p delta (x' = delta.q * x + delta.p, pivoted at the pre-step
+	//! head position so head-relative geometry is preserved). The device transforms its
+	//! world-frame fusion state by delta so its prior lands in the NEW world in the same camera
+	//! frame the optical observations do. Optional — may be NULL.
+	void (*notify_world_reanchor)(struct xrt_device *xdev, timepoint_ns frame_mono_ns,
+	                              const struct xrt_pose *delta);
 };
 
 struct t_constellation_tracked_device_connection *

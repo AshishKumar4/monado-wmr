@@ -218,18 +218,37 @@ struct g2_telem_head_pose
 	float px, py, pz, qx, qy, qz, qw;
 } G2_PACKED;
 
-//! getpose stream row: exactly what the SteamVR pose-pull consumed for one controller — the
-//! resolved relation (pose + velocities + flags) the driver's GetPose returned. This is the
-//! signal the user physically feels (vrserver predicts photon time from this pose+velocity);
-//! unrecorded until now, live jitter/lag could not be attributed to it.
+//! getpose stream row: exactly what the SteamVR pose-pull returned for one device (0=HMD,
+//! 1=left, 2=right controller) — the PRESENTED pose + velocities + relation flags. This is the
+//! signal the user physically feels (vrserver predicts photon time from this pose+velocity).
+//! dp*/dq* record the world re-anchor glide delta composed into the presented pose at this
+//! pull (identity while inactive), so the raw tracker pose is recoverable offline.
 struct g2_telem_getpose
 {
 	uint64_t t_mono_ns;
 	uint8_t device_id;
 	uint32_t relation_flags;
 	float px, py, pz, qx, qy, qz, qw;
-	float vx, vy, vz; //!< linear velocity (m/s)
-	float wx, wy, wz; //!< angular velocity (rad/s)
+	float vx, vy, vz;                 //!< linear velocity (m/s)
+	float wx, wy, wz;                 //!< angular velocity (rad/s)
+	float dpx, dpy, dpz;              //!< world re-anchor glide delta translation (m)
+	float dqx, dqy, dqz, dqw;         //!< world re-anchor glide delta rotation (quat xyzw)
+} G2_PACKED;
+
+//! mask stream row: the SLAM controller-mask rect state for one device on one SLAM camera at one
+//! controller frame (see g2_telem_mask). One row per connected device per camera per processed
+//! frame — the authoritative record of what the tracker asked SLAM to ignore, from which rect
+//! age/steal/leak masking metrics are scored offline (results/b5-ledmask-20260704 pipeline).
+struct g2_telem_mask
+{
+	uint64_t t_mono_ns;
+	uint64_t hw_ts_ns;
+	uint8_t cam_id;
+	uint8_t device_id;
+	uint8_t flags;            //!< enum g2_telem_mask_flags
+	float x0, y0, x1, y1;     //!< rect corners in pixels (valid when ENABLED)
+	float sigma_px;           //!< projected position-uncertainty inflation (<0 unknown)
+	float optical_age_ms;     //!< age of the last accepted optical pose (<0 never)
 } G2_PACKED;
 
 #if defined(_MSC_VER)
@@ -250,7 +269,8 @@ enum g2_telem_stream
 	G2_TELEM_STREAM_HEAD_POSE = 7,
 	G2_TELEM_STREAM_GETPOSE = 8,
 	G2_TELEM_STREAM_BLOB = 9,
-	G2_TELEM_STREAM_COUNT = 10,
+	G2_TELEM_STREAM_MASK = 10,
+	G2_TELEM_STREAM_COUNT = 11,
 };
 
 
@@ -380,6 +400,14 @@ static const struct g2_field head_pose_fields[] = {
     F(g2_telem_head_pose, qw, "f32"),
 };
 
+static const struct g2_field mask_fields[] = {
+    F(g2_telem_mask, t_mono_ns, "u64"), F(g2_telem_mask, hw_ts_ns, "u64"),
+    F(g2_telem_mask, cam_id, "u8"), F(g2_telem_mask, device_id, "u8"), F(g2_telem_mask, flags, "u8"),
+    F(g2_telem_mask, x0, "f32"), F(g2_telem_mask, y0, "f32"),
+    F(g2_telem_mask, x1, "f32"), F(g2_telem_mask, y1, "f32"),
+    F(g2_telem_mask, sigma_px, "f32"), F(g2_telem_mask, optical_age_ms, "f32"),
+};
+
 static const struct g2_field getpose_fields[] = {
     F(g2_telem_getpose, t_mono_ns, "u64"), F(g2_telem_getpose, device_id, "u8"),
     F(g2_telem_getpose, relation_flags, "u32"),
@@ -388,6 +416,9 @@ static const struct g2_field getpose_fields[] = {
     F(g2_telem_getpose, qw, "f32"),
     F(g2_telem_getpose, vx, "f32"), F(g2_telem_getpose, vy, "f32"), F(g2_telem_getpose, vz, "f32"),
     F(g2_telem_getpose, wx, "f32"), F(g2_telem_getpose, wy, "f32"), F(g2_telem_getpose, wz, "f32"),
+    F(g2_telem_getpose, dpx, "f32"), F(g2_telem_getpose, dpy, "f32"), F(g2_telem_getpose, dpz, "f32"),
+    F(g2_telem_getpose, dqx, "f32"), F(g2_telem_getpose, dqy, "f32"), F(g2_telem_getpose, dqz, "f32"),
+    F(g2_telem_getpose, dqw, "f32"),
 };
 // clang-format on
 
@@ -415,6 +446,8 @@ static const struct g2_stream_desc g2_descs[G2_TELEM_STREAM_COUNT] = {
                                  getpose_fields, NF(getpose_fields)},
     [G2_TELEM_STREAM_BLOB] = {"blob", "blob.bin", sizeof(struct g2_telem_blob), 262144, blob_fields,
                               NF(blob_fields)},
+    [G2_TELEM_STREAM_MASK] = {"mask", "mask.bin", sizeof(struct g2_telem_mask), 65536, mask_fields,
+                              NF(mask_fields)},
 };
 
 /* drain_ring dequeues every stream into one fixed 256-byte buffer. */
@@ -422,7 +455,8 @@ _Static_assert(sizeof(struct g2_telem_imu) <= 256 && sizeof(struct g2_telem_fram
                    sizeof(struct g2_telem_pose_attempt) <= 256 && sizeof(struct g2_telem_candidate) <= 256 &&
                    sizeof(struct g2_telem_search) <= 256 && sizeof(struct g2_telem_fusion) <= 256 &&
                    sizeof(struct g2_telem_event) <= 256 && sizeof(struct g2_telem_head_pose) <= 256 &&
-                   sizeof(struct g2_telem_getpose) <= 256 && sizeof(struct g2_telem_blob) <= 256,
+                   sizeof(struct g2_telem_getpose) <= 256 && sizeof(struct g2_telem_blob) <= 256 &&
+                   sizeof(struct g2_telem_mask) <= 256,
                "every row struct must fit drain_ring's buffer");
 
 
@@ -1011,6 +1045,33 @@ g2_telem_blob(uint8_t cam_id,
 }
 
 void
+g2_telem_mask(uint8_t cam_id,
+              uint64_t ts_ns,
+              uint8_t device_id,
+              uint8_t flags,
+              const float rect[4],
+              float sigma_px,
+              float optical_age_ms)
+{
+	if (!g2_telem_enabled() || rect == NULL) {
+		return;
+	}
+	struct g2_telem_mask row = {0};
+	row.t_mono_ns = g2_telem_now_ns();
+	row.hw_ts_ns = ts_ns;
+	row.cam_id = cam_id;
+	row.device_id = device_id;
+	row.flags = flags;
+	row.x0 = rect[0];
+	row.y0 = rect[1];
+	row.x1 = rect[2];
+	row.y1 = rect[3];
+	row.sigma_px = sigma_px;
+	row.optical_age_ms = optical_age_ms;
+	(void)ring_emit(&g_telem.rings[G2_TELEM_STREAM_MASK], &row);
+}
+
+void
 g2_telem_pose_attempt(uint8_t device_id,
                       uint8_t cam_id,
                       uint64_t hw_ts_ns,
@@ -1274,7 +1335,8 @@ g2_telem_getpose(uint8_t device_id,
                  const float pose[7],
                  const float lin_vel[3],
                  const float ang_vel[3],
-                 uint32_t relation_flags)
+                 uint32_t relation_flags,
+                 const float delta[7])
 {
 	if (!g2_telem_enabled() || pose == NULL) {
 		return;
@@ -1299,6 +1361,17 @@ g2_telem_getpose(uint8_t device_id,
 		row.wx = ang_vel[0];
 		row.wy = ang_vel[1];
 		row.wz = ang_vel[2];
+	}
+	if (delta != NULL) {
+		row.dpx = delta[0];
+		row.dpy = delta[1];
+		row.dpz = delta[2];
+		row.dqx = delta[3];
+		row.dqy = delta[4];
+		row.dqz = delta[5];
+		row.dqw = delta[6];
+	} else {
+		row.dqw = 1.0f; /* identity delta */
 	}
 	(void)ring_emit(&g_telem.rings[G2_TELEM_STREAM_GETPOSE], &row);
 }

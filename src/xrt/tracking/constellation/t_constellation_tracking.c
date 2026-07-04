@@ -25,6 +25,7 @@
 #include "util/u_trace_marker.h"
 #include "util/u_var.h"
 #include "util/u_worker.h"
+#include "util/u_world_reanchor.h"
 
 #include "internal/blobwatch.h"
 #include "internal/association_hypothesis.h"
@@ -82,6 +83,32 @@ DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
 #define PRIOR_GATE_SIGMA 3.0 /* ~99.7% per axis */
 #define MAX_POS_ERROR 0.60
 #define MAX_ROT_ERROR DEG_TO_RAD(60)
+
+/* B5 SLAM controller-mask repair (results/b5-ledmask-20260704/design.md). The masks SLAM must
+ * ignore are pushed at FRAME cadence from the live prediction + last-seen pose (mirroring the
+ * static-map exemption pattern), replacing the accept-only push whose rects went pixel-frozen
+ * for seconds during head rotation (age p90 ~3 s / max 10 s, masking up to 86% of a camera and
+ * stealing 10-45% of the scarce dark-frame feature pool). Masking controller light is
+ * load-bearing divergence protection (unmasked light: repeatable early reset + 90 m-1.7 km
+ * post-reset divergence in the 6+6 causal A/B), so coverage must continue through coast — the
+ * prediction rect is inflated by the projected PRIOR_GATE_SIGMA position uncertainty and a
+ * prediction the fusion cannot bound (giant rect) self-disables via the PER-DEVICE area cap
+ * instead of masking a wrong region (an unpredictable controller is overwhelmingly outside the
+ * SLAM cams' view too). MASK_HALO_MARGIN_PX closes the measured halo leak at the rect edges
+ * (LED glow extends 2-3x beyond the bounding rect; 0.59% of strong dark corners leaked there).
+ * MASK_AREA_CAP_FRACTION is enforced PER DEVICE, not on the per-camera total: the design
+ * sketch's total-sum cap measured a leak REGRESSION on the 20260703-202811 emulation (dark
+ * leak 1.50% vs 0.59% live) because it rationed two HONEST close-range rects against each
+ * other, unmasking an in-view controller — exactly the harm class masking exists to prevent.
+ * Per-device at the same fraction passes both acceptance gates (dark leak 0.45% < 0.59% live;
+ * masked non-controller theft 3.8% vs 9.3% live; results/b5-ledmask-20260704/sweep_cap.py)
+ * and keeps >=80% of every camera maskable-free per device, far below the measured harm
+ * regime (45-86% stale-rect blankets). */
+#define MASK_HALO_MARGIN_PX 20.0f
+#define MASK_AREA_CAP_FRACTION 0.20f
+/* Floor for the depth used to project the position sigma to pixels: a controller at/behind the
+ * camera plane projects an unbounded sigma; the area cap then disables the rect. */
+#define MASK_SIGMA_MIN_DEPTH_M 0.05f
 
 /* Tilt scale for the soft anisotropic mirror-flip / prior-orientation cost. The mirror twin of a few-LED
  * PnP almost always TILTS the controller wrong, and gravity is driftless: the fusion prior's TILT is
@@ -432,6 +459,7 @@ t_constellation_camera_group_dump_json(const struct t_constellation_camera_group
 	fprintf(f, "  \"format\": \"g2-constellation-cameras\",\n");
 	fprintf(f, "  \"version\": 1,\n");
 	fprintf(f, "  \"cam_count\": %d,\n", cams->cam_count);
+	fprintf(f, "  \"ctrl_gain\": %u,\n", cams->ctrl_gain);
 	fprintf(f, "  \"cameras\": [\n");
 	for (int i = 0; i < cams->cam_count; i++) {
 		const struct t_constellation_camera *c = &cams->cams[i];
@@ -627,6 +655,9 @@ struct t_constellation_tracker
 	//!< Tracking camera entries
 	struct constellation_tracker_camera_state cam[XRT_TRACKING_MAX_SLAM_CAMS];
 	int cam_count;
+	//!< Commanded controller-slot analog gain shared by all cameras (t_constellation_camera_group::ctrl_gain);
+	//!< 0 = unknown -> the gain-16 calibration point. Passed per frame into blobwatch (K gain law + telemetry).
+	uint16_t ctrl_gain;
 
 	/* Debug */
 	enum u_logging_level log_level;
@@ -642,6 +673,17 @@ struct t_constellation_tracker
 	bool debug_draw_device_bounds;
 
 	uint64_t last_frame_timestamp;
+
+	/*! World re-anchor detection (the head resnap guard's tracker-side complement): previous
+	 * sampled HMD pose + |gyro| for the IMU-envelope innovation test on the very head-pose
+	 * stream the camera extrinsics are composed from. Armed only while the sampled relation
+	 * carries a VALID angular velocity — the envelope is IMU-relative, so without a gyro signal
+	 * a re-anchor cannot be told from head motion (the offline replay's recorded head stream
+	 * deliberately has none, keeping replays byte-identical by construction). */
+	bool reanchor_have_prev;
+	struct xrt_pose reanchor_prev_pose;
+	int64_t reanchor_prev_ts;
+	double reanchor_prev_gyro_dps;
 
 	uint64_t last_fast_analysis_ms;
 	uint64_t last_blob_analysis_ms;
@@ -711,6 +753,18 @@ constellation_tracked_device_connection_cache_pnp_pose_candidate(struct t_conste
 	os_mutex_lock(&ctdc->lock);
 	if (!ctdc->disconnected && ctdc->cb->cache_pnp_pose_candidate) {
 		ctdc->cb->cache_pnp_pose_candidate(ctdc->xdev, frame_mono_ns, pose);
+	}
+	os_mutex_unlock(&ctdc->lock);
+}
+
+static void
+constellation_tracked_device_connection_notify_world_reanchor(struct t_constellation_tracked_device_connection *ctdc,
+                                                              timepoint_ns frame_mono_ns,
+                                                              const struct xrt_pose *delta)
+{
+	os_mutex_lock(&ctdc->lock);
+	if (!ctdc->disconnected && ctdc->cb->notify_world_reanchor) {
+		ctdc->cb->notify_world_reanchor(ctdc->xdev, frame_mono_ns, delta);
 	}
 	os_mutex_unlock(&ctdc->lock);
 }
@@ -1095,44 +1149,6 @@ submit_device_pose(struct t_constellation_tracker *ct,
 
 		constellation_tracked_device_connection_notify_pose(device->connection, sample->timestamp,
 		                                                    &P_xrworld_device);
-
-		// update the controller masks for this controller
-		if (ct->controller_masks_sink) {
-			struct xrt_pose P_imu_obj;
-			math_pose_transform(&ct->cam[view_id].P_imu_cam, P_cam_obj, &P_imu_obj);
-
-			for (int i = 0; i < ct->cam_count; i++) {
-				struct constellation_tracker_camera_state *cam = &ct->cam[i];
-
-				struct xrt_device_masks_sample_camera *sample_camera =
-				    &ct->controller_masks_sample.views[cam->slam_tracking_index];
-
-				struct xrt_device_masks_sample_device *device_mask =
-				    &sample_camera->devices[dev_state->dev_index];
-
-				struct xrt_pose P_tcam_imu;
-				math_pose_invert(&cam->P_imu_cam, &P_tcam_imu);
-
-				struct xrt_pose P_tcam_obj;
-				math_pose_transform(&P_tcam_imu, &P_imu_obj, &P_tcam_obj);
-
-				struct pose_rect device_bounds;
-				pose_metrics_get_device_bounds(&P_tcam_obj, &device->led_model, &cam->camera_model,
-				                               &device_bounds, NULL, NULL);
-
-				device_mask->enabled = pose_rect_has_area(&device_bounds);
-				if (device_mask->enabled) {
-					device_mask->rect = (struct xrt_rect_f32){
-					    .x = device_bounds.left,
-					    .y = device_bounds.top,
-					    .w = device_bounds.right - device_bounds.left,
-					    .h = device_bounds.bottom - device_bounds.top,
-					};
-				}
-			}
-
-			xrt_sink_push_device_masks(ct->controller_masks_sink, &ct->controller_masks_sample);
-		}
 	}
 	os_mutex_unlock(&ct->tracked_device_lock);
 
@@ -1459,6 +1475,16 @@ association_fold_prior_leds(struct t_constellation_tracker *ct,
 #define ASSOC_SINGLE_VIEW_CLUTTER_MAX_BRIGHTNESS 30.0f
 #define ASSOC_SINGLE_VIEW_CLUTTER_MAX_AREA 8.0f
 #define ASSOC_SINGLE_VIEW_CLUTTER_MIN_VAR_PX2 3.0f
+/* The two DN-denominated prongs of the single-view clutter veto above, re-denominated at the commanded
+ * camera gain (B3 design §2/§6.3): clutter brightness scales with m = gain/16 exactly like LED brightness,
+ * so an unscaled 30-DN bound silently DEACTIVATES at higher gain (clutter escapes above it); and the
+ * variance prong tests the blobwatch g(b) inflation of the boundary-brightness blob, which moves with the
+ * K gain law — it is re-derived as 3.0 * g_m(m*30) / g_16(30) with g(b) = 1 + (K/b)^2, so it keeps vetoing
+ * the same physical blob population. At m = 1 both reduce exactly to the calibrated constants (old-capture
+ * replays bit-identical). File-scope, set once at tracker create: the commanded gain is one operating point
+ * per process (same pattern as the predictive-ROI env knobs below). */
+static float assoc_single_view_clutter_max_brightness = ASSOC_SINGLE_VIEW_CLUTTER_MAX_BRIGHTNESS;
+static float assoc_single_view_clutter_min_var_px2 = ASSOC_SINGLE_VIEW_CLUTTER_MIN_VAR_PX2;
 #define ASSOC_STALE_PRIOR_RECOVERY_AGE_MS 120.0
 #define ASSOC_STALE_PRIOR_RECOVERY_MIN_MATCHED 7
 #define ASSOC_STALE_PRIOR_RECOVERY_MAX_UNMATCHED 2
@@ -2436,9 +2462,9 @@ association_baseline_lock_eligible(const struct association_pose_hypothesis *hyp
 	if (single_view && hyp->matched_count <= 7 &&
 	    hyp->cost.total_nll >= ASSOC_SINGLE_VIEW_LOW_EVIDENCE_MAX_NLL &&
 	    hyp->blob_quality_count == hyp->matched_count &&
-	    hyp->blob_brightness_mean < ASSOC_SINGLE_VIEW_CLUTTER_MAX_BRIGHTNESS &&
+	    hyp->blob_brightness_mean < assoc_single_view_clutter_max_brightness &&
 	    hyp->blob_area_mean < ASSOC_SINGLE_VIEW_CLUTTER_MAX_AREA &&
-	    hyp->blob_var_mean_px2 > ASSOC_SINGLE_VIEW_CLUTTER_MIN_VAR_PX2) {
+	    hyp->blob_var_mean_px2 > assoc_single_view_clutter_min_var_px2) {
 		return false;
 	}
 	const float visual_lock_cost =
@@ -5093,12 +5119,179 @@ append_exempt_led_px(const struct tracking_sample_frame *view,
 	}
 }
 
+/* Project one world-space device pose into a camera and union its bounding rect (clamped to the
+ * image by pose_metrics_get_device_bounds) into *rect (replacing it when !have_rect). Returns
+ * true iff the pose contributed a rect with area (some bounding point in front of the camera
+ * and projectable). */
+static bool
+mask_union_device_rect(const struct tracking_sample_frame *view,
+                       struct constellation_tracker_camera_state *cam,
+                       struct t_constellation_led_model *led_model,
+                       const struct xrt_pose *P_world_obj,
+                       bool have_rect,
+                       struct pose_rect *rect,
+                       float *out_depth_m)
+{
+	struct xrt_pose P_cam_obj;
+	math_pose_transform(&view->P_cam_world, P_world_obj, &P_cam_obj);
+
+	struct pose_rect bounds;
+	pose_metrics_get_device_bounds(&P_cam_obj, led_model, &cam->camera_model, &bounds, NULL, NULL);
+	if (!pose_rect_has_area(&bounds)) {
+		return false;
+	}
+	if (out_depth_m != NULL) {
+		*out_depth_m = P_cam_obj.position.z;
+	}
+	if (!have_rect) {
+		*rect = bounds;
+		return true;
+	}
+	rect->left = fmin(rect->left, bounds.left);
+	rect->top = fmin(rect->top, bounds.top);
+	rect->right = fmax(rect->right, bounds.right);
+	rect->bottom = fmax(rect->bottom, bounds.bottom);
+	return true;
+}
+
+/* B5 mask repair: push the SLAM controller masks for this frame, one rect per connected device
+ * per camera, from the live prediction + last-seen pose (see the MASK_* constants' comment for
+ * the measured rationale). Runs at frame cadence under the tracked-device lock, so mask staleness
+ * is bounded by one controller-frame period instead of the time since the last optical accept,
+ * the rect follows the controller through coast, and every rect is re-projected through the LIVE
+ * head pose (a world-anchored rect, never a pixel-frozen one). Devices with neither a bounded
+ * prediction nor a last-seen pose are pushed disabled — no rect ever outlives its knowledge. */
+static void
+push_controller_masks(struct t_constellation_tracker *ct, struct constellation_tracking_sample *sample)
+{
+	if (ct->controller_masks_sink == NULL) {
+		return;
+	}
+
+	struct xrt_device_masks_sample *masks = &ct->controller_masks_sample;
+	*masks = (struct xrt_device_masks_sample){0};
+
+	uint8_t flags[CONSTELLATION_MAX_CAMERAS][CONSTELLATION_MAX_DEVICES] = {0};
+	float sigma_px[CONSTELLATION_MAX_CAMERAS][CONSTELLATION_MAX_DEVICES];
+
+	for (int i = 0; i < sample->n_views; i++) {
+		struct constellation_tracker_camera_state *cam = ct->cam + i;
+		struct tracking_sample_frame *view = sample->views + i;
+		struct xrt_device_masks_sample_camera *sample_camera = &masks->views[cam->slam_tracking_index];
+
+		for (int d = 0; d < sample->n_devices; d++) {
+			struct tracking_sample_device_state *dev_state = sample->devices + d;
+			struct xrt_device_masks_sample_device *device_mask =
+			    &sample_camera->devices[dev_state->dev_index];
+
+			bool have_rect = false;
+			struct pose_rect rect = {0, 0, 0, 0};
+			sigma_px[i][d] = -1.0f;
+
+			/* Prediction rect, inflated by the projected position uncertainty. Trusted
+			 * exactly as far as the fusion can bound it: a coasting controller gets a
+			 * honestly-larger rect, a lost/divergent one inflates past the area cap below
+			 * and self-disables. */
+			if (dev_state->prior_pos_std_m >= 0.0f) {
+				float depth_m = MASK_SIGMA_MIN_DEPTH_M;
+				if (mask_union_device_rect(view, cam, dev_state->led_model,
+				                           &dev_state->P_world_obj_prior, have_rect, &rect,
+				                           &depth_m)) {
+					have_rect = true;
+					const float focal = fmaxf(cam->camera_model.calib.fx, cam->camera_model.calib.fy);
+					const float sigma = focal * (float)PRIOR_GATE_SIGMA * dev_state->prior_pos_std_m /
+					                    fmaxf(depth_m, MASK_SIGMA_MIN_DEPTH_M);
+					rect.left -= sigma;
+					rect.top -= sigma;
+					rect.right += sigma;
+					rect.bottom += sigma;
+					sigma_px[i][d] = sigma;
+					flags[i][d] |= G2_TELEM_MASK_FROM_PREDICTION;
+				}
+			}
+
+			/* Last-seen rect: world-anchored optical truth, re-projected through the live
+			 * head pose — a lost-but-resting controller keeps emitting light there (the
+			 * static-map exemption pattern). */
+			if (dev_state->have_last_seen_pose &&
+			    mask_union_device_rect(view, cam, dev_state->led_model, &dev_state->last_seen_pose,
+			                           have_rect, &rect, NULL)) {
+				have_rect = true;
+				flags[i][d] |= G2_TELEM_MASK_FROM_LAST_SEEN;
+			}
+
+			if (!have_rect) {
+				continue;
+			}
+
+			rect.left = fmax(rect.left - MASK_HALO_MARGIN_PX, 0.0);
+			rect.top = fmax(rect.top - MASK_HALO_MARGIN_PX, 0.0);
+			rect.right = fmin(rect.right + MASK_HALO_MARGIN_PX, (double)cam->camera_model.width - 1.0);
+			rect.bottom = fmin(rect.bottom + MASK_HALO_MARGIN_PX, (double)cam->camera_model.height - 1.0);
+			if (!pose_rect_has_area(&rect) || rect.right < rect.left || rect.bottom < rect.top) {
+				continue;
+			}
+
+			device_mask->enabled = true;
+			device_mask->rect = (struct xrt_rect_f32){
+			    .x = (float)rect.left,
+			    .y = (float)rect.top,
+			    .w = (float)(rect.right - rect.left),
+			    .h = (float)(rect.bottom - rect.top),
+			};
+			flags[i][d] |= G2_TELEM_MASK_ENABLED;
+		}
+
+		/* Per-device area cap: a rect that must be giant to cover its uncertainty is
+		 * worthless as a mask — disable it; the unmasked light of an unpredictable
+		 * controller is almost always outside the SLAM cams' view too. Deliberately NOT a
+		 * total-sum cap: rationing two honest close-range rects against each other unmasks
+		 * an in-view controller (measured leak regression, see the MASK_* constants). */
+		const float cap_px2 =
+		    MASK_AREA_CAP_FRACTION * (float)cam->camera_model.width * (float)cam->camera_model.height;
+		for (int d = 0; d < sample->n_devices; d++) {
+			struct xrt_device_masks_sample_device *device_mask =
+			    &sample_camera->devices[sample->devices[d].dev_index];
+			if (!device_mask->enabled || device_mask->rect.w * device_mask->rect.h <= cap_px2) {
+				continue;
+			}
+			device_mask->enabled = false;
+			flags[i][d] &= (uint8_t)~G2_TELEM_MASK_ENABLED;
+			flags[i][d] |= G2_TELEM_MASK_AREA_CAPPED;
+		}
+
+		if (g2_telem_enabled()) {
+			for (int d = 0; d < sample->n_devices; d++) {
+				struct tracking_sample_device_state *dev_state = sample->devices + d;
+				struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
+				const struct xrt_device_masks_sample_device *device_mask =
+				    &sample_camera->devices[dev_state->dev_index];
+				const float mrect[4] = {
+				    device_mask->rect.x,
+				    device_mask->rect.y,
+				    device_mask->rect.x + device_mask->rect.w,
+				    device_mask->rect.y + device_mask->rect.h,
+				};
+				const float optical_age_ms =
+				    device->have_last_seen_pose
+				        ? (float)((int64_t)(sample->timestamp - device->last_seen_pose_ts) / 1e6)
+				        : -1.0f;
+				g2_telem_mask((uint8_t)cam->slam_tracking_index, sample->timestamp,
+				              telem_device_id(device->connection->xdev), flags[i][d], mrect,
+				              sigma_px[i][d], optical_age_ms);
+			}
+		}
+	}
+
+	xrt_sink_push_device_masks(ct->controller_masks_sink, masks);
+}
+
 // Fast frame processing: blob extraction and match to existing predictions
 static void
 constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt_frame *xf)
 {
 	struct t_constellation_tracker *ct = container_of(sink, struct t_constellation_tracker, fast_process_sink);
-	struct xrt_space_relation xsr_base_pose;
+	struct xrt_space_relation xsr_base_pose = {0};
 
 	/* Allocate a tracking sample for everything we're about to process */
 	struct constellation_tracking_sample *sample = constellation_tracking_sample_new();
@@ -5115,6 +5308,52 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		float head7[7];
 		telem_pack_pose(&xsr_base_pose.pose, head7);
 		g2_telem_head_pose((uint64_t)xf->timestamp, head7);
+	}
+
+	/* World re-anchor detection (B2 complement): a SLAM relocalization/reset steps THIS sampled
+	 * head pose, and with it every P_world_cam below — the controllers' world moves in the same
+	 * camera frame. Detect the step's excess beyond the IMU envelope (same math as the
+	 * presentation guard) and re-anchor each device's fusion world-state by the implied rigid
+	 * delta BEFORE this frame's observations are matched/folded, so the ESKF prior lands in the
+	 * new world the observations live in instead of disagreeing by the full jump. */
+	if ((xsr_base_pose.relation_flags &
+	     (XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
+	      XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT)) ==
+	    (XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
+	     XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT)) {
+		const struct xrt_vec3 *av = &xsr_base_pose.angular_velocity;
+		double gyro_dps = sqrt((double)av->x * av->x + (double)av->y * av->y + (double)av->z * av->z) *
+		                  (180.0 / M_PI);
+		if (ct->reanchor_have_prev && xf->timestamp > ct->reanchor_prev_ts) {
+			double dt_s = (double)(xf->timestamp - ct->reanchor_prev_ts) * 1e-9;
+			double gyro_int_deg = 0.5 * (ct->reanchor_prev_gyro_dps + gyro_dps) * dt_s;
+			struct u_world_reanchor_step st;
+			if (u_world_reanchor_compute_excess(&u_world_reanchor_default_params,
+			                                    &ct->reanchor_prev_pose, &xsr_base_pose.pose, dt_s,
+			                                    gyro_int_deg, &st)) {
+				struct xrt_pose delta;
+				u_world_reanchor_step_to_world_delta(&st, &ct->reanchor_prev_pose.position,
+				                                     &delta);
+				CT_DEBUG(ct,
+				         "World re-anchor at frame TS %" PRIi64
+				         ": step %.2f deg / %.1f mm, excess %.2f deg / %.1f mm -> re-anchoring "
+				         "device fusion world state",
+				         xf->timestamp, st.dang_deg, st.dnorm_m * 1e3, st.exc_ang_deg,
+				         st.exc_pos_m * 1e3);
+				for (int i = 0; i < ct->num_devices; i++) {
+					struct t_constellation_tracked_device_connection *conn =
+					    ct->devices[i].connection;
+					if (conn != NULL) {
+						constellation_tracked_device_connection_notify_world_reanchor(
+						    conn, (timepoint_ns)xf->timestamp, &delta);
+					}
+				}
+			}
+		}
+		ct->reanchor_prev_pose = xsr_base_pose.pose;
+		ct->reanchor_prev_ts = xf->timestamp;
+		ct->reanchor_prev_gyro_dps = gyro_dps;
+		ct->reanchor_have_prev = true;
 	}
 
 	/* Split out camera views and collect blobs across all cameras */
@@ -5274,13 +5513,13 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 				int ry = (int)floorf(ymin);
 				int rw = (int)ceilf(xmax - xmin) + 1;
 				int rh = (int)ceilf(ymax - ymin) + 1;
-				blobwatch_process_roi_lowthresh(cam->bw, view->vframe, frame_exposure, 0, rx, ry, rw, rh,
-				                                4, 3, &view->bwobs);
+				blobwatch_process_roi_lowthresh(cam->bw, view->vframe, frame_exposure, ct->ctrl_gain,
+				                                rx, ry, rw, rh, 4, 3, &view->bwobs);
 				used_roi = true;
 			}
 		}
 		if (!used_roi) {
-			blobwatch_process(cam->bw, view->vframe, frame_exposure, 0, &view->bwobs);
+			blobwatch_process(cam->bw, view->vframe, frame_exposure, ct->ctrl_gain, &view->bwobs);
 		}
 		os_mutex_unlock(&cam->bw_lock);
 
@@ -5362,12 +5601,14 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		 * [FLIP_COST_TILT_SIGMA_MIN, GRAVITY_TILT_TOL] (see the constants' definitions). */
 		float yaw_sigma = (float)FLIP_COST_YAW_SIGMA_MAX;
 		float tilt_sigma = (float)GRAVITY_TILT_TOL;
+		dev_state->prior_pos_std_m = -1.0f;
 		if (constellation_tracked_device_connection_get_pose_uncertainty(device->connection, &pos_std,
 		                                                                 &rot_std, &yaw_std, &tilt_std)) {
 			pos_bound = (float)fmin(fmax(PRIOR_GATE_SIGMA * pos_std, MIN_POS_ERROR), MAX_POS_ERROR);
 			rot_bound = (float)fmin(fmax(PRIOR_GATE_SIGMA * rot_std, MIN_ROT_ERROR), MAX_ROT_ERROR);
 			yaw_sigma = (float)fmin(fmax(yaw_std, FLIP_COST_YAW_SIGMA_MIN), FLIP_COST_YAW_SIGMA_MAX);
 			tilt_sigma = (float)fmin(fmax(tilt_std, FLIP_COST_TILT_SIGMA_MIN), GRAVITY_TILT_TOL);
+			dev_state->prior_pos_std_m = (float)pos_std;
 			/* TILT is driftless (gravity-anchored): trusted whenever the fusion is tracking, even through a
 			 * dropout. The soft cost's yaw scale (yaw_sigma) widens with the live yaw uncertainty, so a
 			 * stale yaw self-deweights rather than needing a binary trust flag. */
@@ -5412,6 +5653,12 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 
 		sample->n_devices++;
 	}
+
+	/* B5 mask repair: the SLAM controller masks follow the per-frame prediction/last-seen
+	 * knowledge gathered above, for every device on every processed frame — never only on
+	 * accepts (an accept this frame refreshes last_seen_pose for the next frame's push,
+	 * one frame period inside the halo/staleness budget). */
+	push_controller_masks(ct, sample);
 	os_mutex_unlock(&ct->tracked_device_lock);
 
 	/* Evidence-accumulating retention (H5): update each camera's world-anchored static-clutter
@@ -5585,6 +5832,21 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
 
 	// Set up the per-camera constellation tracking pieces config and pose
 	ct->cam_count = cams->cam_count;
+	ct->ctrl_gain = cams->ctrl_gain;
+
+	/* Re-denominate the DN-based clutter-veto prongs at the commanded gain (see the definitions of
+	 * assoc_single_view_clutter_* for the derivation). Exact no-ops at gain 16 / unknown (m = 1). */
+	{
+		const float m = blobwatch_gain_multiplier(ct->ctrl_gain);
+		const float k_m = blobwatch_dim_noise_k(ct->ctrl_gain);
+		const float k_16 = blobwatch_dim_noise_k(0);
+		assoc_single_view_clutter_max_brightness = ASSOC_SINGLE_VIEW_CLUTTER_MAX_BRIGHTNESS * m;
+		const float rk_m = k_m / assoc_single_view_clutter_max_brightness;
+		const float rk_16 = k_16 / ASSOC_SINGLE_VIEW_CLUTTER_MAX_BRIGHTNESS;
+		assoc_single_view_clutter_min_var_px2 =
+		    ASSOC_SINGLE_VIEW_CLUTTER_MIN_VAR_PX2 * (1.0f + rk_m * rk_m) / (1.0f + rk_16 * rk_16);
+	}
+
 	for (int i = 0; i < ct->cam_count; i++) {
 		struct constellation_tracker_camera_state *cam = ct->cam + i;
 		struct t_constellation_camera *cam_cfg = cams->cams + i;
