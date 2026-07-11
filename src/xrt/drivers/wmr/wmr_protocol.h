@@ -173,6 +173,54 @@ read64(const unsigned char **buffer)
 	return ret;
 }
 
+/*
+ * Camera bulk-transfer footer.
+ */
+
+#define WMR_CAMERA_XFER_FOOTER_SIZE 26
+
+//! frametype values of the camera transfer footer.
+#define WMR_FRAMETYPE_SLAM 0x0       //!< Long-exposure head-tracking (SLAM) frame
+#define WMR_FRAMETYPE_CONTROLLER 0x2 //!< Short-exposure controller constellation frame
+
+/*!
+ * The 26-byte footer that trails the pixel chunks of a camera bulk transfer:
+ *   __le64 start_ts;  - exposure start, 100 ns device-clock ticks (same clock as the IMU feed)
+ *   __le64 end_ts;    - always ~111000 ticks (11.1 ms, 90 Hz frame slot) after start_ts
+ *   __le16 ctr1;      - counter that increments by 88 (sometimes 96) and wraps at 16384
+ *   __le16 unknown0;  - has only ever been 0
+ *   __be32 magic;     - "Dlo+"
+ *   __le16 frametype; - WMR_FRAMETYPE_SLAM or WMR_FRAMETYPE_CONTROLLER
+ */
+struct wmr_camera_xfer_footer
+{
+	uint64_t start_ts_ticks;
+	uint64_t end_ts_ticks;
+	uint16_t ctr1;
+	uint16_t unknown0;
+	uint16_t frametype;
+};
+
+/*!
+ * Parse a camera transfer footer, validating its magic. Returns false when the magic does not
+ * match: under stream disturbance the device emits structurally intact transfers (chunk magics
+ * and footer position check out) whose footer region carries image pixels instead of a footer,
+ * so every field — the timestamps AND the pipeline-selecting frametype — is garbage
+ * (results/forensics-20260709/REPORT.md ITEM B). @p out is filled either way so a caller can
+ * record the offending raw values.
+ */
+static inline bool
+wmr_camera_xfer_footer_parse(const unsigned char *buf, struct wmr_camera_xfer_footer *out)
+{
+	out->start_ts_ticks = read64(&buf);
+	out->end_ts_ticks = read64(&buf);
+	out->ctr1 = (uint16_t)read16(&buf);
+	out->unknown0 = (uint16_t)read16(&buf);
+	uint32_t magic = (uint32_t)read32(&buf);
+	out->frametype = (uint16_t)read16(&buf);
+	return magic == WMR_MAGIC;
+}
+
 /*!
  * @}
  */

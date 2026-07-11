@@ -99,6 +99,19 @@ enum g2_telem_event_type
 	 * absorbed translation (m). The per-pull delta itself is recorded in the dev0 getpose rows. */
 	G2_TELEM_EV_WORLD_REANCHOR_ANG_DEG = 24,
 	G2_TELEM_EV_WORLD_REANCHOR_POS_M = 25,
+	/*! A SLAM camera frame was dropped by the timestamp guard instead of being handed to the
+	 * external SLAM system (which aborts on non-monotonic timelines — 2026-07-06 crash class).
+	 * t_mono_ns = the offending frame timestamp; value = its delta vs the last pushed frame of
+	 * the same camera in ms (<= 0: regression; large > 0: implausible forward jump). One event
+	 * per camera view, so a dropped 4-cam group emits 4 events. */
+	G2_TELEM_EV_SLAM_FRAME_TS_DROPPED = 26,
+	/*! A structurally-complete camera USB transfer was dropped at the parse boundary
+	 * (wmr_camera img_xfer_cb) before its content could select or reach either tracking
+	 * pipeline. Emitted with the transfer's parsed device-clock start_ts in ns — garbage
+	 * values are recorded verbatim for forensics. value: 1 = footer "Dlo+" magic invalid
+	 * (footer region carried image data), 2 = device timestamp regressed vs the last
+	 * accepted transfer, 3 = implausible forward device-timestamp jump. */
+	G2_TELEM_EV_CAMERA_XFER_DROPPED = 27,
 };
 
 /* ---- Stream emit functions (POD rows; lock-free; safe from any single producer) ---- */

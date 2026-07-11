@@ -1172,14 +1172,25 @@ wmr_hmd_get_slam_tracked_pose(struct xrt_device *xdev,
 	// narrowed to the pose bits below).
 	enum xrt_space_relation_flags slam_flags = out_relation->relation_flags;
 
+	// Compute on a LOCAL pose. wh->pose is shared with concurrent callers of this getter (the
+	// ~1 kHz HEAD_POSE pulls race the controller/constellation/body-anchor TRACKER_POSE reads),
+	// so it must never be used as scratch: the old in-place P_imu_me transform below leaked
+	// middle-eye/torn poses into TRACKER consumers and re-applied the transform onto the stale
+	// member (compounding) while untracked.
+	struct xrt_pose pose;
 	if (pose_tracked) {
 #ifdef XRT_FEATURE_SLAM
 		// !todo Correct pose depending on the VIT system in use, this should be done in the system itself.
 		// For now, assume that we are using Basalt.
-		wh->pose = wmr_hmd_correct_pose_from_basalt(out_relation->pose);
+		pose = wmr_hmd_correct_pose_from_basalt(out_relation->pose);
 #else
-		wh->pose = out_relation->pose;
+		pose = out_relation->pose;
 #endif
+		// Single assignment, always in the IMU frame (never me-transformed): u_var display and
+		// the 3dof/tracker-switch "last tracked pose" seeds.
+		wh->pose = pose;
+	} else {
+		pose = wh->pose;
 	}
 
 	// Defined velocity-field contract for downstream consumers (the world re-anchor guard's IMU
@@ -1204,10 +1215,10 @@ wmr_hmd_get_slam_tracked_pose(struct xrt_device *xdev,
 
 	if (name == XRT_INPUT_GENERIC_HEAD_POSE && wh->tracking.imu2me) {
 		/* Move the pose to the middle-eye position for generic head pose, but not for generic tracker pose */
-		math_pose_transform(&wh->pose, &wh->config.sensors.transforms.P_imu_me, &wh->pose);
+		math_pose_transform(&pose, &wh->config.sensors.transforms.P_imu_me, &pose);
 	}
 
-	out_relation->pose = wh->pose;
+	out_relation->pose = pose;
 	enum xrt_space_relation_flags flags = (enum xrt_space_relation_flags)(
 	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
 	    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT);

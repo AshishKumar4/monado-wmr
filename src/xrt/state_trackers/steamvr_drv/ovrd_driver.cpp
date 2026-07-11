@@ -962,8 +962,21 @@ public:
 			return;
 		}
 
+		// Binding templates are generated per subaction path: every input of the
+		// interaction profile appears once per hand it exists on. This device is one
+		// hand, so instantiate only its own bindings — otherwise shared inputs get
+		// duplicate components and side-gated ones (e.g. the G2's X/Y vs A/B buttons)
+		// get components whose xrt_input the device never exposes, which RunFrame
+		// then reports as missing every frame.
+		const char *hand_subaction_path =
+		    m_hand == XRT_HAND_LEFT ? "/user/hand/left" : "/user/hand/right";
+
 		for (size_t i = 0; i < p->binding_count; i++) {
 			struct binding_template *b = &p->bindings[i];
+
+			if (b->subaction_path != NULL && strcmp(b->subaction_path, hand_subaction_path) != 0) {
+				continue;
+			}
 
 			if (b->input != 0) {
 				AddMonadoInput(b);

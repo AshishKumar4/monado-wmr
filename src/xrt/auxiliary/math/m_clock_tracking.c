@@ -175,8 +175,9 @@ m_clock_windowed_skew_tracker_push(struct m_clock_windowed_skew_tracker *t,
 	/* Wrap around the window index */
 	t->current_window_pos = (t->current_window_pos + 1) % t->max_window_samples;
 
-	/* Update the moving average skew */
-	size_t w = t->current_window_samples;
+	/* Update the moving average skew. The weight must be signed: a size_t weight would
+	 * promote a negative skew to a huge unsigned value and produce garbage estimates. */
+	time_duration_ns w = (time_duration_ns)t->current_window_samples;
 	t->current_skew = (t->current_min_skew + t->current_skew * (w - 1)) / w;
 	t->have_skew_estimate = true;
 }

@@ -43,6 +43,7 @@ add_library(
 	u_format.h
 	u_frame.c
 	u_frame.h
+	u_frame_ts_guard.h
 	u_future.h
 	u_future.cpp
 	u_g2_telemetry.c

@@ -401,6 +401,11 @@ struct blobwatch
 	 * process_frame_roi, consumed by finalize_staged_blobs before any other ob consumer). */
 	struct blob stage[BLOB_STAGE_MAX];
 	int num_staged;
+	/* Cached priority class (0..2) of each staged blob, filled lazily on the first staging
+	 * overflow of a frame so the overflow eviction need not re-derive the retention class per
+	 * candidate. Reset with num_staged each frame. */
+	uint8_t stage_priority[BLOB_STAGE_MAX];
+	bool stage_priority_cached;
 };
 
 /*
@@ -814,6 +819,53 @@ store_blob(struct extent *e,
 	b->static_dwell_s = 0.0f;
 }
 
+/* The retention class of a spot, transferred from the PREVIOUS frame by same-spot proximity (the
+ * tracker's static map writes retention_class after extraction, so the current frame's is not yet
+ * known here). One frame stale is fine for budget ordering; a miss returns FRESH (never demoted).
+ * This is the class both cap stages -- staging-overflow eviction and the final MAX_BLOBS_PER_FRAME
+ * cap -- rank by, so they can never disagree. Matches the static map's image-space match gate. */
+static uint8_t
+stale_retention_class(const blobservation *last_ob, float x, float y)
+{
+	if (last_ob == NULL) {
+		return BLOB_RETENTION_FRESH;
+	}
+	float best_distsq = STAGE_CLASS_MATCH_PX * STAGE_CLASS_MATCH_PX;
+	uint8_t cls = BLOB_RETENTION_FRESH;
+	for (int i = 0; i < last_ob->num_blobs; i++) {
+		const struct blob *b = &last_ob->blobs[i];
+		const float dx = (b->x + b->vx) - x;
+		const float dy = (b->y + b->vy) - y;
+		const float distsq = dx * dx + dy * dy;
+		if (distsq <= best_distsq) {
+			best_distsq = distsq;
+			cls = b->retention_class;
+		}
+	}
+	return cls;
+}
+
+/* Priority class for cap retention: DEVICE_NEAR (0) outranks non-static clutter (1) outranks static
+ * clutter (2). Lower is kept first. */
+static inline uint8_t
+stage_priority_class(const blobwatch *bw, float x, float y)
+{
+	const uint8_t cls = stale_retention_class(bw->last_observation, x, y);
+	return cls == BLOB_RETENTION_DEVICE_NEAR ? 0 : cls != BLOB_RETENTION_STATIC_CLUTTER ? 1 : 2;
+}
+
+/* Strict (class, contrast) priority order: higher priority = lower class rank, ties broken by higher
+ * local contrast. The one ordering primitive shared by the final-cap sort (stage_rank_cmp) and the
+ * staging-overflow eviction, so scanline order can never evict a blob the ranked cap would keep. */
+static inline bool
+stage_key_higher_priority(uint8_t class_a, float contrast_a, uint8_t class_b, float contrast_b)
+{
+	if (class_a != class_b) {
+		return class_a < class_b;
+	}
+	return contrast_a > contrast_b;
+}
+
 static void
 extent_to_blobs(blobwatch *bw, blobservation *ob, struct extent *e, int y, struct xrt_frame *frame)
 {
@@ -873,11 +925,6 @@ extent_to_blobs(blobwatch *bw, blobservation *ob, struct extent *e, int y, struc
 
 	/* In the future we could generate multiple blobs from one extent if we detect
 	 * it as multiple LEDs */
-	if (bw->num_staged >= BLOB_STAGE_MAX) {
-		ob->dropped_capacity++;
-		return;
-	}
-
 	{
 		float led_x, led_y, pos_var_px2;
 
@@ -899,39 +946,48 @@ extent_to_blobs(blobwatch *bw, blobservation *ob, struct extent *e, int y, struc
 		    (float)e->max_pixel -
 		    (float)local_bg_mean(bw, (int)led_x, (int)led_y, (int)frame->width, (int)frame->height);
 
-		store_blob(e, bw->num_staged++, y, bw->stage, bw->next_blob_id++, led_x, led_y, pos_var_px2,
-		           e->max_pixel, contrast);
-	}
-}
+		if (bw->num_staged < BLOB_STAGE_MAX) {
+			store_blob(e, bw->num_staged++, y, bw->stage, bw->next_blob_id++, led_x, led_y,
+			           pos_var_px2, e->max_pixel, contrast);
+			return;
+		}
 
-/* Priority retention at the frame blob cap: copy the staged blobs into the observation,
- * and when more qualified than MAX_BLOBS_PER_FRAME keep by (device-near class first, then
- * non-static-clutter, then descending contrast; staging order breaks ties) instead of the
- * old silent scanline-order truncation. The retention class is the PREVIOUS frame's (the
- * tracker's static map writes it after extraction), transferred by same-spot proximity —
- * one frame stale is fine for budget ordering and FRESH (never demoted) on any miss.
- * Survivors keep staging (scanline) order so under-cap frames are byte-identical. */
-static uint8_t
-stale_retention_class(const blobservation *last_ob, float x, float y)
-{
-	if (last_ob == NULL) {
-		return BLOB_RETENTION_FRESH;
-	}
-	float best_distsq = STAGE_CLASS_MATCH_PX * STAGE_CLASS_MATCH_PX;
-	uint8_t cls = BLOB_RETENTION_FRESH;
-	for (int i = 0; i < last_ob->num_blobs; i++) {
-		const struct blob *b = &last_ob->blobs[i];
-		const float dx = (b->x + b->vx) - x;
-		const float dy = (b->y + b->vy) - y;
-		const float distsq = dx * dx + dy * dy;
-		if (distsq <= best_distsq) {
-			best_distsq = distsq;
-			cls = b->retention_class;
+		/* Staging is full. Do NOT drop this extent just because it completed late in scanline
+		 * order -- a bottom-of-frame (hand-height) LED ring can complete after a top-of-frame
+		 * clutter storm has already claimed all BLOB_STAGE_MAX slots. Keep the highest-priority
+		 * BLOB_STAGE_MAX blobs: evict the lowest-priority staged blob when this one strictly
+		 * outranks it, by the same (device-near, contrast) key the final cap ranks by. Below
+		 * BLOB_STAGE_MAX this branch never runs, so normal frames stage in byte-identical
+		 * scanline order. */
+		ob->dropped_capacity++;
+		if (!bw->stage_priority_cached) {
+			for (int i = 0; i < BLOB_STAGE_MAX; i++) {
+				bw->stage_priority[i] =
+				    stage_priority_class(bw, bw->stage[i].x, bw->stage[i].y);
+			}
+			bw->stage_priority_cached = true;
+		}
+		int victim = 0;
+		for (int i = 1; i < BLOB_STAGE_MAX; i++) {
+			if (stage_key_higher_priority(bw->stage_priority[victim], bw->stage[victim].contrast,
+			                              bw->stage_priority[i], bw->stage[i].contrast)) {
+				victim = i;
+			}
+		}
+		const uint8_t new_priority = stage_priority_class(bw, led_x, led_y);
+		if (stage_key_higher_priority(new_priority, contrast, bw->stage_priority[victim],
+		                              bw->stage[victim].contrast)) {
+			store_blob(e, victim, y, bw->stage, bw->next_blob_id++, led_x, led_y, pos_var_px2,
+			           e->max_pixel, contrast);
+			bw->stage_priority[victim] = new_priority;
 		}
 	}
-	return cls;
 }
 
+/* Priority retention at the frame blob cap: keep the highest-priority MAX_BLOBS_PER_FRAME staged
+ * blobs (device-near class first, then non-static clutter, then descending contrast; staging order
+ * breaks ties) instead of the old silent scanline-order truncation. Survivors keep staging order
+ * so under-cap frames are byte-identical. */
 struct stage_rank
 {
 	uint8_t class_rank;
@@ -943,11 +999,8 @@ static int
 stage_rank_cmp(const void *va, const void *vb)
 {
 	const struct stage_rank *a = va, *b = vb;
-	if (a->class_rank != b->class_rank) {
-		return a->class_rank < b->class_rank ? -1 : 1;
-	}
-	if (a->contrast != b->contrast) {
-		return a->contrast > b->contrast ? -1 : 1;
+	if (a->class_rank != b->class_rank || a->contrast != b->contrast) {
+		return stage_key_higher_priority(a->class_rank, a->contrast, b->class_rank, b->contrast) ? -1 : 1;
 	}
 	return a->idx < b->idx ? -1 : 1;
 }
@@ -963,10 +1016,7 @@ finalize_staged_blobs(blobwatch *bw, blobservation *ob)
 
 	struct stage_rank rank[BLOB_STAGE_MAX];
 	for (int i = 0; i < bw->num_staged; i++) {
-		const uint8_t cls = stale_retention_class(bw->last_observation, bw->stage[i].x, bw->stage[i].y);
-		rank[i].class_rank = cls == BLOB_RETENTION_DEVICE_NEAR ? 0
-		                     : cls != BLOB_RETENTION_STATIC_CLUTTER ? 1
-		                                                            : 2;
+		rank[i].class_rank = stage_priority_class(bw, bw->stage[i].x, bw->stage[i].y);
 		rank[i].contrast = bw->stage[i].contrast;
 		rank[i].idx = i;
 	}
@@ -1436,6 +1486,7 @@ process_frame_roi(blobwatch *bw,
 	ob->dropped_shape_blobs = 0;
 	ob->dropped_capacity = 0;
 	bw->num_staged = 0;
+	bw->stage_priority_cached = false;
 
 	build_integral(bw, frame);
 

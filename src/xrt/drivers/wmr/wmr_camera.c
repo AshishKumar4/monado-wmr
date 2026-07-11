@@ -14,6 +14,7 @@
 #include "math/m_api.h"
 
 #include "os/os_threading.h"
+#include "os/os_time.h"
 #include "xrt/xrt_byte_order.h"
 
 #include "util/u_autoexpgain.h"
@@ -21,7 +22,9 @@
 #include "util/u_var.h"
 #include "util/u_sink.h"
 #include "util/u_frame.h"
+#include "util/u_frame_ts_guard.h"
 #include "util/u_g2_telemetry.h"
+#include "util/u_time.h"
 #include "util/u_trace_marker.h"
 
 #include "wmr_config.h"
@@ -76,9 +79,6 @@ wmr_camera_set_ctrl_exposure_gain(struct wmr_camera *cam, uint8_t camera_id, uin
  * t_constellation_camera_group::ctrl_gain. */
 #define DEFAULT_CTRL_GAIN 32
 
-#define WMR_FRAMETYPE_SLAM 0x0
-#define WMR_FRAMETYPE_CONTROLLER 0x2
-
 #define WMR_DEBUG_SINK_SLAM 0
 #define WMR_DEBUG_SINK_CONTROLLER 1
 
@@ -119,6 +119,13 @@ struct wmr_camera
 	uint32_t frame_width, frame_height;
 	uint8_t last_seq;
 	uint64_t last_frame_ts;
+
+	/*! Device-clock plausibility guard over the footer start_ts. One guard for the whole
+	 * stream: SLAM and controller transfers share one crystal-monotonic device clock
+	 * (11.1 ms frame slots), so their interleaved timeline is strictly increasing. */
+	struct u_frame_ts_guard device_ts_guard;
+	uint64_t xfer_drop_count;              //!< Transfers dropped at the parse boundary
+	timepoint_ns last_xfer_drop_warn_mono; //!< Rate limiter for the parse-boundary drop WARN
 
 	/* Unwrapped frame sequence number */
 	uint64_t frame_sequence;
@@ -307,6 +314,35 @@ set_active(struct wmr_camera *cam, bool active)
 	return send_buffer_to_device(cam, (uint8_t *)&cmd, sizeof(cmd));
 }
 
+//! value field of G2_TELEM_EV_CAMERA_XFER_DROPPED.
+enum wmr_camera_xfer_drop_reason
+{
+	WMR_CAMERA_XFER_DROP_FOOTER_MAGIC = 1,
+	WMR_CAMERA_XFER_DROP_TS_REGRESSED = 2,
+	WMR_CAMERA_XFER_DROP_TS_JUMP = 3,
+};
+
+/*! Record a transfer dropped at the parse boundary: a telemetry event so the next occurrence is
+ * observable offline, plus one rate-limited WARN. @p device_ts_ns may be garbage — it is
+ * recorded verbatim for forensics. */
+static void
+note_dropped_transfer(struct wmr_camera *cam,
+                      uint64_t device_ts_ns,
+                      enum wmr_camera_xfer_drop_reason reason,
+                      const char *why)
+{
+	cam->xfer_drop_count++;
+	if (g2_telem_enabled()) {
+		g2_telem_event(0, device_ts_ns, G2_TELEM_EV_CAMERA_XFER_DROPPED, (float)reason);
+	}
+	timepoint_ns now = (timepoint_ns)os_monotonic_get_ns();
+	if (now - cam->last_xfer_drop_warn_mono >= (timepoint_ns)U_TIME_1S_IN_NS) {
+		cam->last_xfer_drop_warn_mono = now;
+		WMR_CAM_WARN(cam, "Dropping camera transfer (%s), device ts %" PRIu64 " ns; %" PRIu64 " dropped so far",
+		             why, device_ts_ns, cam->xfer_drop_count);
+	}
+}
+
 static void LIBUSB_CALL
 img_xfer_cb(struct libusb_transfer *xfer)
 {
@@ -373,30 +409,41 @@ img_xfer_cb(struct libusb_transfer *xfer)
 		goto drop_frame;
 	}
 
-	/* Footer contains:
-	 * __le64 start_ts; - 100ns unit timestamp, from same clock as video_timestamps on the IMU feed
-	 * __le64 end_ts;   - 100ns unit timestamp, always about 111000 * 100ns later than start_ts ~= 90Hz
-	 * __le16 ctr1;     - Counter that increments by 88, but sometimes by 96, and wraps at 16384
-	 * __le16 unknown0  - Unknown value, has only ever been 0
-	 * __be32 magic     - "Dlo+"
-	 * __le16 frametype?- either 0x00 or 0x02. Every 3rd frame is 0x0, others are 0x2. Might be SLAM vs controllers?
-	 */
-	uint64_t frame_start_ts = read64(&src) * WMR_MS_HOLOLENS_NS_PER_TICK;
-	uint64_t frame_end_ts = read64(&src) * WMR_MS_HOLOLENS_NS_PER_TICK;
+	/* Validate the footer (layout: wmr_camera_xfer_footer_parse) before ANY of its fields is
+	 * used — a garbage footer's frametype would even select the pipeline. Both recorded
+	 * garbage transfers (results/forensics-20260709/REPORT.md ITEM B) carried image pixels in
+	 * the footer region while every chunk magic and the footer position checked out. */
+	struct wmr_camera_xfer_footer footer;
+	if (!wmr_camera_xfer_footer_parse(src, &footer)) {
+		note_dropped_transfer(cam, footer.start_ts_ticks * WMR_MS_HOLOLENS_NS_PER_TICK,
+		                      WMR_CAMERA_XFER_DROP_FOOTER_MAGIC, "invalid footer magic");
+		goto drop_frame;
+	}
+
+	uint64_t frame_start_ts = footer.start_ts_ticks * WMR_MS_HOLOLENS_NS_PER_TICK;
+	uint64_t frame_end_ts = footer.end_ts_ticks * WMR_MS_HOLOLENS_NS_PER_TICK;
 	int64_t delta = frame_end_ts - frame_start_ts;
 
-	uint16_t unknown16 = read16(&src);
-	uint16_t unknown16_2 = read16(&src);
-	src += 4; // Skip "Dlo+" magic bytes
-	uint16_t frametype = read16(&src);
+	/* Device-ts plausibility belt behind the magic check: the same guard the vit seam runs
+	 * (strictly increasing + <= 1 s step; the first transfer seeds it; a dropped candidate
+	 * can never poison the reference or stall the stream). */
+	enum u_frame_ts_guard_verdict ts_verdict = u_frame_ts_guard_check(&cam->device_ts_guard, (int64_t)frame_start_ts);
+	if (ts_verdict != U_FRAME_TS_GUARD_ACCEPT) {
+		bool regressed = ts_verdict == U_FRAME_TS_GUARD_DROP_REGRESSED;
+		note_dropped_transfer(cam, frame_start_ts,
+		                      regressed ? WMR_CAMERA_XFER_DROP_TS_REGRESSED : WMR_CAMERA_XFER_DROP_TS_JUMP,
+		                      regressed ? "device timestamp regressed" : "implausible device timestamp jump");
+		goto drop_frame;
+	}
+
 	/* frametype 0 is SLAM, frametype 2 is controller tracking */
-	bool slam_tracking_frame = (frametype == WMR_FRAMETYPE_SLAM);
+	bool slam_tracking_frame = (footer.frametype == WMR_FRAMETYPE_SLAM);
 
 	WMR_CAM_TRACE(cam,
 	              "Frame start TS %" PRIu64 " (%" PRIi64 " since last) end %" PRIu64 " dt %" PRIi64
 	              " unknown %u %u frame type %u",
-	              frame_start_ts, frame_start_ts - cam->last_frame_ts, frame_end_ts, delta, unknown16, unknown16_2,
-	              frametype);
+	              frame_start_ts, frame_start_ts - cam->last_frame_ts, frame_end_ts, delta, footer.ctr1,
+	              footer.unknown0, footer.frametype);
 
 	/* Read values from the pixel header */
 	uint16_t exposure = xf->data[6] << 8 | xf->data[7];
@@ -525,6 +572,8 @@ wmr_camera_open(struct wmr_camera_open_config *config)
 	}
 
 	cam->controller_cam_sink = config->controller_cam_sink;
+
+	u_frame_ts_guard_init(&cam->device_ts_guard);
 
 	if (os_thread_helper_init(&cam->usb_thread) != 0) {
 		WMR_CAM_ERROR(cam, "Failed to initialise threading");

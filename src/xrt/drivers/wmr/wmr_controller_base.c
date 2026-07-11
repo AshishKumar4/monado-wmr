@@ -561,11 +561,15 @@ imu_cal_parse(FILE *f,
 	memcpy(ta, IMU_CAL_IDENTITY3, sizeof(IMU_CAL_IDENTITY3));
 	int n = fscanf(f, "%d %lf %lf %lf %lf %lf %lf %lf %d", &ver, &bg[0], &bg[1], &bg[2], &ba[0], &ba[1],
 	               &ba[2], scale, count);
-	if (n != 9 || (ver != 1 && ver != 2) || *scale <= 0.9 || *scale >= 1.1) {
+	/* isfinite: fscanf %lf parses "nan", and NaN sails through every magnitude comparison below
+	 * (all compare false). A NaN scale is the worst case: reset_filter never touches m_accel_scale,
+	 * so the filter NaNs and resets on every sample, session after session, until the cache file is
+	 * hand-deleted. Reject the record instead (the caller WARNs and recalibrates). */
+	if (n != 9 || (ver != 1 && ver != 2) || !isfinite(*scale) || *scale <= 0.9 || *scale >= 1.1) {
 		return false;
 	}
 	for (int i = 0; i < 3; i++) {
-		if (fabs(bg[i]) > 0.1 || fabs(ba[i]) > 0.5) {
+		if (!isfinite(bg[i]) || !isfinite(ba[i]) || fabs(bg[i]) > 0.1 || fabs(ba[i]) > 0.5) {
 			return false;
 		}
 	}

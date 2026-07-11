@@ -6,6 +6,7 @@
 set(tests
     tests_cxx_wrappers
     tests_deque
+    tests_frame_ts_guard
     tests_generic_callbacks
     tests_glue_device
     tests_history_buf
@@ -24,6 +25,7 @@ set(tests
     tests_pose
     tests_vec3_angle
     tests_visibility_mask
+    tests_wmr_camera_footer
     tests_world_reanchor
 	)
 if(XRT_HAVE_OPENCV)
@@ -93,6 +95,12 @@ target_include_directories(
 	tests_l2_accept_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/tracking/constellation)
 add_test(NAME tests_l2_accept_gate COMMAND tests_l2_accept_gate --success --allow-running-no-tests)
 set_target_properties(tests_l2_accept_gate PROPERTIES FOLDER monado_tests)
+
+# Recorded cam0 timestamp sequences of the 2026-07-06 crashed + healthy sessions.
+target_compile_definitions(tests_frame_ts_guard PRIVATE G2_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+
+# Camera transfer footer validation (header-only parser in the WMR driver).
+target_include_directories(tests_wmr_camera_footer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/drivers)
 
 if(XRT_HAVE_OPENCV)
 	target_link_libraries(tests_kalman_fusion PRIVATE aux_math aux_tracking Threads::Threads ${OpenCV_LIBRARIES})

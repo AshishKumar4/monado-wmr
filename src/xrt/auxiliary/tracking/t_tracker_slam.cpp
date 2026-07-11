@@ -13,6 +13,7 @@
 #include "xrt/xrt_frameserver.h"
 
 #include "util/u_debug.h"
+#include "util/u_frame_ts_guard.h"
 #include "util/u_g2_telemetry.h"
 #include "util/u_world_reanchor.h"
 #include "util/u_logging.h"
@@ -288,8 +289,13 @@ struct TrackerSlam
 	struct openvr_tracker *ovr_tracker;    //!< OpenVR lighthouse tracker
 
 	// Used mainly for checking that the timestamps come in order
-	timepoint_ns last_imu_ts;         //!< Last received IMU sample timestamp
-	vector<timepoint_ns> last_cam_ts; //!< Last received image timestamp per cam
+	timepoint_ns last_imu_ts; //!< Last received IMU sample timestamp
+
+	//! Per-camera timestamp guards: frames that would hand the SLAM system a non-monotonic or
+	//! implausible timeline are dropped here (Basalt aborts the process on any regression).
+	struct u_frame_ts_guard cam_ts_guard[XRT_TRACKING_MAX_SLAM_CAMS];
+	timepoint_ns last_ts_drop_warn_mono; //!< Rate limiter for the guard-drop warning
+	uint64_t ts_drop_count;              //!< Total frames dropped by the guards
 
 	struct xrt_device_masks_sample last_hand_masks;       //!< Last received hand masks info
 	Mutex last_hand_masks_mutex;                          //!< Mutex for @ref last_hand_masks
@@ -1348,8 +1354,6 @@ receive_frame(TrackerSlam &t, struct xrt_frame *frame, uint32_t cam_index)
 {
 	XRT_TRACE_MARKER();
 
-	SLAM_DASSERT_(frame->timestamp < INT64_MAX);
-
 	// Return early if we don't submit
 	if (!t.submit) {
 		return;
@@ -1359,17 +1363,32 @@ receive_frame(TrackerSlam &t, struct xrt_frame *frame, uint32_t cam_index)
 		flush_poses(t); // Useful to flush SLAM poses when no openxr app is open
 	}
 
-	SLAM_DASSERT(t.last_cam_ts[0] != INT64_MIN || cam_index == 0, "First frame was not a cam0 frame");
+	SLAM_DASSERT(t.cam_ts_guard[0].has_pushed || cam_index == 0, "First frame was not a cam0 frame");
 
-	// Check monotonically increasing timestamps
-	timepoint_ns &last_ts = t.last_cam_ts[cam_index];
+	// Enforce a strictly-monotonic, plausible timeline per camera BEFORE anything reaches the
+	// SLAM system: the WMR device->monotonic conversion offset wobbles under USB churn and can
+	// regress converted group timestamps by tens of ms (2026-07-06 launch-window crash class),
+	// and Basalt turns any regression into an abort() inside the calling process (vrserver).
 	timepoint_ns ts = (int64_t)frame->timestamp;
 	SLAM_TRACE("[%" PRId64 "] cam%d frame t=%" PRId64, os_monotonic_get_ns(), cam_index, ts);
-	if (last_ts >= ts) {
-		SLAM_WARN("Frame (%" PRId64 ") is older than last (%" PRId64 ") by %" PRId64 " ns", ts, last_ts,
-		          last_ts - ts);
+	timepoint_ns prev_pushed = t.cam_ts_guard[cam_index].last_pushed_ns;
+	enum u_frame_ts_guard_verdict verdict = u_frame_ts_guard_check(&t.cam_ts_guard[cam_index], ts);
+	if (verdict != U_FRAME_TS_GUARD_ACCEPT) {
+		t.ts_drop_count++;
+		g2_telem_event(0, (uint64_t)ts, G2_TELEM_EV_SLAM_FRAME_TS_DROPPED,
+		               (float)((double)(ts - prev_pushed) / (double)U_TIME_1MS_IN_NS));
+		timepoint_ns now = os_monotonic_get_ns();
+		if (now - t.last_ts_drop_warn_mono >= (timepoint_ns)U_TIME_1S_IN_NS) {
+			t.last_ts_drop_warn_mono = now;
+			SLAM_WARN("Dropping cam%d frame (t=%" PRId64 "): %s vs last pushed %" PRId64
+			          " (delta %" PRId64 " ns); %" PRIu64 " frame(s) dropped so far",
+			          cam_index, ts,
+			          verdict == U_FRAME_TS_GUARD_DROP_REGRESSED ? "timestamp regressed"
+			                                                     : "implausible forward jump",
+			          prev_pushed, ts - prev_pushed, t.ts_drop_count);
+		}
+		return;
 	}
-	last_ts = ts;
 
 	// Construct and send the image sample
 	vit_img_sample sample = {};
@@ -1639,7 +1658,11 @@ t_slam_create(struct xrt_frame_context *xfctx,
 	g2_telem_init(getenv("G2_TELEMETRY"));
 
 	t.last_imu_ts = INT64_MIN;
-	t.last_cam_ts = vector<timepoint_ns>(t.cam_count, INT64_MIN);
+	for (struct u_frame_ts_guard &guard : t.cam_ts_guard) {
+		u_frame_ts_guard_init(&guard);
+	}
+	t.last_ts_drop_warn_mono = 0; // not INT64_MIN: `now - limiter` must stay overflow-free
+	t.ts_drop_count = 0;
 	t.last_hand_masks = xrt_device_masks_sample{};
 	t.last_controller_masks = xrt_device_masks_sample{};
 

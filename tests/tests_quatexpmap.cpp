@@ -50,19 +50,45 @@ TEST_CASE("m_quatexpmap")
 
 				INFO("vel=" << vel.x << ", " << vel.y << ", " << vel.z);
 				INFO("new_vel=" << new_vel.x << ", " << new_vel.y << ", " << new_vel.z);
-				CHECK(m_vec3_len(new_vel - vel) <= 0.001);
+
+				// The exponential map on SO(3) is injective only for rotations
+				// strictly inside the π ball. At |vel|*dt == π exactly (the
+				// antipode), q2⊗q1⁻¹ = (±axis, 0) and both signs name the SAME
+				// rotation through the quaternion double cover, so the axis sign
+				// recovered by the log — and thus the velocity's sign — is
+				// inherently ambiguous (float rounding of cos(|vel|*dt/2) ≈ ∓ε
+				// picks the branch). Velocity equality is only a valid identity
+				// off the antipode; at the antipode assert the actual contract:
+				// the recovered velocity reproduces the same orientation.
+				float rot_angle = fabsf(vel_angle) * dt;
+				bool antipodal = fabsf(rot_angle - (float)M_PI) < 1e-6f;
+				if (!antipodal) {
+					CHECK(m_vec3_len(new_vel - vel) <= 0.001);
+				} else {
+					xrt_quat q2_check{};
+					math_quat_integrate_velocity(&q1, &new_vel, dt, &q2_check);
+					float dot = q2.x * q2_check.x + q2.y * q2_check.y +
+					            q2.z * q2_check.z + q2.w * q2_check.w;
+					CHECK(fabsf(dot) >= 1.f - 1e-6f);
+				}
 			}
 		}
 	}
 
 	SECTION("Test quat_exp and quat_ln are inverses")
 	{
-		// We use rotations with less than PI radians as quat_ln will return the negative rotation otherwise
+		// quat_exp is the true quaternion exponential: its argument is the Lie-algebra
+		// exponent, i.e. HALF the rotation angle times the axis (integrate_velocity
+		// passes vel*dt*0.5). quat_ln returns the principal branch, so ln(exp(aa)) == aa
+		// only holds for |aa| < π/2 (rotation < π). At |aa| == π/2 exactly — the
+		// antipodal rotation — the axis sign is ambiguous through the quaternion double
+		// cover and float rounding of cos(|aa|) picks the branch, so we test up to but
+		// not onto that boundary.
 		vector<xrt_vec3> aas = {
 		    {0, 0, 0},
 		    axis1 * (float)M_PI * 0.01f,
-		    axis2 * (float)M_PI * 0.5f,
-		    axis3 * (float)M_PI * 0.99f,
+		    axis2 * (float)M_PI * 0.25f,
+		    axis3 * (float)M_PI * 0.49f,
 		};
 
 		for (xrt_vec3 aa : aas) {

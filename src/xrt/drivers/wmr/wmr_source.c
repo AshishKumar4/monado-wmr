@@ -14,6 +14,7 @@
 #include "math/m_api.h"
 #include "math/m_clock_tracking.h"
 #include "math/m_filter_fifo.h"
+#include "os/os_threading.h"
 #include "util/u_debug.h"
 #include "util/u_g2_telemetry.h"
 #include "util/u_sink.h"
@@ -75,12 +76,33 @@ struct wmr_source
 	struct m_ff_vec3_f32 *gyro_ff;                          //!< Queue of gyroscope data to display in UI
 	struct m_ff_vec3_f32 *accel_ff;                         //!< Queue of accelerometer data to display in UI
 
-	bool is_running;              //!< Whether the device is streaming
-	bool first_imu_received;      //!< Don't send frames until first IMU sample
-	timepoint_ns last_imu_ns;     //!< Last timepoint received.
-	time_duration_ns hw2mono;     //!< Estimated offset from IMU to monotonic clock
-	time_duration_ns cam_hw2mono; //!< Caches hw2mono for use in the full frame bundle
+	bool is_running;          //!< Whether the device is streaming
+	bool first_imu_received;  //!< Don't send frames until first IMU sample
+	timepoint_ns last_imu_ns; //!< Last timepoint received.
+
+	/*! The one hw->mono conversion authority for every stream of the shared USB device:
+	 * a windowed min-skew tracker fed from IMU sample arrivals. Minima correspond to the
+	 * lowest-delay arrivals, so USB churn — which can only ever ADD delay — cannot inflate
+	 * the estimate the way the previous arrival-mean exponential filter did (~100 ms
+	 * launch-window wobble, the 2026-07-06 Basalt-abort class). Guarded by hw2mono_lock:
+	 * the IMU (HID) thread pushes observations, the camera (USB) thread samples it. */
+	struct os_mutex hw2mono_lock;
+	struct m_clock_windowed_skew_tracker *hw2mono_clock;
+
+	/*! hw2mono offset sampled once per camera group (at cam0) so all views of a group and
+	 * the interleaved controller frames convert identically. Only touched from the camera
+	 * USB thread. */
+	bool cam_hw2mono_valid;
+	time_duration_ns cam_hw2mono;
 };
+
+/*! hw2mono window: 4 s of HMD IMU samples (1000 Hz; 4 samples per USB packet share one
+ * arrival instant, and the min-skew logic keys on the newest, lowest-delay one). Sized from
+ * a sweep over four live captures (results/hw2mono-windowed-20260708): 4 s brings the
+ * steady-state per-camera-group offset step to ~0.1 us (~350x below the old exponential
+ * filter) with zero converted-timeline regressions, bridges multi-second USB churn bursts,
+ * and bounds the worst-case drift-following lag to ~0.2 ms (true drift ~56 us/s). */
+#define WMR_HW2MONO_WINDOW_SAMPLES 4000
 
 /*
  *
@@ -88,12 +110,26 @@ struct wmr_source
  *
  */
 
+//! Sample the hw2mono authority for camera conversions (see cam_hw2mono).
+static void
+wmr_source_update_cam_hw2mono(struct wmr_source *ws, timepoint_ns group_hw_ts)
+{
+	os_mutex_lock(&ws->hw2mono_lock);
+	timepoint_ns mono_ts = 0;
+	bool have = m_clock_windowed_skew_tracker_to_local(ws->hw2mono_clock, group_hw_ts, &mono_ts);
+	os_mutex_unlock(&ws->hw2mono_lock);
+	if (have) {
+		ws->cam_hw2mono = mono_ts - group_hw_ts;
+		ws->cam_hw2mono_valid = true;
+	}
+}
+
 #define DEFINE_RECEIVE_CAM(cam_id)                                                                                     \
 	static void receive_cam##cam_id(struct xrt_frame_sink *sink, struct xrt_frame *xf)                             \
 	{                                                                                                              \
 		struct wmr_source *ws = container_of(sink, struct wmr_source, cam_slam_sinks[cam_id]);                 \
 		if (cam_id == 0) {                                                                                     \
-			ws->cam_hw2mono = ws->hw2mono;                                                                 \
+			wmr_source_update_cam_hw2mono(ws, (timepoint_ns)xf->timestamp);                                \
 		}                                                                                                      \
 		xf->timestamp += ws->cam_hw2mono;                                                                      \
 		WMR_TRACE(ws, "cam" #cam_id " img t=%" PRId64 " source_t=%" PRId64, xf->timestamp,                     \
@@ -114,8 +150,20 @@ receive_controller_frame(struct xrt_frame_sink *sink, struct xrt_frame *xf)
 {
 	struct wmr_source *ws = container_of(sink, struct wmr_source, in_controller_sink);
 
-	// Convert from device TS to system TS
-	xf->timestamp += ws->hw2mono;
+	// Convert from device TS to system TS with the same group-sampled offset the SLAM camera
+	// groups use (one conversion timeline for every camera product of the shared USB stream).
+	// Until the first IMU sample seeds the estimator there is no conversion authority at all;
+	// forwarding would hand the tracker raw device-clock stamps (the 2026-07-09 phantom
+	// head-resnap class), so drop the frame exactly like the SLAM path is gated.
+	if (!ws->cam_hw2mono_valid) {
+		wmr_source_update_cam_hw2mono(ws, (timepoint_ns)xf->timestamp);
+		if (!ws->cam_hw2mono_valid) {
+			WMR_DEBUG(ws, "Dropping controller frame until the clock estimator synchronises, hw ts %" PRIu64,
+			          xf->timestamp);
+			return;
+		}
+	}
+	xf->timestamp += ws->cam_hw2mono;
 
 	timepoint_ns now_mono = (timepoint_ns)os_monotonic_get_ns();
 	WMR_TRACE(ws, "img seq %" PRIu64 " mono_t=%" PRIu64 " t=%" PRId64 " source_t=%" PRId64, xf->source_sequence,
@@ -139,20 +187,28 @@ receive_imu_sample(struct xrt_imu_sink *sink, struct xrt_imu_sample *s)
 {
 	struct wmr_source *ws = container_of(sink, struct wmr_source, imu_sink);
 
-	// Convert hardware timestamp into monotonic clock. Update offset estimate hw2mono.
-	// Note this is only done with IMU samples as they have the smallest USB transmission time.
-	const float IMU_FREQ = 1000.f; // HMD IMU is 1000 Hz now that average_imus=false (4 samples/packet)
+	// Update the hw->mono offset estimate and convert the hardware timestamp into the
+	// monotonic clock. Only IMU samples feed the estimator: they have the smallest USB
+	// transmission time, and every other stream of the device shares its clock.
 	timepoint_ns now_hw = s->timestamp_ns;
 	timepoint_ns now_mono = (timepoint_ns)os_monotonic_get_ns();
-	timepoint_ns ts = m_clock_offset_a2b(IMU_FREQ, now_hw, now_mono, &ws->hw2mono);
+	os_mutex_lock(&ws->hw2mono_lock);
+	m_clock_windowed_skew_tracker_push(ws->hw2mono_clock, now_mono, now_hw);
+	timepoint_ns ts = 0;
+	bool have = m_clock_windowed_skew_tracker_to_local(ws->hw2mono_clock, now_hw, &ts);
+	os_mutex_unlock(&ws->hw2mono_lock);
+	if (!have) {
+		WMR_DEBUG(ws, "Dropping IMU sample until the clock estimator synchronises, hw ts %" PRId64, now_hw);
+		return;
+	}
 
 	/*
 	 * Check if the timepoint does time travel, we get one or two
 	 * old samples when the device has not been cleanly shut down.
 	 */
 	if (ws->last_imu_ns >= ts) { // >= : also drop a duplicate timestamp (dt==0) before it reaches SLAM
-		WMR_WARN(ws, "Received sample from the past, new: %" PRIu64 ", last: %" PRIu64 ", diff: %" PRIu64, ts,
-		         s->timestamp_ns, ts - s->timestamp_ns);
+		WMR_WARN(ws, "Received sample from the past, new: %" PRId64 ", last: %" PRId64 ", diff: %" PRId64, ts,
+		         ws->last_imu_ns, ws->last_imu_ns - ts);
 		return;
 	}
 
@@ -303,6 +359,8 @@ wmr_source_node_destroy(struct xrt_frame_node *node)
 	}
 	m_ff_vec3_f32_free(&ws->gyro_ff);
 	m_ff_vec3_f32_free(&ws->accel_ff);
+	m_clock_windowed_skew_tracker_destroy(ws->hw2mono_clock);
+	os_mutex_destroy(&ws->hw2mono_lock);
 	u_var_remove_root(ws);
 	if (ws->camera != NULL) { // It could be null if XRT_HAVE_LIBUSB is not defined
 		wmr_camera_free(ws->camera);
@@ -328,6 +386,9 @@ wmr_source_create(struct xrt_frame_context *xfctx,
 
 	struct wmr_source *ws = U_TYPED_CALLOC(struct wmr_source);
 	ws->log_level = debug_get_log_option_wmr_log();
+
+	ws->hw2mono_clock = m_clock_windowed_skew_tracker_alloc(WMR_HW2MONO_WINDOW_SAMPLES);
+	os_mutex_init(&ws->hw2mono_lock);
 
 	// Setup xrt_fs
 	struct xrt_fs *xfs = &ws->xfs;

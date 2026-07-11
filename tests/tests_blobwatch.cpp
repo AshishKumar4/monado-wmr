@@ -450,6 +450,52 @@ TEST_CASE("blobwatch: cap-pressure retention keeps high-contrast blobs over scan
 	blobwatch_free(bw);
 }
 
+TEST_CASE("blobwatch: staging overflow keeps high-priority blobs that complete late in scanline order")
+{
+	// The 256-slot staging buffer fills in scanline (top-to-bottom) order. Place DIM blobs in the top
+	// rows -- enough to overflow staging on their own -- and BRIGHT blobs strictly BELOW them, so the
+	// bright blobs complete only after staging is already full. The old blind scanline drop discarded
+	// every extent past slot 256 before the priority ranking ran, so it kept ZERO bright blobs.
+	// Priority-aware staging must evict dim staged blobs for the later bright ones, so the final cap
+	// keeps all 100 bright and never silently loses a hand-height LED ring behind top-of-frame clutter.
+	constexpr int DIM = 260, BRIGHT = 100;
+	static_assert(DIM > 256, "the dim group alone must overflow BLOB_STAGE_MAX to exercise the fix");
+	TestFrame tf(320, 480);
+	int placed_dim = 0, placed_bright = 0;
+	for (int gy = 0; gy < 30 && placed_dim + placed_bright < DIM + BRIGHT; gy++) {
+		for (int gx = 0; gx < 20 && placed_dim + placed_bright < DIM + BRIGHT; gx++) {
+			const double x = 12.0 + gx * 15.0, y = 12.0 + gy * 15.0;
+			if (placed_dim < DIM) {
+				tf.add_gaussian(x, y, 1.2, 30, false);
+				placed_dim++;
+			} else {
+				tf.add_gaussian(x, y, 1.2, 200, false);
+				placed_bright++;
+			}
+		}
+	}
+	REQUIRE(placed_dim == DIM);
+	REQUIRE(placed_bright == BRIGHT);
+
+	blobwatch *bw = blobwatch_new(PIX_THR, 0);
+	blobservation *ob = nullptr;
+	blobwatch_process(bw, &tf.f, /*exposure=*/100, /*gain=*/0, &ob);
+	REQUIRE(ob != nullptr);
+	REQUIRE(ob->num_blobs == MAX_BLOBS_PER_FRAME);
+
+	int bright_kept = 0;
+	for (int i = 0; i < ob->num_blobs; i++) {
+		if (ob->blobs[i].brightness > 100) {
+			bright_kept++;
+		}
+	}
+	// Pre-fix: 0 (staging was full of dim clutter before any bright blob was even reached).
+	REQUIRE(bright_kept == BRIGHT);
+	// Every qualifying blob is either kept or accounted as a capacity drop -- none silently vanish.
+	REQUIRE(ob->dropped_capacity == DIM + BRIGHT - MAX_BLOBS_PER_FRAME);
+	blobwatch_free(bw);
+}
+
 namespace {
 
 // Distortion-free RADTAN8 camera (all coefficients zero) for static-map geometry tests.
