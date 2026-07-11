@@ -1,4 +1,4 @@
-// Copyright 2026, NVIDIA CORPORATION.
+// Copyright 2026, G2-on-Linux project
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -181,6 +181,20 @@ greysum_center(TestFrame &tf, int x0, int y0, int x1, int y1, double &gx, double
 }
 
 } // namespace
+
+TEST_CASE("blobwatch: LED id macros round-trip and mask the 8-bit local field")
+{
+	const uint16_t id = LED_MAKE_ID(0x12, 0x34);
+	REQUIRE(id == 0x1234);
+	REQUIRE(LED_OBJECT_ID(id) == 0x12);
+	REQUIRE(LED_LOCAL_ID(id) == 0x34);
+	// An out-of-range LED index must not corrupt the object id.
+	REQUIRE(LED_MAKE_ID(0x12, 0x134) == LED_MAKE_ID(0x12, 0x34));
+	REQUIRE(LED_OBJECT_ID(LED_MAKE_ID(0x12, 0x134)) == 0x12);
+	// The invalid sentinel survives both accessors.
+	REQUIRE(LED_LOCAL_ID(LED_INVALID_ID) == LED_INVALID_ID);
+	REQUIRE(LED_OBJECT_ID(LED_INVALID_ID) == LED_INVALID_ID);
+}
 
 TEST_CASE("blobwatch: unsaturated round LED is retained near its true centre")
 {

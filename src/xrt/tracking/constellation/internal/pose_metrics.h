@@ -143,6 +143,17 @@ pose_metrics_prior_orient_cost(const struct xrt_quat *q_cand,
                                double huber_knee_sigma,
                                double weight);
 
+/* The same robust cost from an ALREADY-COMPUTED split (tilt, yaw from pose_metrics_prior_orient_split) —
+ * the single source of the Huber math for callers that need one channel priced alone (a non-positive
+ * sigma drops that axis, so e.g. sigma_yaw <= 0 yields the gravity-tilt-only prior charge). */
+double
+pose_metrics_prior_orient_cost_from_split(double tilt_rad,
+                                          double yaw_rad,
+                                          double sigma_tilt_rad,
+                                          double sigma_yaw_rad,
+                                          double huber_knee_sigma,
+                                          double weight);
+
 void
 pose_metrics_get_device_bounds(struct xrt_pose *P_cam_obj,
                                struct t_constellation_led_model *led_model,

@@ -243,7 +243,10 @@ debug_draw_blobs_leds(struct xrt_frame *rgb_out,
 			src += in_stride;
 		}
 		max_pix = MIN(64, max_pix); // HACK: Scale everything in the bottom 25% up
-		uint8_t delta = max_pix - min_pix;
+		/* A uniform frame (or one entirely above the 64 clamp) has no range to
+		 * equalise: force a >=1 span instead of dividing by zero or wrapping the
+		 * uint8 subtraction (all-black short-exposure frames genuinely occur). */
+		const int delta = max_pix > min_pix ? max_pix - min_pix : 1;
 		for (int i = 0; i < 256; i++) {
 			equalise_map[i] = CLAMP(((i - min_pix) * 255 + delta / 2) / delta, 0, 255);
 		}

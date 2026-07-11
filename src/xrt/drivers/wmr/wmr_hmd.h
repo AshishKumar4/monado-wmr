@@ -70,6 +70,10 @@ struct wmr_hmd
 	//! Config data parsed from the firmware JSON
 	struct wmr_hmd_config config;
 
+	//! Absolute accel scale (LSB -> m/s^2): per-device calibration. Per-headset-type
+	//! default, refined by wmr/accel-scale.json in the config dir.
+	float accel_scale;
+
 	//! Packet reading thread.
 	struct os_thread_helper oth;
 

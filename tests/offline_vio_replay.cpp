@@ -1,4 +1,4 @@
-// Copyright 2026, NVIDIA CORPORATION.
+// Copyright 2026, G2-on-Linux project
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -1667,6 +1667,7 @@ main(int argc, char **argv)
 
 	uint64_t seq = 0;
 	size_t dropped_frame_groups = 0;
+	size_t barrier_timeouts = 0;
 	int64_t next_render_ns = render_period_ns > 0 ? replay_start_ns + render_period_ns : INT64_MAX;
 	auto sample_render_until = [&](int64_t limit_ns, int64_t frame_t_ns) {
 		while (next_render_ns <= limit_ns) {
@@ -1735,6 +1736,11 @@ main(int argc, char **argv)
 					if (std::chrono::steady_clock::now() > deadline) {
 						fprintf(stderr, "WARN: frame %lld completion barrier timed out\n",
 						        (long long)mf.t_ns);
+						// FATAL (counted at exit): a fired barrier means frame N's CSV
+						// row was read pre-completion and N's late completion can
+						// release frame N+1's barrier -- the run is nondeterministic
+						// and every downstream number is invalid.
+						barrier_timeouts++;
 						break;
 					}
 					std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -1883,6 +1889,13 @@ main(int argc, char **argv)
 	g2_telem_shutdown();                     // flush + close the replay telemetry (no-op if disabled)
 	for (CtrlSession &cs : sessions) {
 		kalman_fusion_destroy(cs.ctrl->kf);
+	}
+	if (barrier_timeouts > 0) {
+		fprintf(stderr,
+		        "FATAL: %zu frame completion barrier timeout(s) -- the replay is nondeterministic, "
+		        "its outputs are invalid\n",
+		        barrier_timeouts);
+		return 1;
 	}
 	return 0;
 }

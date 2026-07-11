@@ -140,6 +140,10 @@ struct g2_telem_candidate
 	float yaw_sigma_rad;
 	float tilt_err_rad;
 	float yaw_err_rad;
+	//! Gravity-tilt channel of the orientation prior charge (nats) — the quantity the v3
+	//! visual-recovery re-price keeps unwaived, emitted so selection-class defects are
+	//! adjudicable offline.
+	float tilt_prior_nll;
 	float prior_pos_err_x, prior_pos_err_y, prior_pos_err_z;
 	float prior_rot_err_x, prior_rot_err_y, prior_rot_err_z;
 	float blob_var_mean_px2;
@@ -346,6 +350,7 @@ static const struct g2_field candidate_fields[] = {
     F(g2_telem_candidate, prior_cost, "f32"), F(g2_telem_candidate, total_cost, "f32"),
     F(g2_telem_candidate, yaw_sigma_rad, "f32"), F(g2_telem_candidate, tilt_err_rad, "f32"),
     F(g2_telem_candidate, yaw_err_rad, "f32"),
+    F(g2_telem_candidate, tilt_prior_nll, "f32"),
     F(g2_telem_candidate, prior_pos_err_x, "f32"), F(g2_telem_candidate, prior_pos_err_y, "f32"),
     F(g2_telem_candidate, prior_pos_err_z, "f32"),
     F(g2_telem_candidate, prior_rot_err_x, "f32"), F(g2_telem_candidate, prior_rot_err_y, "f32"),
@@ -1128,6 +1133,7 @@ g2_telem_candidate(uint8_t device_id,
                    float yaw_sigma_rad,
                    float tilt_err_rad,
                    float yaw_err_rad,
+                   float tilt_prior_nll,
                    const float prior_pos_err[3],
                    const float prior_rot_err[3],
                    float blob_var_mean_px2,
@@ -1159,6 +1165,7 @@ g2_telem_candidate(uint8_t device_id,
 	row.yaw_sigma_rad = yaw_sigma_rad;
 	row.tilt_err_rad = tilt_err_rad;
 	row.yaw_err_rad = yaw_err_rad;
+	row.tilt_prior_nll = tilt_prior_nll;
 	if (prior_pos_err != NULL) {
 		row.prior_pos_err_x = prior_pos_err[0];
 		row.prior_pos_err_y = prior_pos_err[1];

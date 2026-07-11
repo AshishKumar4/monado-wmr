@@ -561,6 +561,12 @@ namespace {
 		double accel_scale{1.0};
 		bool scale_bootstrapped{false};
 		Quaterniond gravity_corrected_q{1.0, 0.0, 0.0, 0.0};
+		//! Orientation-adoption veto reference: an OOSM rewind-replay must re-decide the veto against the
+		//! same dead-reckoned attitude it saw in-order, or a lagged pose folds against a stale reference.
+		Quaterniond gyro_ref_q{Quaterniond::Identity()};
+		timepoint_ns gyro_ref_ns{0};
+		double gyro_ref_rot{0.0};
+		bool gyro_ref_valid{false};
 	};
 
 	//! One buffered IMU sample retained for out-of-sequence replay.
@@ -589,12 +595,16 @@ namespace {
 		EskfFusion()
 		{
 			reset_filter_and_imu();
-			if (getenv("G2_IMU_ONLY") != nullptr) {
+			/* Sanctioned diagnostic (never a behavior gate): pure-inertial mode to gauge raw
+			 * IMU quality. Optical is allowed only to bootstrap the true pose for the window,
+			 * then all optical folds are rejected and the filter dead-reckons. Read per
+			 * construction (not DEBUG_GET_ONCE) so each filter honors its own environment. */
+			if (debug_get_bool_option("KALMAN_IMU_ONLY", false)) {
 				m_imu_only = true;
-				const char *bs = getenv("G2_IMU_ONLY_BOOTSTRAP_S");
-				const double s = (bs != nullptr && *bs != '\0') ? atof(bs) : 3.0;
+				const double s = debug_get_float_option("KALMAN_IMU_ONLY_BOOTSTRAP_S", 3.0f);
 				m_imu_only_bootstrap_ns = (int64_t)(s * 1.0e9);
-				U_LOG_I("ESKF: G2_IMU_ONLY diagnostic — pure inertial after %.1fs optical bootstrap", s);
+				U_LOG_I("ESKF: KALMAN_IMU_ONLY diagnostic — pure inertial after %.1fs optical bootstrap",
+				        s);
 			}
 		}
 
@@ -841,9 +851,12 @@ namespace {
 			{
 				// Re-entry render ease state is world-frame too. Leaf lock; the filter->leaf
 				// nesting above released first, and no path takes leaf->filter, so no cycle.
+				// m_v_at_loss belongs to this lock domain (get_prediction reads/writes it under
+				// the leaf lock), so its rotation happens here, not in apply_world_delta.
 				std::lock_guard<std::mutex> lock(m_reentry_render_lock);
 				m_reentry_cur_pos = R * m_reentry_cur_pos + t;
 				m_reentry_cur_orient = (R * m_reentry_cur_orient).normalized();
+				m_v_at_loss = R * m_v_at_loss;
 			}
 		}
 
@@ -1067,15 +1080,25 @@ namespace {
 		//! large reprojection error — too nonlinear); snap-re-anchor to the PnP pose instead of a slow
 		//! EKF nudge. Below it, apply the pose as a normal absolute EKF update.
 		static constexpr double REANCHOR_SNAP_M = 0.5;
-		//! Optical-orientation flip rejection (gyro arbitration). A few-LED PnP intermittently returns a
-		//! ~90-180 deg mirror-flipped orientation; the 200 Hz gyro never rotated that far between frames.
-		//! When the gyro is fresh (optical recent, so it has not drifted) and a candidate optical
-		//! orientation disagrees with the gyro-propagated filter orientation by more than this, keep the
-		//! gyro orientation (adopt optical POSITION only). ~75 deg between frames is >3000 deg/s —
-		//! implausibly fast for a hand, so this rejects only flips, never real fast rotation. After a long
-		//! gap (> FLIP_GUARD_TRUST_NS) the gyro is no longer trusted, so the optical orientation is
-		//! accepted (sole ref).
-		static constexpr double FLIP_REJECT_RAD = deg2rad(75);
+		//! Orientation-adoption veto envelope (B4). At every flip-arbitration site the candidate optical
+		//! attitude is compared to the gyro DEAD-RECKONED reference (m_gyro_ref_q: the last adopted attitude
+		//! integrated forward by the body gyro), NOT to the covariance-driven filter orientation — a
+		//! re-anchor flood or speculative per-LED feed can rotate the filter off its own gyro, but the
+		//! reference is immune, so the veto stays independent of the ESKF covariance. That decoupling is the
+		//! fix: the old veto compared against the filter orientation, which the poison chain had already
+		//! rotated into the flip basin, so the flip agreed with it and passed; the clean reference does not.
+		//! A wrong-attitude re-acquisition (mirror flip / cold-search twin) misses the reference by 90-145 deg
+		//! (its whole point is that the gyro says the controller did NOT rotate that far). The FLOOR sits
+		//! ABOVE the worst reference error and BELOW the flips: the reference itself drifts/re-seeds by up to
+		//! ~80 deg in the identity-calibration offline replay (measured — the harness runs uncalibrated gyro,
+		//! and dim-LED coasts stretch the dead-reckoning), so a disagreement must exceed that to be a genuine
+		//! flip rather than a correct fit the drifted reference merely disagrees with — anything tighter
+		//! vetoes correct re-acquisitions (a lock-out that regresses the OOV battery). RATE_FRAC adds the
+		//! measured rotation-scaled gyro-propagation error (~20-30% of the in-gap rotation,
+		//! results/b4-design-20260707/gyro_consistency.py) for genuine fast spins. Beyond FLIP_GUARD_TRUST_NS
+		//! the coasted gyro is stale, so optical becomes the sole reference (a true re-acquisition).
+		static constexpr double FLIP_GYRO_FLOOR_RAD = deg2rad(85);
+		static constexpr double FLIP_GYRO_RATE_FRAC = 0.35;
 		//! Gyro-trust horizon for flip arbitration — DECOUPLED from the 0.5 s position freeze. The gyro
 		//! orientation drifts only slowly (bias ~0.06 rad/s, estimated online), so it stays a valid flip
 		//! reference for seconds; optical dropouts are routinely 0.5–3 s (BT-limited controllers), and
@@ -1083,8 +1106,9 @@ namespace {
 		//! those flips through the gap; past it (a true re-acquisition) the optical orientation is adopted.
 		static constexpr int64_t FLIP_GUARD_TRUST_NS = ms_to_ns(3000);
 		//! Flip-veto LOCK-IN release. The gyro flip-veto keeps the filter orientation only while the gyro
-		//! has been RECENTLY CONFIRMED by an AGREEING optical (disagreement <= FLIP_REJECT_RAD); we track the
-		//! last such agreement. If optical instead DISAGREES continuously for longer than this, the filter —
+		//! has been RECENTLY CONFIRMED by an AGREEING optical (disagreement within the gyro envelope); we
+		//! track the last such agreement. If optical instead DISAGREES continuously for longer than this,
+		//! the filter —
 		//! not optical — is the outlier (a bad seed drove the gyro orientation into a wrong basin while its
 		//! own optical kept reporting correctly), so the veto RELEASES and the optical orientation is adopted
 		//! (re-seed), breaking the lock-in. A transient one-off flip (brief disagreement, well under this)
@@ -1169,11 +1193,20 @@ namespace {
 		int m_imu_anomaly_count{0};
 
 		timepoint_ns last_optical_ns{0};
-		//! Time optical orientation last AGREED with the gyro-propagated filter (disagreement <=
-		//! FLIP_REJECT_RAD). Unlike last_optical_ns (which advances on EVERY optical op, including flip-
-		//! REJECTED ones), this advances only on AGREEMENT, so a sustained disagreement ages it out and
-		//! releases the flip-veto (see FLIP_LOCKIN_RELEASE_NS / reject_orientation_flip).
+		//! Time optical orientation last AGREED with the gyro reference (disagreement within the envelope).
+		//! Unlike last_optical_ns (which advances on EVERY optical op, including flip-REJECTED ones), this
+		//! advances only on AGREEMENT, so a sustained disagreement ages it out and releases the flip-veto
+		//! (see FLIP_LOCKIN_RELEASE_NS / reject_orientation_flip).
 		timepoint_ns m_last_orient_agree_ns{0};
+		//! Gyro dead-reckoned attitude reference for the orientation-adoption veto (B4): the last ADOPTED
+		//! optical attitude, propagated forward by the body gyro in integrate_imu_sample and NEVER moved by
+		//! folds / re-anchor floods / speculative feeds -> a covariance-independent short-horizon attitude
+		//! truth. m_gyro_ref_rot accumulates the integrated |w| dt (rad) since the snapshot (the envelope's
+		//! rotation scale). Snapshotted on adoption (reject_orientation_flip), held through vetoes.
+		Quaterniond m_gyro_ref_q{Quaterniond::Identity()};
+		timepoint_ns m_gyro_ref_ns{0};
+		double m_gyro_ref_rot{0.0};
+		bool m_gyro_ref_valid{false};
 		Vector3d last_good_position{0, 0, 0};
 		//! Time of the last successful per-LED fold; gates process_pose's measurement mode (see above).
 		timepoint_ns m_last_led_fold_ns{0};
@@ -1221,6 +1254,7 @@ namespace {
 		//! then eases the residual instead of teleporting.
 		bool m_follow_was_stale{false};
 		//! Filter velocity at the last fresh pull: the hold-model scale for the out-of-view blend.
+		//! Guarded by m_reentry_render_lock ONLY (like the other cross-frame render-follow state).
 		Vector3d m_v_at_loss{0, 0, 0};
 		Vector3d m_reentry_cur_pos{0, 0, 0};
 		Quaterniond m_reentry_cur_orient{1, 0, 0, 0}; //!< eased reported orientation (gyro-quat slid on the manifold)
@@ -1242,8 +1276,8 @@ namespace {
 		timepoint_ns m_pnp_ns{0};
 		bool m_pnp_valid{false};
 
-		//! Diagnostic (env G2_IMU_ONLY): pure-inertial mode. Optical is allowed only to bootstrap (lock at
-		//! the true pose for G2_IMU_ONLY_BOOTSTRAP_S, default 3 s); thereafter ALL optical folds are
+		//! Diagnostic (env KALMAN_IMU_ONLY): pure-inertial mode. Optical is allowed only to bootstrap (lock
+		//! at the true pose for KALMAN_IMU_ONLY_BOOTSTRAP_S, default 3 s); thereafter ALL optical folds are
 		//! suppressed and the filter runs on the IMU alone — to gauge the inertial odometry's smoothness in
 		//! isolation from the matcher. (Pure-inertial position must drift; what we read is continuity.)
 		bool m_imu_only{false};
@@ -1319,14 +1353,24 @@ namespace {
 		void
 		apply_world_delta(const Quaterniond &R, const Vector3d &t);
 		//! The gyro flip-veto DECISION (single source of truth for every flip-arbitration site). Returns true
-		//! iff @p cand should be rejected as a likely optical mirror-flip and the gyro orientation @p q_filter
-		//! kept. A flip is vetoed only while the gyro is fresh (optical recent) AND was confirmed by an
-		//! agreeing optical within FLIP_LOCKIN_RELEASE_NS; a SUSTAINED disagreement past that releases the
-		//! veto (the filter, not optical, is the outlier — adopt/re-seed optical), breaking a wrong-yaw
-		//! lock-in. Records the agreement time (m_last_orient_agree_ns = @p when_ns) whenever cand agrees, so
-		//! the release clock measures the disagreement run. Caller holds m_filter_lock.
+		//! iff @p cand should be rejected as a likely optical mirror-flip and the gyro orientation kept. The
+		//! candidate is judged against the gyro DEAD-RECKONED reference (m_gyro_ref_q), not the filter
+		//! orientation, so a re-anchor flood or speculative feed cannot neutralise the veto. Vetoed only while
+		//! the reference is fresh (< FLIP_GUARD_TRUST_NS) AND cand exceeds the measured gyro envelope AND that
+		//! disagreement has not been sustained past FLIP_LOCKIN_RELEASE_NS (a sustained disagreement means the
+		//! reference, not optical, is the outlier -> adopt/re-seed, breaking a wrong-attitude lock-in). On
+		//! ADOPTION the candidate becomes the new reference (snapshot_gyro_ref). Caller holds m_filter_lock.
 		bool
-		reject_orientation_flip(const Quaterniond &cand, const Quaterniond &q_filter, timepoint_ns when_ns);
+		reject_orientation_flip(const Quaterniond &cand, timepoint_ns when_ns);
+		//! Pure geometric flip test (no side effects): is @p cand outside the fresh gyro envelope, i.e. a
+		//! likely mirror-flip? The shared core of reject_orientation_flip (which adds the lock-in release +
+		//! reference snapshot) and the re-anchor cache pre-filter. Caller holds m_filter_lock.
+		bool
+		orientation_flip_vs_gyro(const Quaterniond &cand, timepoint_ns when_ns) const;
+		//! Snapshot @p cand as the gyro dead-reckoning reference: the veto's short-horizon attitude truth,
+		//! re-integrated forward by the body gyro until the next adoption. Caller holds m_filter_lock.
+		void
+		snapshot_gyro_ref(const Quaterniond &cand, timepoint_ns when_ns);
 		//! Gyro arbitration helper: return @p cand unless reject_orientation_flip vetoes it, in which case
 		//! return the current gyro orientation so a flip cannot be adopted. Caller holds m_filter_lock.
 		Quaterniond
@@ -1350,6 +1394,11 @@ namespace {
 		fold_body_anchor(const struct xrt_pose *hmd_pose);
 		void
 		propagate_to(int64_t target_ns);
+		//! Propagate the filter by one IMU sample. Returns false iff the sample forced
+		//! reset_filter_and_imu() (a sustained anomaly run or a non-finite state): the filter is no
+		//! longer the continuation of the pre-call state and m_imu_log was cleared, so any caller
+		//! REPLAYING the log must abort its loop — continuing would iterate a cleared deque (UB) and
+		//! re-integrate against the reset state.
 		bool
 		integrate_imu_sample(const xrt_imu_sample &sample);
 		//! Generic EKF measurement update: error += K r; Joseph-form covariance. Returns false on a
@@ -1588,9 +1637,10 @@ namespace {
 		tracked = false;
 		position_state = TrackingInfo{};
 		m_body_lock_valid = false; // a lost track invalidates the head-relative offset; re-captured on re-lock
-		// A reset wipes the orientation basin (m_x.q -> identity); there is no longer a gyro orientation
+		// A reset wipes the orientation basin (m_x.q -> identity); there is no longer a gyro reference
 		// confirmed by an agreeing optical, so the next optical re-seeds rather than being flip-vetoed.
 		m_last_orient_agree_ns = 0;
+		m_gyro_ref_valid = false;
 		m_last_led_fold_ns = 0;
 		m_last_position_led_fold_ns = 0;
 		m_optical_velocity_world.setZero();
@@ -1690,13 +1740,17 @@ namespace {
 		rot_vec(m_accel_world);
 		rot_vec(m_angvel_world);
 		rot_quat(m_gravity_corrected_q);
+		if (m_gyro_ref_valid) {
+			rot_quat(m_gyro_ref_q); // world<-body reference follows the world re-anchor like m_x.q
+		}
 		xform_point(last_good_position);
 		rot_vec(m_optical_velocity_world);
 		for (int i = 0; i < m_optical_pos_history_count; i++) {
 			xform_point(m_optical_pos_history[i]);
 		}
 		rot_vec(m_body_offset_world);
-		rot_vec(m_v_at_loss);
+		// m_v_at_loss lives in the m_reentry_render_lock domain (get_prediction reads and writes it
+		// under that leaf lock only); re_anchor_world rotates it in its reentry-lock block, never here.
 		if (m_hmd_pos_valid) {
 			xform_point(m_hmd_pos);
 			rot_quat(m_hmd_quat);
@@ -1725,6 +1779,9 @@ namespace {
 			}
 			rot_vec(c.body_offset_world);
 			rot_quat(c.gravity_corrected_q);
+			if (c.gyro_ref_valid) {
+				rot_quat(c.gyro_ref_q);
+			}
 		}
 	}
 
@@ -1737,21 +1794,41 @@ namespace {
 		return have_fresh_optical_velocity ? m_optical_velocity_world : Vector3d::Zero();
 	}
 
-	bool
-	EskfFusion::reject_orientation_flip(const Quaterniond &cand, const Quaterniond &q_filter, timepoint_ns when_ns)
+	void
+	EskfFusion::snapshot_gyro_ref(const Quaterniond &cand, timepoint_ns when_ns)
 	{
-		// Gyro untrustworthy only after a LONG optical gap (FLIP_GUARD_TRUST_NS, not the 0.5 s position
-		// freeze) — until then it stays a valid flip reference through dropouts. Past it -> accept the
-		// optical orientation as the sole reference (a true re-acquisition); the agreement clock restarts.
-		const bool gyro_fresh = last_optical_ns != 0 && (when_ns - last_optical_ns) < FLIP_GUARD_TRUST_NS;
-		const double ang = log_quat(cand.normalized() * q_filter.conjugate()).norm(); // rad between cand & gyro
-		if (ang <= FLIP_REJECT_RAD || !gyro_fresh) {
-			m_last_orient_agree_ns = when_ns; // optical confirms the gyro (or re-seeds it) -> restart the clock
+		m_gyro_ref_q = cand.normalized();
+		m_gyro_ref_ns = when_ns;
+		m_gyro_ref_rot = 0.0;
+		m_gyro_ref_valid = true;
+	}
+
+	bool
+	EskfFusion::orientation_flip_vs_gyro(const Quaterniond &cand, timepoint_ns when_ns) const
+	{
+		// Compare the candidate optical attitude to the gyro DEAD-RECKONED reference (independent of the
+		// ESKF covariance the re-anchor floods move), not to the filter orientation. Trusted only while
+		// fresh (FLIP_GUARD_TRUST_NS, not the 0.5 s position freeze) — before the first adoption or past the
+		// horizon, optical is the sole reference (a true re-acquisition) and nothing is a flip.
+		if (!m_gyro_ref_valid || (when_ns - m_gyro_ref_ns) >= FLIP_GUARD_TRUST_NS) {
 			return false;
 		}
-		// Disagreement past the flip threshold while the gyro is fresh: a mirror-flip OR the filter has
-		// locked into a wrong basin while its own (correct) optical keeps arriving. Distinguish by HOW LONG
-		// optical has been CONTINUOUSLY disagreeing:
+		const double dis = log_quat(cand.normalized() * m_gyro_ref_q.conjugate()).norm();
+		const double env = FLIP_GYRO_FLOOR_RAD + FLIP_GYRO_RATE_FRAC * m_gyro_ref_rot;
+		return dis > env;
+	}
+
+	bool
+	EskfFusion::reject_orientation_flip(const Quaterniond &cand, timepoint_ns when_ns)
+	{
+		if (!orientation_flip_vs_gyro(cand, when_ns)) {
+			m_last_orient_agree_ns = when_ns; // optical confirms the gyro (or re-seeds it) -> restart the clock
+			snapshot_gyro_ref(cand, when_ns); // adopted: the candidate becomes the new reference
+			return false;
+		}
+		// Disagreement past the gyro envelope while the reference is fresh: a mirror-flip OR the reference
+		// has locked into a wrong basin while its own (correct) optical keeps arriving. Distinguish by HOW
+		// LONG optical has been CONTINUOUSLY disagreeing:
 		//  - Optical absent (gap > FLIP_LOCKIN_RELEASE_NS, i.e. a dropout — empirically the normal optical
 		//    op interval is <=~p99 333 ms, dropouts are >500 ms): the gyro held ALONE through the gap, so the
 		//    disagreement is a fresh episode that just started — restart the clock to NOW and veto (a returning
@@ -1759,19 +1836,32 @@ namespace {
 		//  - Optical present + disagreeing within FLIP_LOCKIN_RELEASE_NS of the last evidence: a transient
 		//    one-off flip — veto.
 		//  - Optical present + disagreeing for LONGER than FLIP_LOCKIN_RELEASE_NS of continuous presence: the
-		//    filter, not optical, is the outlier — RELEASE the veto and adopt optical to re-seed.
+		//    reference, not optical, is the outlier — RELEASE the veto and adopt optical to re-seed.
 		const bool optical_was_absent =
 		    last_optical_ns == 0 || (when_ns - last_optical_ns) >= FLIP_LOCKIN_RELEASE_NS;
 		if (optical_was_absent || m_last_orient_agree_ns == 0) {
 			m_last_orient_agree_ns = when_ns; // gyro coasted alone (or reset): a fresh disagreement run
 		}
-		return (when_ns - m_last_orient_agree_ns) < FLIP_LOCKIN_RELEASE_NS; // veto until sustained
+		if ((when_ns - m_last_orient_agree_ns) < FLIP_LOCKIN_RELEASE_NS) {
+			return true; // veto until sustained (position-only, keep gyro orientation, reference held)
+		}
+		// Sustained dissent: the reference, not optical, was the outlier -> adopt/re-seed. INVARIANT:
+		// every adoption restarts the agree clock — adoption re-defines the basin, so the dissent run
+		// has ended by fiat. Without this, the clock stays >= FLIP_LOCKIN_RELEASE_NS old and the very
+		// next candidate disagreeing with the just-adopted basin is adopted too: alternating mirror
+		// twins ping-pong with ZERO vetoes until two consecutive frames agree. The fast path was
+		// accidentally repaired by its double call (the second call agreed with the re-seeded
+		// reference), but the OOSM rewind path replays with the stale clock checkpointed into the
+		// anchor — this restart makes the invariant explicit on both paths.
+		m_last_orient_agree_ns = when_ns;
+		snapshot_gyro_ref(cand, when_ns);
+		return false;
 	}
 
 	Quaterniond
 	EskfFusion::flip_guard(const Quaterniond &cand)
 	{
-		return reject_orientation_flip(cand, m_x.q, filter_time_ns) ? m_x.q : cand;
+		return reject_orientation_flip(cand, filter_time_ns) ? m_x.q : cand;
 	}
 
 	void
@@ -1891,6 +1981,10 @@ namespace {
 		c.accel_scale = m_accel_scale;
 		c.scale_bootstrapped = m_scale_bootstrapped;
 		c.gravity_corrected_q = m_gravity_corrected_q;
+		c.gyro_ref_q = m_gyro_ref_q;
+		c.gyro_ref_ns = m_gyro_ref_ns;
+		c.gyro_ref_rot = m_gyro_ref_rot;
+		c.gyro_ref_valid = m_gyro_ref_valid;
 		return c;
 	}
 
@@ -1930,6 +2024,10 @@ namespace {
 		m_accel_scale = c.accel_scale;
 		m_scale_bootstrapped = c.scale_bootstrapped;
 		m_gravity_corrected_q = c.gravity_corrected_q;
+		m_gyro_ref_q = c.gyro_ref_q;
+		m_gyro_ref_ns = c.gyro_ref_ns;
+		m_gyro_ref_rot = c.gyro_ref_rot;
+		m_gyro_ref_valid = c.gyro_ref_valid;
 	}
 
 	void
@@ -2090,10 +2188,10 @@ namespace {
 				U_LOG_E("Sustained anomalous IMU samples (%d) - resetting filter", m_imu_anomaly_count);
 				reset_filter_and_imu();
 				m_imu_anomaly_count = 0;
-			} else {
-				U_LOG_W("Rejected outlier IMU sample (glitch %d/%d), keeping filter",
-				        m_imu_anomaly_count, IMU_ANOMALY_RESET_RUN);
+				return false; // filter reset: replaying callers must abort (log cleared)
 			}
+			U_LOG_W("Rejected outlier IMU sample (glitch %d/%d), keeping filter",
+			        m_imu_anomaly_count, IMU_ANOMALY_RESET_RUN);
 			return true;
 		}
 		m_imu_anomaly_count = 0;
@@ -2189,7 +2287,14 @@ namespace {
 		// --- nominal integration ---
 		m_x.p += m_x.v * dt + 0.5 * a_world * dt * dt;
 		m_x.v += a_world * dt;
-		m_x.q = (m_x.q * exp_quat(w * dt)).normalized();
+		const Quaterniond dq_gyro = exp_quat(w * dt);
+		m_x.q = (m_x.q * dq_gyro).normalized();
+		// Dead-reckon the orientation-adoption veto's reference by the SAME body rate (bias/M_g-corrected),
+		// but untouched by folds/floods/speculative feeds -> a covariance-independent attitude truth.
+		if (m_gyro_ref_valid) {
+			m_gyro_ref_q = (m_gyro_ref_q * dq_gyro).normalized();
+			m_gyro_ref_rot += w.norm() * dt;
+		}
 
 		m_accel_world = a_world;
 		m_angvel_world = R * w;
@@ -3008,13 +3113,13 @@ namespace {
 			return true;
 		}
 
-		// Absolute pose measurement. Position is always folded; the optical ORIENTATION is folded only
-		// if it agrees with the gyro-propagated orientation — a fresh-gyro disagreement past
-		// FLIP_REJECT_RAD is a PnP mirror flip, so we do a position-only update and keep gyro orientation.
-		// reject_orientation_flip releases this veto on a SUSTAINED disagreement (filter-side lock-in).
+		// Absolute pose measurement. Position is always folded; the optical ORIENTATION is folded only if it
+		// agrees with the gyro dead-reckoned reference — a fresh-gyro disagreement past the measured envelope
+		// is a PnP mirror flip, so we do a position-only update and keep gyro orientation.
+		// reject_orientation_flip releases this veto on a SUSTAINED disagreement (reference-side lock-in).
 		const Vector3d dpos = pos - m_x.p;
 		const Vector3d dtheta = log_quat(orient * m_x.q.conjugate());
-		const bool ori_flip = reject_orientation_flip(orient, m_x.q, filter_time_ns);
+		const bool ori_flip = reject_orientation_flip(orient, filter_time_ns);
 
 		bool ok;
 		if (ori_flip) {
@@ -3121,12 +3226,21 @@ namespace {
 			return false; // superseded / older than the rewind horizon
 		}
 
+		// Replay loops are INDEX-based with a live bounds check and abort when integrate_imu_sample
+		// returns false: it can call reset_filter_and_imu() mid-replay (a checkpointed anomaly count
+		// completing a run of 10, or a non-finite state on the replayed trajectory), which clears
+		// m_imu_log — a range-for's saved iterators would then be invalidated (UB), and any further
+		// integration or anchor capture would resurrect the state the reset just discarded.
 		restore_checkpoint(m_anchor);
-		for (const ImuLogEntry &e : m_imu_log) {
-			if (e.sample.timestamp_ns > t_pose) {
+		for (size_t i = 0; i < m_imu_log.size(); i++) {
+			if (m_imu_log[i].sample.timestamp_ns > t_pose) {
 				break;
 			}
-			integrate_imu_sample(e.sample);
+			if (!integrate_imu_sample(m_imu_log[i].sample)) {
+				// Reset mid-rewind: anchor and log are gone; do NOT apply the lagged optical or
+				// re-capture an anchor from the reset state. The next in-order optical re-seeds.
+				return false;
+			}
 		}
 		propagate_to(t_pose);
 		apply();
@@ -3135,8 +3249,10 @@ namespace {
 		while (!m_imu_log.empty() && m_imu_log.front().sample.timestamp_ns <= t_pose) {
 			m_imu_log.pop_front();
 		}
-		for (const ImuLogEntry &e : m_imu_log) {
-			integrate_imu_sample(e.sample);
+		for (size_t i = 0; i < m_imu_log.size(); i++) {
+			if (!integrate_imu_sample(m_imu_log[i].sample)) {
+				break; // reset mid-tail-replay: the reset cleared the log and anchor validity
+			}
 		}
 		return true;
 	}
@@ -3163,10 +3279,14 @@ namespace {
 		m_imu_log.insert(at, ImuLogEntry{s});
 
 		// Rewind to the anchor and replay the (now-reordered) log forward: the late sample folds exactly as if
-		// it had arrived in order, and the filter clock returns to the latest sample as before.
+		// it had arrived in order, and the filter clock returns to the latest sample as before. Index-based +
+		// abort-on-reset for the same reason as apply_optical_at (a spliced anomaly can complete a run of 10
+		// mid-replay and clear the log under the loop).
 		restore_checkpoint(m_anchor);
-		for (const ImuLogEntry &e : m_imu_log) {
-			integrate_imu_sample(e.sample);
+		for (size_t i = 0; i < m_imu_log.size(); i++) {
+			if (!integrate_imu_sample(m_imu_log[i].sample)) {
+				break;
+			}
 		}
 	}
 
@@ -3224,9 +3344,9 @@ namespace {
 
 		std::lock_guard<std::mutex> lock(m_filter_lock);
 		set_op_hmd_pose(hmd_world_pose);
-		const bool gyro_fresh = tracked && last_optical_ns != 0 && (timestamp_ns - last_optical_ns) < FLIP_GUARD_TRUST_NS;
-		const bool pnp_flipped =
-		    gyro_fresh && log_quat(orient * m_x.q.normalized().conjugate()).norm() > FLIP_REJECT_RAD;
+		// Pre-filter the re-anchor cache against the gyro reference (pure test, no adoption side-effect):
+		// a flipped PnP must never become the divergence snap target. Same reference the fold veto uses.
+		const bool pnp_flipped = tracked && orientation_flip_vs_gyro(orient, timestamp_ns);
 		if (pnp_flipped || !optical_motion_plausible(pos, timestamp_ns) || !position_plausible(pos)) {
 			return;
 		}
@@ -3264,15 +3384,14 @@ namespace {
 				// must never be a mirror-flipped solve. The front-end's anisotropic prior cost down-ranks
 				// flips it can see, but offline (and during a stale-yaw dropout) one can slip
 				// through; as a filter-side second line, reject a candidate whose orientation grossly
-				// disagrees with the FRESH gyro-propagated filter orientation (the same gyro arbitration
-				// integrate_pose_measurement uses) from becoming the re-anchor reference. A flipped pose
-				// then cannot poison the re-anchor. Bootstrap (untracked, no gyro reference yet) always
-				// takes it — the plausibility gate below guards a bad bootstrap. Same lock-in release as
-				// the fold path: a SUSTAINED disagreement frees the gate so a correct pose can re-seed the
-				// re-anchor reference instead of being vetoed forever by a wrong-basin gyro.
-				const Quaterniond q_prior_filt = m_x.q.normalized();
+				// disagrees with the FRESH gyro DEAD-RECKONED reference (the same arbitration the fold uses,
+				// so the cache and the fold agree on this sample) from becoming the re-anchor reference. A
+				// flipped pose then cannot poison the re-anchor. Bootstrap (untracked, no gyro reference yet)
+				// always takes it — the plausibility gate below guards a bad bootstrap. Same lock-in release
+				// as the fold path: a SUSTAINED disagreement frees the gate so a correct pose can re-seed the
+				// re-anchor reference instead of being vetoed forever by a wrong-basin reference.
 				const bool pnp_flipped = tracked && reject_orientation_flip(orient.normalized(),
-				                                                            q_prior_filt, sample->timestamp_ns);
+				                                                            sample->timestamp_ns);
 				// A discontinuous solve that the controller could not physically have reached from the
 				// last optical anchor (covariance-and-time-scaled bound) must not become the re-anchor
 				// cache — that is the snap target a per-LED divergence will jump onto. The bound
@@ -3470,7 +3589,7 @@ namespace {
 		orient.normalize();
 
 		// IMU position dead-reckon is good only briefly; past OPTICAL_FREEZE_NS with no position-constraining
-		// fold, freeze position at last_good (gyro orientation lasts longer). G2_IMU_ONLY reports the dead-reckon
+		// fold, freeze position at last_good (gyro orientation lasts longer). KALMAN_IMU_ONLY reports the dead-reckon
 		// so the pure-inertial drift is visible.
 		const bool optical_stale =
 		    !m_imu_only &&

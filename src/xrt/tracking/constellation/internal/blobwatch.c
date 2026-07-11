@@ -31,15 +31,24 @@
 
 /* AVX2 row kernels for the two per-pixel passes (integral-image accumulation
  * and the dark-pixel scan): pure integer ops computing exactly the same values
- * element-for-element as the scalar remainder loops they sit above, so the
- * output is bit-identical to the scalar build by construction. AVX2 is assumed
- * present at runtime on x86-64 (x86-64-v3; every deployment/CI machine of this
- * project, incl. the production i9-12900K) — no runtime dispatch. Non-x86
- * builds compile the scalar loops only. */
+ * element-for-element as the scalar loops, so the output is bit-identical to
+ * the scalar path by construction. Selected once per process at library load
+ * via __builtin_cpu_supports("avx2") — pre-Haswell x86-64 and non-x86 builds
+ * run the scalar loops. */
 #if defined(__x86_64__) && defined(__GNUC__)
 #include <immintrin.h>
 #define BW_HAVE_AVX2 1
 #define BW_TARGET_AVX2 __attribute__((target("avx2")))
+
+/* Written exactly once, by the load-time constructor below, before any frame
+ * thread can exist; read (unsynchronized, safely) by the row kernels. */
+static bool bw_use_avx2 = false;
+
+__attribute__((constructor)) static void
+bw_select_row_kernels(void)
+{
+	bw_use_avx2 = __builtin_cpu_supports("avx2");
+}
 #else
 #define BW_HAVE_AVX2 0
 #define BW_TARGET_AVX2
@@ -422,6 +431,18 @@ blobwatch_new(uint8_t pixel_threshold, uint8_t cam_id)
 	if (!bw)
 		return NULL;
 
+	{
+		static bool kernels_logged = false;
+		if (!kernels_logged) {
+			kernels_logged = true;
+#if BW_HAVE_AVX2
+			U_LOG_I("blobwatch: row kernels: %s", bw_use_avx2 ? "AVX2 (runtime-selected)" : "scalar");
+#else
+			U_LOG_I("blobwatch: row kernels: scalar");
+#endif
+		}
+	}
+
 	memset(bw, 0, sizeof(*bw));
 	bw->next_blob_id = 1;
 	bw->cam_id = cam_id;
@@ -456,10 +477,10 @@ blobwatch_free(blobwatch *bw)
  * The pixels skipped over have no side effects in any caller, so vectorizing
  * this scan cannot change any output.
  */
-BW_TARGET_AVX2 static uint32_t
-next_pixel_above(const uint8_t *line, uint32_t x, uint32_t x_max, uint8_t threshold)
-{
 #if BW_HAVE_AVX2
+BW_TARGET_AVX2 static uint32_t
+next_pixel_above_avx2(const uint8_t *line, uint32_t x, uint32_t x_max, uint8_t threshold)
+{
 	const __m256i thr = _mm256_set1_epi8((char)threshold);
 	const __m256i zero = _mm256_setzero_si256();
 	while (x + 32 <= x_max) {
@@ -471,6 +492,20 @@ next_pixel_above(const uint8_t *line, uint32_t x, uint32_t x_max, uint8_t thresh
 			return x + (uint32_t)__builtin_ctz(above);
 		}
 		x += 32;
+	}
+	while (x < x_max && line[x] <= threshold) {
+		x++;
+	}
+	return x;
+}
+#endif
+
+static uint32_t
+next_pixel_above(const uint8_t *line, uint32_t x, uint32_t x_max, uint8_t threshold)
+{
+#if BW_HAVE_AVX2
+	if (bw_use_avx2) {
+		return next_pixel_above_avx2(line, x, x_max, threshold);
 	}
 #endif
 	while (x < x_max && line[x] <= threshold) {
@@ -484,13 +519,13 @@ next_pixel_above(const uint8_t *line, uint32_t x, uint32_t x_max, uint8_t thresh
  * uint32 addition is associative, so the in-register prefix scan produces
  * exactly the scalar running sum in every element.
  */
+#if BW_HAVE_AVX2
 BW_TARGET_AVX2 static void
-integral_row(const uint8_t *src, const uint32_t *prev, uint32_t *row, int w)
+integral_row_avx2(const uint8_t *src, const uint32_t *prev, uint32_t *row, int w)
 {
 	uint32_t run = 0;
 	int x = 0;
 	row[0] = 0; /* left border column */
-#if BW_HAVE_AVX2
 	const __m128i zero128 = _mm_setzero_si128();
 	__m256i vrun = _mm256_setzero_si256(); /* running total, broadcast in all 8 lanes */
 	for (; x + 16 <= w; x += 16) {
@@ -523,8 +558,25 @@ integral_row(const uint8_t *src, const uint32_t *prev, uint32_t *row, int w)
 		                    _mm256_add_epi32(v1, _mm256_loadu_si256((const __m256i *)(prev + x + 9))));
 	}
 	run = (uint32_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(vrun));
-#endif
 	for (; x < w; x++) {
+		run += src[x];
+		row[x + 1] = prev[x + 1] + run;
+	}
+}
+#endif
+
+static void
+integral_row(const uint8_t *src, const uint32_t *prev, uint32_t *row, int w)
+{
+#if BW_HAVE_AVX2
+	if (bw_use_avx2) {
+		integral_row_avx2(src, prev, row, w);
+		return;
+	}
+#endif
+	uint32_t run = 0;
+	row[0] = 0; /* left border column */
+	for (int x = 0; x < w; x++) {
 		run += src[x];
 		row[x + 1] = prev[x + 1] + run;
 	}
@@ -1635,9 +1687,9 @@ blobwatch_process_roi(blobwatch *bw,
 			char path[512];
 			// Encode cam, frame timestamp (ns, for IMU alignment in offline replay), exposure (the real
 			// controller exposure the matcher needs), source seq (groups the 4 cams of one frame), blobs.
-			snprintf(path, sizeof(path), "%s/cam%u_t%020lld_e%u_s%010lu_n%u.pgm", g_pgm_dump.dir,
-			         bw->cam_id, (long long)frame->timestamp, (unsigned)exposure,
-			         (unsigned long)frame->source_sequence, (unsigned)ob->num_blobs);
+			snprintf(path, sizeof(path), "%s/cam%u_t%020" PRId64 "_e%u_s%010" PRIu64 "_n%u.pgm",
+			         g_pgm_dump.dir, bw->cam_id, frame->timestamp, (unsigned)exposure,
+			         frame->source_sequence, (unsigned)ob->num_blobs);
 			g2_pgm_dump_enqueue(path, frame);
 		}
 	}

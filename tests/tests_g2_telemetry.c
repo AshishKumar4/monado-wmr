@@ -109,6 +109,7 @@ struct g2_telem_candidate
 	float yaw_sigma_rad;
 	float tilt_err_rad;
 	float yaw_err_rad;
+	float tilt_prior_nll;
 	float prior_pos_err_x, prior_pos_err_y, prior_pos_err_z;
 	float prior_rot_err_x, prior_rot_err_y, prior_rot_err_z;
 	float blob_var_mean_px2;
@@ -420,7 +421,7 @@ test_peak(const char *dir)
 	for (long i = 0; i < N_POSE; i++) {
 		g2_telem_pose_attempt(0, 0, (uint64_t)i, 10, 8, 7, 0.5f, pose, 1);
 		g2_telem_candidate(0, 0, (uint64_t)i, 3, 0, 1, 1, 1, 0x31, 10, 8, 2, 7, 0.5f, 1.0f, 1.5f, 1,
-		                  0.2f, 0.1f, 0.15f, err3, err3, 0.1f, 120.0f, 4.0f, pose);
+		                  0.2f, 0.1f, 0.15f, 2.5f, err3, err3, 0.1f, 120.0f, 4.0f, pose);
 		g2_telem_search(0, 0, (uint64_t)i, 1, 6, 0x35, 1, 12, 8, 4, 6, 32, 100, 50, 2, 1, 8, 5, 4, 7,
 		               0x31, 10, 8, 2, 0.5f, G2_SEARCH_BNG_REPROJ_FAIL, 0.0625f, 0.25f, 0.8f, 612, 1);
 		if ((i % CHUNK) == (CHUNK - 1)) {
@@ -634,6 +635,7 @@ test_offsets(const char *dir)
 	CHKOFF("candidate", g2_telem_candidate, match_flags);
 	CHKOFF("candidate", g2_telem_candidate, prior_cost);
 	CHKOFF("candidate", g2_telem_candidate, yaw_err_rad);
+	CHKOFF("candidate", g2_telem_candidate, tilt_prior_nll);
 	CHKOFF("candidate", g2_telem_candidate, prior_pos_err_z);
 	CHKOFF("candidate", g2_telem_candidate, qw);
 	CHKOFF("search", g2_telem_search, result);

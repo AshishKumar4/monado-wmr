@@ -1,3 +1,5 @@
+// Copyright 2026, G2-on-Linux project
+// SPDX-License-Identifier: BSL-1.0
 #pragma once
 
 #include "xrt/xrt_defines.h"
@@ -83,7 +85,14 @@ struct association_pose_hypothesis
 	float blob_brightness_mean;
 	float blob_area_mean;
 
+	//! Swing-twist split of the candidate-vs-prior rotation about gravity, computed once at pricing
+	//! time in the primary view's camera frame (valid iff tilt_valid): the single source for the
+	//! prior cost channels and for candidate telemetry.
 	float tilt_error_rad;
+	float yaw_error_rad;
+	//! Gravity-tilt channel of cost.orientation_prior_nll (same sigma/Huber/weight, yaw axis dropped):
+	//! the one prior objection that never drifts, charged unwaived by the recovery re-price.
+	float tilt_prior_nll;
 	bool tilt_valid;
 
 	struct association_cost_terms cost;

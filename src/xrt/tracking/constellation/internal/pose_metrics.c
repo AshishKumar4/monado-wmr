@@ -91,7 +91,18 @@ pose_metrics_prior_orient_cost(const struct xrt_quat *q_cand,
 {
 	double tilt_rad = 0.0, yaw_rad = 0.0;
 	pose_metrics_prior_orient_split(q_cand, q_prior, up, &tilt_rad, &yaw_rad);
+	return pose_metrics_prior_orient_cost_from_split(tilt_rad, yaw_rad, sigma_tilt_rad, sigma_yaw_rad,
+	                                                 huber_knee_sigma, weight);
+}
 
+double
+pose_metrics_prior_orient_cost_from_split(double tilt_rad,
+                                          double yaw_rad,
+                                          double sigma_tilt_rad,
+                                          double sigma_yaw_rad,
+                                          double huber_knee_sigma,
+                                          double weight)
+{
 	/* Anisotropic squared Mahalanobis distance. A non-positive sigma drops that axis (treated as +inf). */
 	double d2 = 0.0;
 	if (sigma_tilt_rad > 0.0) {
@@ -430,6 +441,10 @@ get_visible_leds_and_bounds(struct xrt_pose *pose,
 	int i;
 	struct t_constellation_led *leds = led_model->leds;
 	const int num_leds = led_model->num_leds;
+
+	/* Zero-visible outcomes (projection failure below, or every LED culled) must still leave a
+	 * defined rect: callers pass uninitialized stack storage and filter blobs against it. */
+	*bounds = (struct pose_rect){0};
 
 	/* Project LEDs into the distorted image space */
 	if (!project_led_points(led_model, calib, pose, led_out_positions, led_out_points)) {

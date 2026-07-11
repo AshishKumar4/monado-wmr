@@ -1,4 +1,4 @@
-// Copyright 2026, NVIDIA CORPORATION.
+// Copyright 2026, G2-on-Linux project
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file

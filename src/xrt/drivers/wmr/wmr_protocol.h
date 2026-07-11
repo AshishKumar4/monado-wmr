@@ -113,7 +113,7 @@ struct wmr_config_header
  */
 
 void
-vec3_from_hololens_accel(int32_t sample[3][4], int i, struct xrt_vec3 *out_vec);
+vec3_from_hololens_accel(int32_t sample[3][4], int i, float scale, struct xrt_vec3 *out_vec);
 
 void
 vec3_from_hololens_gyro(int16_t sample[3][32], int i, struct xrt_vec3 *out_vec);
@@ -130,32 +130,34 @@ read8(const unsigned char **buffer)
 static inline int16_t
 read16(const unsigned char **buffer)
 {
-	int16_t ret = (*(*buffer + 0) << 0) | //
-	              (*(*buffer + 1) << 8);
+	uint16_t ret = ((uint16_t) * (*buffer + 0) << 0) | //
+	               ((uint16_t) * (*buffer + 1) << 8);
 	*buffer += 2;
-	return ret;
+	return (int16_t)ret;
 }
 
 static inline int32_t
 read24(const unsigned char **buffer)
 {
 	// Note: Preserve sign by shifting up to write MSB
-	int32_t ret = (*(*buffer + 0) << 8) | (*(*buffer + 1) << 16) | (*(*buffer + 2) << 24);
+	uint32_t ret = ((uint32_t) * (*buffer + 0) << 8) |  //
+	               ((uint32_t) * (*buffer + 1) << 16) | //
+	               ((uint32_t) * (*buffer + 2) << 24);
 	*buffer += 3;
 
 	// restore 24 bit scale again
-	return ret >> 8;
+	return (int32_t)ret >> 8;
 }
 
 static inline int32_t
 read32(const unsigned char **buffer)
 {
-	int32_t ret = (*(*buffer + 0) << 0) |  //
-	              (*(*buffer + 1) << 8) |  //
-	              (*(*buffer + 2) << 16) | //
-	              (*(*buffer + 3) << 24);
+	uint32_t ret = ((uint32_t) * (*buffer + 0) << 0) |  //
+	               ((uint32_t) * (*buffer + 1) << 8) |  //
+	               ((uint32_t) * (*buffer + 2) << 16) | //
+	               ((uint32_t) * (*buffer + 3) << 24);
 	*buffer += 4;
-	return ret;
+	return (int32_t)ret;
 }
 
 static inline uint64_t

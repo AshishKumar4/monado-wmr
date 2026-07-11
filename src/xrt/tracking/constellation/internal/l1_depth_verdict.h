@@ -1,3 +1,5 @@
+// Copyright 2026, G2-on-Linux project
+// SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief  L1 multi-cam single-cam-depth dispute verdict (the pure decision core).

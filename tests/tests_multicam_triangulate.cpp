@@ -278,46 +278,6 @@ TEST_CASE("epipolar triangulation recovers the position from UNLABELLED blobs (F
 	REQUIRE(std::sqrt(dx * dx + dy * dy + dz * dz) < 0.02);
 }
 
-TEST_CASE("primary-labelled epipolar triangulation does not depend on a clean prior position")
-{
-	const std::vector<struct xrt_vec3> led_obj = {
-	    {-0.04f, 0.0f, 0.0f}, {0.04f, 0.0f, 0.0f}, {0.0f, 0.03f, 0.0f}, {0.0f, -0.03f, 0.0f}};
-	struct xrt_pose P_world_obj = {};
-	const struct xrt_vec3 up_axis = {0.f, 1.f, 0.f};
-	math_quat_from_angle_vector(0.25f, &up_axis, &P_world_obj.orientation);
-	P_world_obj.position = {0.12f, -0.04f, 1.15f};
-
-	const std::vector<struct xrt_pose> cam_poses = {
-	    make_cam_pose({-0.15f, 0.0f, 0.0f}, 0.12f),
-	    make_cam_pose({0.15f, 0.0f, 0.0f}, -0.12f),
-	};
-
-	Scene s = build_scene(led_obj, P_world_obj, cam_poses);
-	for (auto &b : s.blobs[1]) {
-		b.led_id = LED_INVALID_ID;
-	}
-	struct camera_model cam = make_pinhole();
-	std::vector<multicam_tri_view> views = make_views(s, cam_poses, cam);
-
-	struct xrt_pose bad_prior = P_world_obj;
-	bad_prior.position.z += 0.6f;
-	struct multicam_tri_result prior_seeded = {};
-	REQUIRE_FALSE(multicam_triangulate_epipolar_position(views.data(), (int)views.size(), &s.model,
-	                                                     &bad_prior, 0.0f, 0.30f, 0.06f, 2,
-	                                                     &prior_seeded));
-
-	struct multicam_tri_result res = {};
-	const bool ok = multicam_triangulate_primary_label_epipolar_position(
-	    views.data(), (int)views.size(), 0, &s.model, &P_world_obj.orientation, 0.0f, 2, &res);
-	REQUIRE(ok);
-	REQUIRE(res.num_views >= 2);
-	REQUIRE(res.num_leds >= 2);
-	const double dx = res.position.x - P_world_obj.position.x;
-	const double dy = res.position.y - P_world_obj.position.y;
-	const double dz = res.position.z - P_world_obj.position.z;
-	REQUIRE(std::sqrt(dx * dx + dy * dy + dz * dz) < 0.02);
-}
-
 TEST_CASE("epipolar triangulation declines on clutter that does not form the model (no false position)")
 {
 	const std::vector<struct xrt_vec3> led_obj = {

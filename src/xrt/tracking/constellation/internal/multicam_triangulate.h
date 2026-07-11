@@ -1,3 +1,5 @@
+// Copyright 2026, G2-on-Linux project
+// SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief  Per-LED multi-camera triangulation of a controller position (no full constellation / pose).
@@ -131,23 +133,6 @@ multicam_triangulate_epipolar_position(const struct multicam_tri_view *views,
                                        float model_gate_m,
                                        int min_leds,
                                        struct multicam_tri_result *out_result);
-
-/*!
- * Triangulate from one labelled primary view plus unlabelled secondary-view blobs. This is the depth-check
- * primitive for a single-camera pose lock: the committing camera already identified local LED ids, while a
- * co-visible camera may have raw blobs that the wrong-depth pose failed to label. The solve pairs each
- * labelled primary LED ray with raw rays from other views, then keeps only cross-LED origin estimates that
- * form a rigid controller under @p prior_orientation. It does not gate on prior position.
- */
-bool
-multicam_triangulate_primary_label_epipolar_position(const struct multicam_tri_view *views,
-                                                     int num_views,
-                                                     int primary_view,
-                                                     const struct t_constellation_led_model *leds_model,
-                                                     const struct xrt_quat *prior_orientation,
-                                                     float prior_yaw_sigma_rad,
-                                                     int min_leds,
-                                                     struct multicam_tri_result *out_result);
 
 #ifdef __cplusplus
 }

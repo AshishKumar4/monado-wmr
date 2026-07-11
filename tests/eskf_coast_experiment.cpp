@@ -1,4 +1,4 @@
-// Copyright 2026, NVIDIA CORPORATION.
+// Copyright 2026, G2-on-Linux project
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -278,7 +278,8 @@ struct Guard
 	std::string where;  // e.g. "bin 100-200ms"
 	std::string metric; // e.g. "pos_p95_cm"
 	double cur, base, tol;
-	bool gated; // false => reported only (bin too sparse to gate reliably)
+	bool gated;           // false => reported only (bin too sparse to gate reliably)
+	bool vanished = false; // baseline bin with no samples in the current run (always a regression)
 };
 
 // Tolerances. The replay is deterministic so these only need to absorb legitimate filter improvements
@@ -331,12 +332,30 @@ compare(const std::vector<BinMetrics> &bins, double reentry_snap_max_m, const cJ
 		guards.push_back({where, "frozen_pct", m.frozen_pct, jget(jb, "frozen_pct", &f),
 		                  FROZEN_ABS_TOL_PCT, m.n_all >= MIN_N_TO_GATE});
 	}
+	// A baseline bin with NO samples in the current run is a regression, never a free pass: the
+	// replay is deterministic, so a vanished bin means the coast-gap/fold distribution itself
+	// changed (e.g. the filter stopped reporting valid positions in that regime). A legitimate
+	// re-distribution goes through --update, visibly.
+	for (const cJSON *jb = jbins->child; jb != NULL; jb = jb->next) {
+		bool present = false;
+		for (const BinMetrics &m : bins) {
+			if (strcmp(key_for_label(m.label), jb->string) == 0) {
+				present = true;
+				break;
+			}
+		}
+		if (!present) {
+			bool f;
+			guards.push_back({std::string("bin ") + jb->string, "(vanished)", 0.0,
+			                  jget(jb, "n_all", &f), 0.0, true, true});
+		}
+	}
 	bool snap_found;
 	double snap_base = jget(baseline, "reentry_snap_max_cm", &snap_found);
 	guards.push_back({"global", "reentry_snap_max_cm", reentry_snap_max_m * 100, snap_base,
 	                  SNAP_ABS_TOL_CM, snap_found});
 	for (Guard &gd : guards) {
-		if (gd.gated && gd.cur - gd.base > gd.tol)
+		if (gd.gated && (gd.vanished || gd.cur - gd.base > gd.tol))
 			ok = false;
 	}
 	return ok;
@@ -348,7 +367,7 @@ print_guard_table(const std::vector<Guard> &guards)
 	printf("%-16s %-14s %9s %9s %9s  %s\n", "where", "metric", "current", "baseline", "tol", "status");
 	printf("%s\n", std::string(72, '-').c_str());
 	for (const Guard &g : guards) {
-		const bool fail = g.gated && g.cur - g.base > g.tol;
+		const bool fail = g.gated && (g.vanished || g.cur - g.base > g.tol);
 		const char *status = !g.gated ? "report" : (fail ? "FAIL" : "ok");
 		printf("%-16s %-14s %9.2f %9.2f %9.2f  %s%s\n", g.where.c_str(), g.metric.c_str(), g.cur, g.base,
 		       g.tol, status, fail ? "  <== REGRESSION" : "");
@@ -574,6 +593,14 @@ main(int argc, char **argv)
 			        check_path.c_str());
 			return EXIT_SKIP;
 		}
+		if (samples.empty()) {
+			// The fixture loaded but the filter produced ZERO gateable coast samples (e.g. it
+			// regressed to never setting POSITION_VALID). An empty run must never PASS.
+			fprintf(stderr,
+			        "RESULT: FAIL -- zero coast samples collected; the gate has no evidence to pass on\n");
+			cJSON_Delete(baseline);
+			return 1;
+		}
 		std::vector<Guard> guards;
 		const bool ok = compare(bins, reentry_snap_max_m, baseline, guards);
 		cJSON_Delete(baseline);
@@ -583,6 +610,14 @@ main(int argc, char **argv)
 		       "snap <= +%.0fcm; sparse bins (n<%d) reported not gated\n",
 		       POS_REL_TOL * 100, POS_ABS_TOL_CM, FLIP_ABS_TOL_PCT, FROZEN_ABS_TOL_PCT, SNAP_ABS_TOL_CM,
 		       MIN_N_TO_GATE);
+		size_t n_gated = 0;
+		for (const Guard &gd : guards) {
+			n_gated += gd.gated ? 1 : 0;
+		}
+		if (n_gated == 0) {
+			printf("\nRESULT: FAIL -- no guard was gateable (zero gated evidence); refusing to pass\n");
+			return 1;
+		}
 		if (!ok) {
 			printf("\nRESULT: FAIL -- a guarded coast metric regressed beyond tolerance\n");
 			return 1;

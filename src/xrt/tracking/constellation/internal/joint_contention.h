@@ -1,3 +1,5 @@
+// Copyright 2026, G2-on-Linux project
+// SPDX-License-Identifier: BSL-1.0
 #pragma once
 
 #include "pose_metrics.h"

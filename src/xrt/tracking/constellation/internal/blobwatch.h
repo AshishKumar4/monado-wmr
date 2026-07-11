@@ -26,7 +26,7 @@ extern "C" {
 #define LED_NOISE_ID ((uint16_t)(-2))
 #define LED_LOCAL_ID(l) (((l) == LED_INVALID_ID) ? (l) : (l) & 0xFF)
 #define LED_OBJECT_ID(l) (((l) == LED_INVALID_ID) ? (l) : (l) >> 8)
-#define LED_MAKE_ID(o, n) ((uint16_t)((uint16_t)(o)) << 8 | ((uint16_t)(n)))
+#define LED_MAKE_ID(o, n) ((uint16_t)(((uint16_t)(o) << 8) | ((n)&0xFF)))
 
 /* 0x24 works much better for Rift CV1, but the threshold needs
  * to be higher for DK2 which has more background bleed and bigger

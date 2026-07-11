@@ -141,8 +141,12 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 				${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/telemetry/regression_check.py
 				--bin $<TARGET_FILE:offline_vio_replay> --baseline
 				${CMAKE_CURRENT_SOURCE_DIR}/regression_baseline.json)
-	set_tests_properties(regression_benchmark PROPERTIES ENVIRONMENT "PYTHONNOUSERSITE=1" LABELS
-															 g2_regression)
+	# regression_check.py exits 77 on every skip path (missing scoring deps / capture / binary /
+	# controller jsons / baseline), mirroring coast_regression below: a capture-less checkout
+	# reports a LOUD ctest SKIP, never a silent pass.
+	set_tests_properties(
+		regression_benchmark PROPERTIES ENVIRONMENT "PYTHONNOUSERSITE=1" SKIP_RETURN_CODE 77 LABELS
+										g2_regression)
 
 	# Inertial coast-drift experiment + GATE: real ESKF on recorded IMU + optical (also with withheld-
 	# optical windows) to measure out-of-view dead-reckon drift, the frozen fraction, and the re-entry
@@ -246,6 +250,16 @@ target_link_libraries(tests_g2_telemetry PRIVATE Threads::Threads)
 target_compile_definitions(tests_g2_telemetry PRIVATE _GNU_SOURCE) # pthread_setname_np in os_threading.h
 add_test(NAME tests_g2_telemetry COMMAND tests_g2_telemetry ${CMAKE_CURRENT_BINARY_DIR}/g2_telem_test_out)
 set_target_properties(tests_g2_telemetry PROPERTIES FOLDER monado_tests)
+
+# Standalone C-mode compile + exercise of the wmr_protocol.h byte readers (own main; guards the
+# sign-extension contract and keeps the header C11-clean for negative device bytes — audit R4#3).
+add_executable(tests_wmr_protocol tests_wmr_protocol.c)
+target_include_directories(
+	tests_wmr_protocol PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/drivers
+							   ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/include
+							   ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/auxiliary)
+add_test(NAME tests_wmr_protocol COMMAND tests_wmr_protocol)
+set_target_properties(tests_wmr_protocol PROPERTIES FOLDER monado_tests)
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(

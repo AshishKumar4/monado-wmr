@@ -1,3 +1,5 @@
+// Copyright 2026, G2-on-Linux project
+// SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief  Kept-alive two-mode yaw belief for pure-yaw mirror ambiguities.

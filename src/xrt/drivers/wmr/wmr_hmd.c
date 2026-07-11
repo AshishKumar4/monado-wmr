@@ -38,6 +38,7 @@
 #include "util/u_distortion_mesh.h"
 #include "util/u_sink.h"
 #include "util/u_file.h"
+#include "util/u_json.h"
 #include "util/u_g2_telemetry.h"
 
 #ifdef XRT_OS_LINUX
@@ -396,7 +397,7 @@ hololens_handle_sensors_avg(struct wmr_hmd *wh, const unsigned char *buffer, int
 	for (int i = 0; i < IMU_SAMPLES_PER_PACKET; i++) {
 		struct xrt_vec3 a = XRT_VEC3_ZERO;
 		struct xrt_vec3 g = XRT_VEC3_ZERO;
-		vec3_from_hololens_accel(wh->packet.accel, i, &a);
+		vec3_from_hololens_accel(wh->packet.accel, i, wh->accel_scale, &a);
 		vec3_from_hololens_gyro(wh->packet.gyro, i, &g);
 		math_vec3_accum(&a, &avg_raw_accel);
 		math_vec3_accum(&g, &avg_raw_gyro);
@@ -451,7 +452,7 @@ hololens_handle_sensors_all(struct wmr_hmd *wh, const unsigned char *buffer, int
 
 		struct xrt_vec3 *ra = &raw_accel[i];
 		struct xrt_vec3 *ca = &calib_accel[i];
-		vec3_from_hololens_accel(wh->packet.accel, i, ra);
+		vec3_from_hololens_accel(wh->packet.accel, i, wh->accel_scale, ra);
 		math_matrix_3x3_transform_vec3(&wh->config.sensors.accel.mix_matrix, ra, ca);
 		math_vec3_accum(&wh->config.sensors.accel.bias_offsets, ca);
 		math_quat_rotate_vec3(&wh->config.sensors.transforms.P_oxr_acc.orientation, ca, ca);
@@ -1977,6 +1978,29 @@ get_compositor_info_wmr(struct xrt_device *xdev,
 	return XRT_SUCCESS;
 }
 
+/* Optional per-device refinement of the absolute accel scale: wmr/accel-scale.json in the
+ * config dir, {"accel_scale": <LSB -> m/s^2>}, written by a clean still-capture calibration. */
+static void
+wmr_hmd_load_accel_scale(struct wmr_hmd *wh)
+{
+	FILE *f = u_file_open_file_in_config_dir_subpath("wmr", "accel-scale.json", "r");
+	if (f == NULL) {
+		return;
+	}
+	char buf[256] = {0};
+	size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	cJSON *json = cJSON_Parse(buf);
+	float v = 0.0f;
+	if (n > 0 && json != NULL && u_json_get_float(u_json_get(json, "accel_scale"), &v) && v > 0.0f) {
+		wh->accel_scale = v;
+		WMR_INFO(wh, "Per-device accel scale %.6g loaded from config (wmr/accel-scale.json)", v);
+	} else {
+		WMR_WARN(wh, "wmr/accel-scale.json present but invalid; keeping accel scale %.6g", wh->accel_scale);
+	}
+	cJSON_Delete(json);
+}
+
 void
 wmr_hmd_create(enum wmr_headset_type hmd_type,
                struct os_hid_device *hid_holo,
@@ -2137,6 +2161,15 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 		// Other WMR models stay 0 (unverified) — consumers fall back.
 		wh->base.hmd->screens[0].vsync_to_photons_ns = 15668000;
 	}
+
+	/* Absolute accel scale (LSB -> m/s^2). The nominal WMR 0.001 reads the Reverb G2's at-rest
+	 * magnitude ~1.8% high (|a| ~9.98 vs 9.80665, consistent across captures); the factory
+	 * mix-matrix is ~unity and Basalt only estimates accel bias (never scale), so the measured
+	 * 0.000982 = 0.001 * (9.80665/9.984) is per-DEVICE calibration and this is its single home,
+	 * fixing the SLAM and 3DOF paths at once. Other models keep the nominal scale (the G2
+	 * correction is unvalidated for them); wmr/accel-scale.json refines it without a rebuild. */
+	wh->accel_scale = (wh->hmd_desc->hmd_type == WMR_HEADSET_REVERB_G2) ? 0.000982f : 0.001f;
+	wmr_hmd_load_accel_scale(wh);
 
 	// Fill in blend mode - just opqaue, unless we get Hololens support one day.
 	size_t idx = 0;

@@ -429,6 +429,14 @@ tilt_clamped_pnp(const std::vector<cv::Point3f> &p3d,
 		}
 	}
 
+	/* KNOWN, CALIBRATED-IN: this GN has no step acceptance, so it can end on a
+	 * cost-increasing final step (the divergence break fires one iteration late).
+	 * The audit's best-so-far rollback (R1-L8) was implemented and REFUTED on the
+	 * frozen matrices — xv1/bursts-long objective 40.10->39.24 (dev1), 39.28->38.57
+	 * (dev2); the downstream selection stack is calibrated WITH this behavior.
+	 * See results/w3-preupstream-20260711/l8-tilt-rollback-adjudication/. Re-open
+	 * only inside the W5 analytic-Jacobian rework of this solver, matrix-gated. */
+
 	if (t.at<double>(2) <= 0.0) {
 		return false;
 	}
@@ -530,6 +538,8 @@ ransac_pnp_pose_with_twin(struct xrt_pose *pose,
 		if (LED_OBJECT_ID(led_id) != leds_model->id)
 			continue; /* invalid or LED id for another object */
 		led_id = LED_LOCAL_ID(led_id);
+		if (led_id < 0 || led_id >= leds_model->num_leds || led_id >= 64)
+			continue; /* corrupt label: out of model range / taken-mask width */
 
 		if (taken & (1ULL << led_id))
 			continue;
@@ -552,6 +562,8 @@ ransac_pnp_pose_with_twin(struct xrt_pose *pose,
 		if (LED_OBJECT_ID(led_id) != leds_model->id)
 			continue; /* invalid or LED id for another object */
 		led_id = LED_LOCAL_ID(led_id);
+		if (led_id < 0 || led_id >= leds_model->num_leds || led_id >= 64)
+			continue; /* corrupt label: out of model range / taken-mask width */
 		if (taken & (1ULL << led_id))
 			continue;
 		taken |= (1ULL << led_id);

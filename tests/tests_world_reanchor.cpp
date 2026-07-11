@@ -67,6 +67,7 @@ struct Fixture
 	double worst_event_t = 0.0;
 	std::vector<double> events;
 	std::vector<Stream> streams;
+	bool file_present = false; //!< the fixture file opened (distinguishes missing from corrupt)
 	bool loaded = false;
 };
 
@@ -79,6 +80,7 @@ load_fixture()
 	if (f == nullptr) {
 		return fx;
 	}
+	fx.file_present = true;
 	auto rd = [&](void *dst, size_t sz) { return fread(dst, 1, sz, f) == sz; };
 	uint64_t magic = 0;
 	uint32_t n_events = 0;
@@ -382,12 +384,15 @@ TEST_CASE("world_reanchor_basics")
 TEST_CASE("world_reanchor_recorded_streams")
 {
 	Fixture fx = load_fixture();
-	if (!fx.loaded) {
-		WARN("fixture data/b2_reanchor_head_streams.bin missing; recorded-stream validation skipped");
-		return;
+	if (!fx.file_present) {
+		SKIP("fixture data/b2_reanchor_head_streams.bin missing; recorded-stream validation skipped");
 	}
+	// Present but corrupt/truncated must FAIL, never skip: a bad fixture regen would otherwise
+	// silently green the whole recorded-stream/parity battery.
+	INFO("fixture data/b2_reanchor_head_streams.bin present but corrupt/truncated");
+	REQUIRE(fx.loaded);
 	REQUIRE(fx.events.size() == 54);
-	REQUIRE(fx.streams.size() == 3);
+	REQUIRE(fx.streams.size() == 4);
 
 	// Pinned worst-event bounds (the reference simulator's numbers on these streams at the
 	// production parameters; raw step 819 mm / 59.3 deg).
@@ -426,7 +431,8 @@ TEST_CASE("world_reanchor_recorded_streams")
 			}
 
 			check_hard_properties(fx, st, po, bounds_pos(st.name), bounds_ang(st.name),
-			                      /*check_purity=*/st.name != "syn", /*conv_bound_s=*/0.8);
+			                      /*check_purity=*/st.name != "syn" && st.name != "skw",
+			                      /*conv_bound_s=*/0.8);
 		}
 
 		DYNAMIC_SECTION("production configuration (IMU-derived speed floor): " << st.name)
@@ -439,9 +445,10 @@ TEST_CASE("world_reanchor_recorded_streams")
 			// v0 = 1 m/s floor needs (636-100) mm / 1 m/s + tau*ln — ~0.93 s structurally, so
 			// that one harsher-than-designed combination gets its own derived 1.0 s bound.
 			PortOut po = run_port(st, /*use_sim_speed=*/false);
+			const bool injected = st.name == "syn" || st.name == "skw";
 			check_hard_properties(fx, st, po, bounds_pos(st.name), bounds_ang(st.name),
-			                      /*check_purity=*/st.name != "syn",
-			                      /*conv_bound_s=*/st.name == "syn" ? 1.0 : 0.8);
+			                      /*check_purity=*/!injected,
+			                      /*conv_bound_s=*/injected ? 1.0 : 0.8);
 		}
 	}
 
@@ -460,4 +467,25 @@ TEST_CASE("world_reanchor_recorded_streams")
 	REQUIRE(peak_ang <= 90.0 + 1e-9);
 	REQUIRE(peak_pos <= 1.5 + 1e-9);
 	REQUIRE(peak_ang > 80.0); // the two 59 deg jumps really did stack (grazes the cap)
+
+	// R2#1 commutator regression: the skew-axis stream's second 59 deg jump lands 0.3 s into
+	// the worst event's glide about an axis perpendicular to the first. dq maps raw->presented,
+	// so the excess must RIGHT-compose (dq_new = dq_old*R_exc^-1); the refuted left-composition
+	// presented the commutator as a 30.3 deg single-frame step here, while correct composition
+	// glides at 3.4 deg (reference simulator, both compositions, on this exact stream).
+	const Stream &skw = fx.streams[3];
+	REQUIRE(skw.name == "skw");
+	PortOut pk = run_port(skw, true);
+	double skew_step = 0.0;
+	double skew_peak_ang = 0.0;
+	for (size_t i = 1; i < skw.rows.size(); i++) {
+		skew_peak_ang = fmax(skew_peak_ang, pk.dq_ang[i]);
+		if (fabs(skw.rows[i].t - (fx.worst_event_t + 0.3)) <= 0.06) {
+			skew_step = fmax(skew_step, quat_step_deg(pk.presented[i - 1], pk.presented[i]));
+		}
+	}
+	INFO("skew second-event max presented frame-step " << skew_step << " deg, peak delta " << skew_peak_ang
+	                                                   << " deg");
+	REQUIRE(skew_peak_ang > 60.0); // the second jump really was absorbed mid-glide (overlap happened)
+	REQUIRE(skew_step <= 8.0);     // no commutator jump: presented stays glide-smooth
 }

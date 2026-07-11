@@ -14,7 +14,8 @@
 
 #include "u_world_reanchor.h"
 
-#include <math.h>
+#include "math/m_mathinclude.h"
+
 #include <string.h>
 
 const struct u_world_reanchor_params u_world_reanchor_default_params = {
@@ -212,11 +213,17 @@ u_world_reanchor_update(struct u_world_reanchor *wr,
 
 	bool absorbed = false;
 	if (st.exc_ang_deg > 0.0) {
-		/* Compose the step's excess fraction, inverted, into dq. */
+		/* Compose the step's excess fraction, inverted, into dq. The excess rotation
+		 * R_exc lives in the RAW world frame (step = q1*q0^-1) while dq maps raw ->
+		 * presented (presented_q = dq*raw_q), so exact continuity at the event
+		 * (dq_new*q1 == dq_old*q0) requires RIGHT-composition: dq_new = dq_old*R_exc^-1.
+		 * Left-composition only agrees when dq is identity or the axes commute — a
+		 * second re-anchor mid-glide on a skew axis would present the commutator as a
+		 * spurious jump (audit 2026-07-10 R2#1). */
 		double inv_exc[4];
 		quat_axis_angle(st.axis, -DEG2RAD * st.exc_ang_deg, inv_exc);
 		double dq_new[4];
-		qmul(inv_exc, wr->dq, dq_new);
+		qmul(wr->dq, inv_exc, dq_new);
 		memcpy(wr->dq, dq_new, sizeof(dq_new));
 		absorbed = true;
 	}

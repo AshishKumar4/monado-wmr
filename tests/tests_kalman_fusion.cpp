@@ -1,4 +1,4 @@
-// Copyright 2026, NVIDIA CORPORATION.
+// Copyright 2026, G2-on-Linux project
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -3635,15 +3635,99 @@ TEST_CASE("kalman: flip-guard rejects an optical flip through a multi-second dro
 	CHECK(quat_abs_dot(rel.pose.orientation, q_flip) < 0.5f);        // did NOT adopt the flip
 }
 
-TEST_CASE("kalman: G2_IMU_ONLY runs pure inertial after the bootstrap window")
+TEST_CASE("kalman: release-adopt restarts the agree clock so an alternating mirror twin is vetoed")
+{
+	// Sustained-dissent release: when optical disagrees with the gyro reference CONTINUOUSLY for longer
+	// than the lock-in window, the reference (not optical) is the outlier and the candidate is ADOPTED.
+	// INVARIANT under test: adoption restarts the agree clock. If it does not, the very next candidate
+	// disagreeing with the just-adopted basin also satisfies the release test and is adopted too —
+	// alternating mirror twins then ping-pong with ZERO vetoes (a post-release veto-disarm window).
+	// Covered on both arbitration paths: the fast path (optical at the filter clock) and the OOSM
+	// rewind path (lagged optical, where the checkpoint used to persist the stale clock durably).
+	const bool lagged = GENERATE(false, true);
+	CAPTURE(lagged);
+
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+	const int64_t dt = DT_NS;
+	int64_t ts = 1000000;
+	const xrt_vec3 pos{0.2f, 0.0f, 0.5f};
+	const xrt_vec3 a_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC); // yaw-invariant: valid in both basins
+	// A pure-yaw mirror flip: well past the veto envelope, gravity-consistent at rest.
+	const xrt_quat q_flip = quat_axis_angle({0.0f, 1.0f, 0.0f}, (float)M_PI);
+	const int64_t lag = lagged ? 30 * dt : 0; // 60 ms staleness -> every optical takes the rewind path
+
+	// Feed one optical per 10 IMU samples (20 ms cadence, far under the 500 ms lock-in release window),
+	// lagged by `lag` behind the IMU clock so the OOSM variant genuinely rewinds and replays. A tight
+	// optical orientation variance (the front-end passes real variances too) makes an ADOPTED fold
+	// converge within a few frames, so adopted-vs-vetoed is sharply observable in the output.
+	const xrt_vec3 tight_ori_var = {1e-4f, 1e-4f, 1e-4f};
+	auto run_block = [&](const xrt_quat &q_opt, int n_optical) {
+		for (int o = 0; o < n_optical; o++) {
+			for (int i = 0; i < 10; i++) {
+				feed_imu(kf.get(), ts, a_rest, ZERO_VEC);
+				ts += dt;
+			}
+			xrt_pose_sample ps{};
+			ps.timestamp_ns = ts - lag;
+			ps.pose.position = pos;
+			ps.pose.orientation = q_opt;
+			kf->process_pose(&ps, nullptr, &tight_ori_var, 15.0f, nullptr);
+		}
+	};
+
+	run_block(IDENTITY_QUAT, 50); // lock in: agreeing optical for ~1 s, reference = identity basin
+
+	xrt_space_relation rel{};
+	kf->get_prediction(ts, &rel, nullptr);
+	REQUIRE(quat_abs_dot(rel.pose.orientation, IDENTITY_QUAT) > 0.9f);
+
+	// Sustained dissent: flipped optical, continuously present, until the RELEASE fires. Every vetoed
+	// fold is position-only and the gyro is zero, so during the veto phase the reported orientation
+	// stays EXACTLY at identity; the very first movement off identity IS the release-adopting fold.
+	// Catching that exact fold matters: the disarm window under test is one optical wide — the next
+	// same-basin optical would AGREE with the re-seeded reference and restart the clock anyway (that
+	// agree-path restart is what masks the defect a few frames later).
+	bool released = false;
+	for (int o = 0; o < 60 && !released; o++) { // 60 x 20 ms >> the 500 ms release window
+		run_block(q_flip, 1);
+		kf->get_prediction(ts, &rel, nullptr);
+		released = quat_abs_dot(rel.pose.orientation, IDENTITY_QUAT) < 0.9998f;
+	}
+	REQUIRE(released);
+
+	// The ALTERNATING MIRROR TWIN evidence, immediately after the release-adopt and for LESS than the
+	// release window: every sample disagrees with the just-adopted basin, so every sample must be
+	// VETOED (position-only -> the orientation must not move at all). Without the clock restart, the
+	// FIRST twin satisfies the release test the moment it arrives (the dissent clock is still >=
+	// 500 ms old), is adopted, re-seeds the reference, and every following twin then agrees — the
+	// whole block folds with ZERO vetoes and drags the estimate straight back to identity.
+	const float flip_dot_0 = quat_abs_dot(rel.pose.orientation, q_flip);
+	run_block(IDENTITY_QUAT, 20); // 400 ms of twin evidence: under the 500 ms release window
+	kf->get_prediction(ts, &rel, nullptr);
+	CHECK(quat_abs_dot(rel.pose.orientation, q_flip) >= flip_dot_0 - 0.005f); // all vetoed: no pull-back
+
+	// Continued same-basin evidence agrees with the held reference and keeps converging onto it.
+	run_block(q_flip, 60);
+	kf->get_prediction(ts, &rel, nullptr);
+	CHECK(quat_abs_dot(rel.pose.orientation, q_flip) > 0.9f);
+
+	// And the fix must not create a lock-out: the SAME sustained-dissent release still frees a
+	// genuinely wrong basin — ~3 s of continuous twin evidence is adopted and re-converges.
+	run_block(IDENTITY_QUAT, 150);
+	kf->get_prediction(ts, &rel, nullptr);
+	CHECK(quat_abs_dot(rel.pose.orientation, IDENTITY_QUAT) > 0.9f);
+}
+
+TEST_CASE("kalman: KALMAN_IMU_ONLY runs pure inertial after the bootstrap window")
 {
 	// Diagnostic mode: optical locks the filter for the bootstrap window, then ALL optical is ignored and
 	// the filter runs on the IMU alone. Verify a post-window optical jump is NOT adopted.
-	setenv("G2_IMU_ONLY", "1", 1);
-	setenv("G2_IMU_ONLY_BOOTSTRAP_S", "0.2", 1); // 0.2 s window for the test
+	setenv("KALMAN_IMU_ONLY", "1", 1);
+	setenv("KALMAN_IMU_ONLY_BOOTSTRAP_S", "0.2", 1); // 0.2 s window for the test
 	auto kf = KalmanFusionInterface::create();
-	unsetenv("G2_IMU_ONLY");
-	unsetenv("G2_IMU_ONLY_BOOTSTRAP_S");
+	unsetenv("KALMAN_IMU_ONLY");
+	unsetenv("KALMAN_IMU_ONLY_BOOTSTRAP_S");
 	REQUIRE(kf != nullptr);
 	const int64_t dt = DT_NS;
 	int64_t ts = 1000000;
@@ -3674,11 +3758,11 @@ TEST_CASE("kalman: ZUPT zeros residual velocity at rest so pure-inertial positio
 	// A rotation/motion leaves a residual velocity; with no optical it would integrate into unbounded
 	// drift. ZUPT must zero it at rest so position holds. (Run in IMU-only so get_prediction exposes the
 	// dead-reckoned position instead of freezing it, and optical never re-corrects the velocity.)
-	setenv("G2_IMU_ONLY", "1", 1);
-	setenv("G2_IMU_ONLY_BOOTSTRAP_S", "0.2", 1);
+	setenv("KALMAN_IMU_ONLY", "1", 1);
+	setenv("KALMAN_IMU_ONLY_BOOTSTRAP_S", "0.2", 1);
 	auto kf = KalmanFusionInterface::create();
-	unsetenv("G2_IMU_ONLY");
-	unsetenv("G2_IMU_ONLY_BOOTSTRAP_S");
+	unsetenv("KALMAN_IMU_ONLY");
+	unsetenv("KALMAN_IMU_ONLY_BOOTSTRAP_S");
 	REQUIRE(kf != nullptr);
 	const int64_t dt = DT_NS;
 	int64_t ts = 1000000;
@@ -3795,11 +3879,11 @@ TEST_CASE("kalman: velocity divergence watchdog bounds an unphysical dead-reckon
 {
 	// A sustained large acceleration with no optical would dead-reckon to an impossible speed; the
 	// watchdog must clamp it to ~OPTICAL_MAX_SPEED_M_S (12) so the reported pose cannot fly off.
-	setenv("G2_IMU_ONLY", "1", 1);
-	setenv("G2_IMU_ONLY_BOOTSTRAP_S", "0.1", 1);
+	setenv("KALMAN_IMU_ONLY", "1", 1);
+	setenv("KALMAN_IMU_ONLY_BOOTSTRAP_S", "0.1", 1);
 	auto kf = KalmanFusionInterface::create();
-	unsetenv("G2_IMU_ONLY");
-	unsetenv("G2_IMU_ONLY_BOOTSTRAP_S");
+	unsetenv("KALMAN_IMU_ONLY");
+	unsetenv("KALMAN_IMU_ONLY_BOOTSTRAP_S");
 	REQUIRE(kf != nullptr);
 	const int64_t dt = DT_NS;
 	int64_t ts = 1000000;
@@ -4432,8 +4516,8 @@ TEST_CASE("kalman: real recorded session corpus replays stay finite and bounded"
 	// the inputs are recorded from hardware, not synthesised from the filter's own model.
 	const std::vector<std::string> fixtures = g2replay::list_fixtures(G2_TEST_DATA_DIR);
 	if (fixtures.empty()) {
-		SUCCEED("no .replay fixtures present (data dir absent) - skipping real-data corpus");
-		return;
+		// Loud, visible skip -- SUCCEED here silently greened a fixture-less checkout.
+		SKIP("no .replay fixtures present (data dir absent) - real-data corpus not run");
 	}
 	for (const std::string &path : fixtures) {
 		g2replay::Dataset ds;
@@ -5637,6 +5721,81 @@ TEST_CASE("kalman: an out-of-horizon late IMU sample is folded best-effort witho
 	kf->get_prediction(t, &recov, nullptr);
 	CHECK(recov.pose.position.x == Approx(home.x).margin(0.05));
 	CHECK((recov.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0);
+}
+
+TEST_CASE("kalman: a filter reset fired inside an OOSM replay aborts the replay safely")
+{
+	// The IMU log legitimately holds up to 9 samples of an interrupted anomaly run (each returned
+	// \"rejected, keeping filter\" and was pushed). A rewind-replay can then complete the run of 10 —
+	// reset_filter_and_imu() fires INSIDE the replay loop and clears the very deque being iterated.
+	// The loops must abort on the reset (index-based + integrate_imu_sample returning false), never
+	// touch invalidated iterators, and never re-capture an anchor from the reset state. Post-reset the
+	// filter must be honestly UNTRACKED, finite, and cleanly re-lockable.
+	auto kf = KalmanFusionInterface::create();
+	REQUIRE(kf != nullptr);
+	const int64_t dt = DT_NS;
+	int64_t ts = 1000000;
+	const xrt_vec3 home{0.2f, 0.0f, 0.5f};
+	const xrt_vec3 a_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	const xrt_vec3 a_glitch = {2000.0f, 2000.0f, 2000.0f}; // impossible rate: the anomaly class
+	for (int i = 0; i < 80; i++) { // lock on at rest
+		feed_pose(kf.get(), ts, home, IDENTITY_QUAT);
+		feed_imu(kf.get(), ts, a_rest, ZERO_VEC);
+		ts += dt;
+	}
+	feed_pose(kf.get(), ts, home, IDENTITY_QUAT); // in-order optical: anchor here, log cleared
+
+	SECTION("a spliced late anomaly completes a logged run of 10 mid-replay")
+	{
+		// Log after this block: [good x5, anomaly x9, good]. In-order the run never reached 10 (the
+		// trailing good sample zeroed the count at 9).
+		for (int i = 1; i <= 5; i++) {
+			feed_imu(kf.get(), ts + i * dt, a_rest, ZERO_VEC);
+		}
+		const int64_t t_run = ts + 5 * dt;
+		for (int i = 1; i <= 9; i++) { // anomalies never advance the filter clock
+			feed_imu(kf.get(), t_run + i * (dt / 32), a_rest, a_glitch);
+		}
+		feed_imu(kf.get(), ts + 6 * dt, a_rest, ZERO_VEC);
+		// A LATE anomalous sample lands between the 9-run and the trailing good: the splice-replay
+		// reaches 10 consecutive anomalies and resets the filter under the replay loop.
+		feed_imu(kf.get(), t_run + dt / 2, a_rest, a_glitch);
+	}
+
+	SECTION("an anchor checkpointed mid-anomaly-run restores count>0 into the replay")
+	{
+		// Drive the live anomaly count to 9, then let an in-order optical capture the anchor WITH
+		// count=9 (anomalies do not advance the clock, so the optical is in-order and clears the log).
+		for (int i = 1; i <= 9; i++) {
+			feed_imu(kf.get(), ts + i * (dt / 32), a_rest, a_glitch);
+		}
+		feed_pose(kf.get(), ts + dt, home, IDENTITY_QUAT); // anchor now carries anomaly_count = 9
+		const int64_t t_anchor = ts + dt;
+		for (int i = 2; i <= 4; i++) { // good samples: live count back to 0, log = [good x3]
+			feed_imu(kf.get(), ts + i * dt, a_rest, ZERO_VEC);
+		}
+		// ONE late anomaly splicing to the log FRONT: replay restores count=9 from the anchor and
+		// reaches 10 on the first replayed sample, resetting under the loop with 3 entries left.
+		feed_imu(kf.get(), t_anchor + dt / 2, a_rest, a_glitch);
+	}
+
+	// No UB (ASan/UBSan builds prove the negative); the reset left a sane, honest state.
+	xrt_space_relation rel{};
+	kf->get_prediction(ts + 8 * dt, &rel, nullptr);
+	REQUIRE(std::isfinite(rel.pose.position.x));
+	REQUIRE(std::isfinite(rel.pose.orientation.w));
+	CHECK((rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0);
+
+	// And the reset is recoverable: a clean optical re-lock works.
+	ts += 20 * dt;
+	for (int i = 0; i < 80; i++) {
+		feed_pose(kf.get(), ts, home, IDENTITY_QUAT);
+		feed_imu(kf.get(), ts, a_rest, ZERO_VEC);
+		ts += dt;
+	}
+	kf->get_prediction(ts, &rel, nullptr);
+	CHECK(rel.pose.position.x == Approx(home.x).margin(0.05));
+	CHECK((rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0);
 }
 
 TEST_CASE("kalman: OOSM optical replay is deterministic (reordered feed ends bit-equal to in-order)")

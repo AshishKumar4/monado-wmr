@@ -102,6 +102,27 @@ TEST_CASE("m_quatexpmap")
 		}
 	}
 
+	SECTION("Test quat_ln takes the principal branch on solid w < 0 inputs")
+	{
+		// exp(0.99pi*a) has w = cos(0.99pi) < 0 -- solidly inside quat_ln's negation
+		// branch, not just the antipodal +-epsilon boundary the previous section stops
+		// short of. The principal log of that rotation is the short way around:
+		// ln(exp(0.99pi*a)) == -(0.01pi)*a. Pins the w<0 negation added by the
+		// math_quat_ln principal-branch formulation (upstream 4f51a7a1e).
+		for (xrt_vec3 axis : {axis1, axis4}) {
+			xrt_vec3 aa = axis * ((float)M_PI * 0.99f);
+			xrt_quat quat{};
+			math_quat_exp(&aa, &quat);
+			REQUIRE(quat.w < 0.f);
+
+			xrt_vec3 ln{};
+			math_quat_ln(&quat, &ln);
+
+			xrt_vec3 expected = axis * -((float)M_PI * 0.01f);
+			CHECK(m_vec3_len(ln - expected) <= 0.001);
+		}
+	}
+
 //! @todo Fix quat_exp
 #if 0
 	SECTION("Test quat_exp(angle_axis) returns the appropriate quaternion")

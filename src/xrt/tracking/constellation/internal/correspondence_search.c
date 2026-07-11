@@ -81,6 +81,9 @@ struct correspondence_search *
 correspondence_search_new(struct camera_model *camera_calib)
 {
 	struct correspondence_search *cs = calloc(1, sizeof(struct correspondence_search));
+	if (cs == NULL) {
+		return NULL;
+	}
 	cs->calib = camera_calib;
 	return cs;
 }
@@ -175,9 +178,14 @@ correspondence_search_set_blobs(struct correspondence_search *cs, struct blob *b
 
 	if (num_blobs > cs->points_capacity) {
 		struct cs_image_point *points = realloc(cs->points, num_blobs * sizeof(struct cs_image_point));
-		assert(points != NULL);
-		cs->points = points;
-		cs->points_capacity = num_blobs;
+		if (points == NULL) {
+			/* OOM on the frame thread: keep the old buffer and take only the blobs that
+			 * fit this frame instead of dereferencing NULL. */
+			num_blobs = cs->points_capacity;
+		} else {
+			cs->points = points;
+			cs->points_capacity = num_blobs;
+		}
 	}
 	cs->num_points = num_blobs;
 	cs->blobs = blobs;
@@ -405,6 +413,12 @@ insert_search_result(struct cs_model_info *mi,
 				mi->results[i].score = *score;
 				mi->result_prior_cost[i] = prior_cost;
 			}
+			/* KNOWN, CALIBRATED-IN (audit 2026-07-10 R1-M1 i2): same in-place
+			 * duplicate-improvement-without-re-bubble shape as
+			 * association_insert_hypothesis, and results[0] is consumed downstream.
+			 * The bubble fix for the sibling was REFUTED on the standing regression
+			 * gate (results/w2-fold-20260711/m1-insert-order-adjudication/); the same
+			 * verdict applies here — re-open only matrix-gated in the W5 rework. */
 			return;
 		}
 	}

@@ -1,3 +1,5 @@
+// Copyright 2026, G2-on-Linux project
+// SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief  Per-LED multi-camera triangulation of a controller position. See multicam_triangulate.h.
@@ -28,7 +30,6 @@ static const double MIN_PARALLAX_SIN = 0.035;   // ~2 deg between the two most-s
 static const double MAX_RAY_RESIDUAL_M = 0.02;  // 2 cm mean point-to-ray distance
 static const double OUTLIER_MAD_K = 3.0;
 static const double MIN_INLIER_SPREAD_STD_M = 0.01; // 1 cm floor
-static const double PRIMARY_EPIPOLAR_ORIGIN_GATE_M = 0.06;
 
 namespace {
 
@@ -380,141 +381,6 @@ multicam_triangulate_position(const struct multicam_tri_view *views,
 			tri[n_tri].rays[r] = rays[r];
 		}
 		n_tri++;
-	}
-
-	return aggregate_tri_leds(tri, n_tri, leds_model, &q_prior, prior_yaw_sigma_rad, min_leds, out_result);
-}
-
-bool
-multicam_triangulate_primary_label_epipolar_position(const struct multicam_tri_view *views,
-                                                     int num_views,
-                                                     int primary_view,
-                                                     const struct t_constellation_led_model *leds_model,
-                                                     const struct xrt_quat *prior_orientation,
-                                                     float prior_yaw_sigma_rad,
-                                                     int min_leds,
-                                                     struct multicam_tri_result *out_result)
-{
-	if (views == NULL || leds_model == NULL || prior_orientation == NULL || out_result == NULL ||
-	    num_views < 2 || primary_view < 0 || primary_view >= num_views || leds_model->num_leds <= 0) {
-		return false;
-	}
-	memset(out_result, 0, sizeof(*out_result));
-	if (min_leds < 1) {
-		min_leds = 1;
-	}
-
-	struct xrt_quat q_prior = *prior_orientation;
-	math_quat_normalize(&q_prior);
-
-	struct Candidate
-	{
-		TriLed tri;
-		V3d origin;
-	};
-	Candidate candidates[MAX_TRI];
-	int n_candidates = 0;
-
-	const struct multicam_tri_view *primary = &views[primary_view];
-	const int n_primary = (primary->blobs != NULL && primary->calib != NULL && primary->num_blobs > 0)
-	                          ? (primary->num_blobs < 64 ? primary->num_blobs : 64)
-	                          : 0;
-	for (int pi = 0; pi < n_primary && n_candidates < MAX_TRI; pi++) {
-		const struct blob *pb = &primary->blobs[pi];
-		if (LED_OBJECT_ID(pb->led_id) != leds_model->id) {
-			continue;
-		}
-		const int led = LED_LOCAL_ID(pb->led_id);
-		if (led < 0 || led >= leds_model->num_leds || led >= 64) {
-			continue;
-		}
-		LedRay primary_ray;
-		if (!blob_world_ray(primary, pi, primary_view, primary_ray)) {
-			continue;
-		}
-
-		for (int vi = 0; vi < num_views && n_candidates < MAX_TRI; vi++) {
-			if (vi == primary_view) {
-				continue;
-			}
-			const struct multicam_tri_view *view = &views[vi];
-			const int nb = (view->blobs != NULL && view->calib != NULL && view->num_blobs > 0)
-			                   ? (view->num_blobs < 64 ? view->num_blobs : 64)
-			                   : 0;
-			for (int bi = 0; bi < nb && n_candidates < MAX_TRI; bi++) {
-				LedRay other_ray;
-				if (!blob_world_ray(view, bi, vi, other_ray)) {
-					continue;
-				}
-				LedRay pair[2] = {primary_ray, other_ray};
-				V3d led_world;
-				if (!triangulate_rays(pair, 2, led_world)) {
-					continue;
-				}
-
-				struct xrt_vec3 lever;
-				math_quat_rotate_vec3(&q_prior, &leds_model->leds[led].pos, &lever);
-				Candidate &candidate = candidates[n_candidates++];
-				candidate.origin = {led_world.x - lever.x, led_world.y - lever.y, led_world.z - lever.z};
-				candidate.tri.led_id = led;
-				candidate.tri.world_pt = led_world;
-				candidate.tri.n_rays = 2;
-				candidate.tri.rays[0] = primary_ray;
-				candidate.tri.rays[1] = other_ray;
-			}
-		}
-	}
-
-	int best_seed = -1;
-	int best_distinct_leds = 0;
-	double best_spread = INFINITY;
-	for (int seed = 0; seed < n_candidates; seed++) {
-		bool led_seen[64] = {false};
-		int distinct_leds = 0;
-		double spread = 0.0;
-		for (int i = 0; i < n_candidates; i++) {
-			const double d = norm(sub(candidates[i].origin, candidates[seed].origin));
-			if (d > PRIMARY_EPIPOLAR_ORIGIN_GATE_M) {
-				continue;
-			}
-			const int led = candidates[i].tri.led_id;
-			if (led >= 0 && led < 64 && !led_seen[led]) {
-				led_seen[led] = true;
-				distinct_leds++;
-				spread += d;
-			}
-		}
-		if (distinct_leds > best_distinct_leds ||
-		    (distinct_leds == best_distinct_leds && spread < best_spread)) {
-			best_seed = seed;
-			best_distinct_leds = distinct_leds;
-			best_spread = spread;
-		}
-	}
-	if (best_seed < 0 || best_distinct_leds < (min_leds < 2 ? 2 : min_leds)) {
-		return false;
-	}
-
-	TriLed tri[MAX_TRI];
-	int n_tri = 0;
-	bool led_used[64] = {false};
-	for (int led = 0; led < 64 && n_tri < MAX_TRI; led++) {
-		int best = -1;
-		double best_d = PRIMARY_EPIPOLAR_ORIGIN_GATE_M;
-		for (int i = 0; i < n_candidates; i++) {
-			if (candidates[i].tri.led_id != led) {
-				continue;
-			}
-			const double d = norm(sub(candidates[i].origin, candidates[best_seed].origin));
-			if (d <= best_d) {
-				best = i;
-				best_d = d;
-			}
-		}
-		if (best >= 0 && !led_used[led]) {
-			tri[n_tri++] = candidates[best].tri;
-			led_used[led] = true;
-		}
 	}
 
 	return aggregate_tri_leds(tri, n_tri, leds_model, &q_prior, prior_yaw_sigma_rad, min_leds, out_result);

@@ -7,6 +7,7 @@
 #define LAMBDATWIST_P3P
 
 #include <math.h>
+#include <string.h>
 
 #include "cubic.h"
 #include "quadratic.h"
