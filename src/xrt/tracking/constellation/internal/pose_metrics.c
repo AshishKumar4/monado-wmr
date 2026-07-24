@@ -139,10 +139,11 @@ expand_rect(struct pose_rect *bounds, double x, double y, double w, double h)
 /* True if @p blob falls inside this LED's covariance-scaled gate ellipse (and isn't grossly oversized).
  * Returns the raw reprojection cost (px^2) in @p out_sqerror — accumulated into reprojection_error and
  * compared against the px^2-calibrated GOOD/STRONG thresholds — AND the per-blob measurement-noise-weighted
- * (Mahalanobis) cost (dx^2+dy^2)/pos_var_px2 in @p out_rank_cost, which RANKS the global one-to-one
- * assignment: a fat / clipped / edge / faint blob (large pos_var_px2, an uncertain LED centre) yields a
- * larger weighted cost, so when blobs compete for an LED the tighter, more certain centre is preferred. The
- * accept/reject error stays in raw px^2; only the assignment ordering is uncertainty-weighted. The
+ * twice-Gaussian-negative-log-likelihood cost, up to an additive constant,
+ * (dx^2+dy^2)/pos_var_px2 + 2*log(pos_var_px2), in
+ * @p out_rank_cost, which RANKS the one-to-one assignment. The log-determinant term prevents a fat /
+ * clipped / edge / faint blob from winning merely because its uncertain centre has a large variance. The
+ * accept/reject error stays in raw px^2; only the assignment ordering is uncertainty-aware. The
  * gate half-axes gate_ax/ay come from get_visible_leds_and_bounds; they equal led_radius_px. */
 static bool
 led_blob_match_cost(const struct pose_metrics_visible_led_info *led_info,
@@ -160,7 +161,8 @@ led_blob_match_cost(const struct pose_metrics_visible_led_info *led_info,
 	const double sqerror = dx * dx + dy * dy;
 	*out_sqerror = sqerror;
 	/* pos_var_px2 is floored >= 0.25 px^2 at the source (blobwatch), so this division is well-posed. */
-	*out_rank_cost = sqerror / (double)blob->pos_var_px2;
+	const double variance = (double)blob->pos_var_px2;
+	*out_rank_cost = sqerror / variance + 2.0 * log(variance);
 	return true;
 }
 
@@ -168,7 +170,7 @@ led_blob_match_cost(const struct pose_metrics_visible_led_info *led_info,
  * never truncate a valid pairing (derived from the array maxima, not a magic cap). ~50 KB on the stack. */
 #define MAX_GATE_CANDIDATES (MAX_BLOBS_PER_FRAME * MAX_OBJECT_LEDS)
 
-/* One admissible blob<->LED pairing for the global assignment. Ranked by rank_cost (the per-blob
+/* One admissible blob<->LED pairing for the greedy one-to-one assignment. Ranked by rank_cost (the per-blob
  * measurement-noise-weighted reprojection cost); sqerror is the raw px^2 error folded into reprojection_error
  * once the pairing is committed. */
 struct gate_candidate
@@ -623,12 +625,9 @@ pose_metrics_match_pose_to_blobs(struct xrt_pose *pose,
 	get_visible_leds_and_bounds(pose, led_model, calib, match_info->visible_leds, &match_info->num_visible_leds,
 	                            &match_info->bounds);
 
-	/* Global ONE-TO-ONE assignment (Global Nearest Neighbour): collect every admissible (blob,LED) pair
-	 * within its gate ellipse, rank by reprojection cost, then assign greedily with mutual exclusivity —
-	 * each blob and each LED used at most once. Unlike per-blob nearest matching, this cannot mislabel
-	 * when the gate is wider than the inter-LED spacing (the case a covariance-adaptive gate creates): it
-	 * yields the lowest-total-reprojection consistent matching, so a wide prior widens the SEARCH without
-	 * corrupting the ASSIGNMENT. */
+	/* Greedy ONE-TO-ONE assignment: collect every admissible (blob,LED) pair within its gate ellipse, rank
+	 * by pair cost, then assign with mutual exclusivity — each blob and each LED used at most once. This
+	 * prevents duplicate assignments, but it does not solve the minimum-total-cost assignment problem. */
 	bool all_led_ids_matched = true;
 	const int nleds = match_info->num_visible_leds;
 
@@ -710,13 +709,13 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 	 */
 	struct pose_metrics_blob_match_info blob_match_info;
 
+	assert(score != NULL);
+	*score = (struct pose_metrics){0};
+
 	pose_metrics_match_pose_to_blobs(pose, blobs, num_blobs, led_model, calib, &blob_match_info);
 
 	assert(led_model->num_leds > 0);
 	assert(num_blobs > 0);
-	assert(score != NULL);
-
-	score->match_flags = 0;
 	score->reprojection_error = blob_match_info.reprojection_error;
 	score->matched_blobs = blob_match_info.matched_blobs;
 	score->unmatched_blobs = blob_match_info.unmatched_blobs;

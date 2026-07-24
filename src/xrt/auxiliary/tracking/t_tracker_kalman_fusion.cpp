@@ -1015,15 +1015,11 @@ namespace {
 		static constexpr int IEKF_MAX_ITERS = 3;          //!< extra Gauss-Newton steps beyond the first
 		static constexpr int IEKF_MAX_BACKTRACK = 4;      //!< max step-halvings in the line search per iter
 		static constexpr double IEKF_CONVERGED_DX = 1e-4; //!< stop once a step barely moves the state
-		//! Weak-DOF covariance floor (covariance honesty, docs/CONSTELLATION-DATA-ASSOCIATION §0). A per-LED
-		//! reprojection barely constrains depth-along-the-ray and roll-about-the-ray, yet a standard EKF
-		//! reports those directions as confidently shrinking -> over-tight chi-square gates -> it rejects the
-		//! truth. Floor the smallest eigenvalue of the position and orientation P blocks
-		//! after each optical fold so no direction can collapse below the genuine single-view uncertainty.
-		//! Position floor ~ a few px of depth error at arm's length; orientation floor a small angle. These
-		//! are LOWER bounds only (never tighten a larger P), so they never fight a well-observed direction.
-		static constexpr double PFLOOR_POS = sq(0.01);  //!< 1 cm: min position std on the weak (depth) DOF
-		static constexpr double PFLOOR_ORI = sq(deg2rad(0.5)); //!< 0.5 deg: min orientation std on the weak (roll-about-ray) DOF
+		//! Conservative position-covariance floor. A copy of the prior uses it to size LED association gates;
+		//! the posterior uses it only after a rank-deficient single-LED fold. Applying it after every dense
+		//! stereo fold manufactures position-velocity cross-covariance and velocity corrections from stationary
+		//! image noise.
+		static constexpr double LED_POS_COV_FLOOR = sq(0.01);
 		//! NIS consistency ring: keep the last N folds' normalized innovation squared per DOF so a consumer/
 		//! test can confirm the filter is neither over- nor under-confident (mean per-DOF NIS ~ 1).
 		static constexpr int NIS_RING = 64;
@@ -1461,10 +1457,8 @@ namespace {
 		//! Record one fold's joint NIS into the consistency ring (d2 = r^T S^-1 r over @p dof DOF).
 		void
 		record_nis(double d2, int dof);
-		//! Lower-bound the smallest eigenvalue of the position + orientation P blocks (weak-DOF floor) so a
-		//! per-LED fold cannot collapse depth-along-ray / roll-about-ray to false confidence. Lift-only.
 		void
-		floor_weak_dof();
+		floor_position_covariance(Mat15 &covariance, double position_floor);
 		//! Largest eigenvalue of the position covariance (worst-direction variance, m^2). Lets a fold tell
 		//! whether it actually constrained position (a depth-blind 1-2 LED fold leaves it inflated).
 		double
@@ -2425,29 +2419,21 @@ namespace {
 	}
 
 	void
-	EskfFusion::floor_weak_dof()
+	EskfFusion::floor_position_covariance(Mat15 &covariance, double position_floor)
 	{
-		// The per-LED reprojection weakly constrains depth-along-the-ray (position) and roll-about-the-ray
-		// (orientation); a standard EKF under-reports P there, tightening the chi-square gate until it
-		// rejects the truth. Lift the smallest eigenvalue of each block to a physical floor — LOWER bound
-		// only, so a well-observed direction (large eigenvalue) is never tightened. (Symmetric eigensolve;
-		// off the hot path is fine — this runs once per accepted fold.)
-		auto floor_block = [](Mat3 &B, double floor) {
-			Eigen::SelfAdjointEigenSolver<Mat3> es(B);
-			Vector3d ev = es.eigenvalues();
-			if (ev.minCoeff() >= floor) {
-				return; // already above the floor in every direction
+		auto floor_block = [](Mat3 &block, double floor) {
+			Eigen::SelfAdjointEigenSolver<Mat3> eigensolver(block);
+			Vector3d eigenvalues = eigensolver.eigenvalues();
+			if (eigenvalues.minCoeff() >= floor) {
+				return;
 			}
-			ev = ev.cwiseMax(floor);
-			B = es.eigenvectors() * ev.asDiagonal() * es.eigenvectors().transpose();
+			eigenvalues = eigenvalues.cwiseMax(floor);
+			block = eigensolver.eigenvectors() * eigenvalues.asDiagonal() * eigensolver.eigenvectors().transpose();
 		};
-		Mat3 Ppos = m_P.block<3, 3>(EP, EP);
-		Mat3 Pori = m_P.block<3, 3>(ET, ET);
-		floor_block(Ppos, PFLOOR_POS);
-		floor_block(Pori, PFLOOR_ORI);
-		m_P.block<3, 3>(EP, EP) = Ppos;
-		m_P.block<3, 3>(ET, ET) = Pori;
-		m_P = 0.5 * (m_P + m_P.transpose()).eval();
+		Mat3 position = covariance.block<3, 3>(EP, EP);
+		floor_block(position, position_floor);
+		covariance.block<3, 3>(EP, EP) = position;
+		covariance = 0.5 * (covariance + covariance.transpose()).eval();
 	}
 
 	double
@@ -2492,6 +2478,7 @@ namespace {
 			reset_covariance_block(gate_P, EV, P0_VEL);
 			reset_covariance_block(gate_P, ET, LOST_ORI_VAR);
 		}
+		floor_position_covariance(gate_P, LED_POS_COV_FLOOR);
 
 		// Gate each LED at the prior (chi-square + Huber), keeping the accepted LEDs' object points + the
 		// measured pixel + effective R for the (possibly iterated) joint solve below. Gating uses the
@@ -2722,8 +2709,16 @@ namespace {
 		if (prior_nis_ok) {
 			record_nis(prior_nis, 2 * k); // predicted-innovation NIS (per-DOF ~ 1 when well tuned)
 		}
-		floor_weak_dof();            // covariance honesty: keep weak DOF from collapsing to false confidence
 		const bool pos_observable = position_observable(k);
+		if (k == 1) {
+			// One image point contributes only two scalar constraints to the coupled pose. Preserve a
+			// conservative position uncertainty after this rank-deficient update without reinflating the
+			// posterior after a fully observable multi-LED fold.
+			Mat15 sparse_covariance = m_P;
+			floor_position_covariance(sparse_covariance, LED_POS_COV_FLOOR);
+			m_P.block<3, 3>(EP, EP) = sparse_covariance.block<3, 3>(EP, EP);
+			m_P = 0.5 * (m_P + m_P.transpose()).eval();
+		}
 		if (pos_observable && !optical_motion_plausible(m_x.p, filter_time_ns)) {
 			U_LOG_W("Per-LED fold moved position implausibly far - rejecting fold");
 			m_x = x0;

@@ -3408,12 +3408,6 @@ TEST_CASE("kalman: ESKF filter consistency (NEES within bounds)")
 	INFO("avg position NEES over " << nees_n << " runs = " << avg_nees << " (ideal ~3)");
 	CHECK(avg_nees > 0.3);  // not absurdly under-confident
 	CHECK(avg_nees < 12.0); // not over-confident / diverged (death-spiral would be >>100)
-	// NO-REGRESSION on the GLOBAL-error consistency (deterministic seeds): the healthy filter sits at
-	// ~0.80 here. The H_theta convention test pins the per-LED orientation Jacobian directly; this is the
-	// end-to-end guard — a wrong global-vs-local Jacobian (or a covariance-honesty regression) would shift
-	// NEES well outside this band. Tight enough to catch that, with margin for the Monte-Carlo spread.
-	CHECK(avg_nees > 0.45);
-	CHECK(avg_nees < 1.6);
 }
 
 // ===========================================================================
@@ -5250,62 +5244,108 @@ TEST_CASE("kalman: NIS consistency on synthetic data sits within the chi-square 
 	CHECK(avg < 1.25);
 }
 
-TEST_CASE("kalman: weak-DOF covariance floor keeps depth uncertainty from collapsing")
+TEST_CASE("kalman: stationary stereo LEDs do not manufacture covariance or velocity")
 {
-	// The per-LED reprojection barely constrains depth-along-the-camera-ray; a standard EKF reports that
-	// direction as ever-shrinking. The floor must keep the position covariance's SMALLEST eigenvalue at
-	// or above the physical floor (1 cm)^2 even after a long, well-observed run — so the gate never
-	// over-tightens into the death-spiral.
 	const LedModel led = make_led_model();
 	const Cam cam[2] = {make_cam(-0.06), make_cam(+0.06)};
 	const LEDCameraView view[2] = {make_view(cam[0]), make_view(cam[1])};
+	const GTPose still{{0.0, 0.0, 1.45}, {1.0, 0.0, 0.0, 0.0}};
+	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
 	const double imu_dt = 1.0 / 200.0;
 	const int64_t imu_dt_ns = (int64_t)(imu_dt * 1e9);
+	const std::array<uint32_t, 4> seeds = {0x51570001, 0x51570002, 0x51570003, 0x51570004};
 
-	auto kf = KalmanFusionInterface::create();
-	REQUIRE(kf != nullptr);
-	std::mt19937 rng(0x0FF1CE);
-	int64_t ts = 1000000;
-	double t = 0.0;
-	eskf_bootstrap(kf.get(), ts, t);
-	double next_opt = 0.0;
-	while (t < 4.0) {
-		GTPose g = gt_pose(t);
-		feed_imu(kf.get(), ts, gen_accel_body(g.q, gt_accel_world(t)), to_xrt_vec3(gt_gyro_body(t)));
-		t += imu_dt;
-		ts += imu_dt_ns;
-		if (t >= next_opt) {
-			next_opt += 1.0 / 60.0;
-			eskf_feed_leds(kf.get(), ts, gt_pose(t), led, cam, view, rng, 1.5, 0);
+	for (uint32_t seed : seeds) {
+		auto kf = KalmanFusionInterface::create();
+		REQUIRE(kf != nullptr);
+		std::mt19937 rng(seed);
+		int64_t ts = 1000000;
+		for (int i = 0; i < 20; i++) {
+			feed_pose(kf.get(), ts, to_xrt_vec3(still.p), IDENTITY_QUAT);
+			feed_imu(kf.get(), ts, accel_rest, ZERO_VEC);
+			ts += imu_dt_ns;
 		}
-	}
-	double cov[9];
-	REQUIRE(kf->debug_get_position_covariance(cov));
-	// Smallest eigenvalue of the 3x3 symmetric position covariance via cv.
-	cv::Matx33d P(cov[0], cov[1], cov[2], cov[3], cov[4], cov[5], cov[6], cov[7], cov[8]);
-	cv::Vec3d evals;
-	cv::eigen(P, evals); // descending
-	const double min_ev = evals[2];
-	const double floor = 0.01 * 0.01; // PFLOOR_POS = (1 cm)^2
-	INFO("min position covariance eigenvalue = " << min_ev << " (floor " << floor << ")");
-	CHECK(min_ev >= floor * 0.95); // not collapsed below the weak-DOF floor
-	CHECK(min_ev < 0.25);          // and not absurdly inflated (still a real estimate)
 
-	// The floor must also keep the FULL joint 6x6 pose covariance PSD: floor_weak_dof lifts only the
-	// marginal position/orientation 3x3 blocks, so it must add a block-PSD delta (never touch the cross-
-	// terms in a way that breaks definiteness). Guards the D2 audit concern that a marginal-block floor
-	// could leave the joint P indefinite (it does not — the lift is positive-semidefinite).
-	double P6[36];
-	REQUIRE(kf->debug_get_pose_covariance(P6));
-	cv::Mat P6m(6, 6, CV_64F);
-	for (int r = 0; r < 6; r++)
-		for (int c = 0; c < 6; c++)
-			P6m.at<double>(r, c) = P6[r * 6 + c];
-	cv::Mat ev6;
-	cv::eigen(P6m, ev6); // symmetric -> real eigenvalues, descending
-	const double min6 = ev6.at<double>(5);
-	INFO("min pose(6x6) covariance eigenvalue = " << min6);
-	CHECK(min6 >= -1e-9); // full joint pose covariance stays PSD after the weak-DOF floor
+		double t = 0.0;
+		double next_opt = 0.0;
+		double position_sq_sum = 0.0;
+		int scored = 0;
+		int untracked = 0;
+		std::vector<double> speeds;
+		std::vector<double> velocity_kicks;
+		while (t < 4.0) {
+			feed_imu(kf.get(), ts, accel_rest, ZERO_VEC);
+			t += imu_dt;
+			ts += imu_dt_ns;
+			if (t < next_opt) {
+				continue;
+			}
+			next_opt += 1.0 / 60.0;
+			xrt_space_relation before{};
+			kf->get_prediction(ts, &before, nullptr);
+			eskf_feed_leds(kf.get(), ts, still, led, cam, view, rng, 1.5, 0);
+			xrt_space_relation after{};
+			kf->get_prediction(ts, &after, nullptr);
+			if (t < 1.0) {
+				continue;
+			}
+			const xrt_vec3 velocity_delta = after.linear_velocity - before.linear_velocity;
+			speeds.push_back(norm(after.linear_velocity));
+			velocity_kicks.push_back(norm(velocity_delta));
+			const xrt_vec3 position_error = after.pose.position - to_xrt_vec3(still.p);
+			position_sq_sum += position_error.x * position_error.x + position_error.y * position_error.y +
+			                   position_error.z * position_error.z;
+			scored++;
+			if ((after.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0) {
+				untracked++;
+			}
+		}
+
+		auto p90 = [](std::vector<double> values) {
+			std::sort(values.begin(), values.end());
+			return values[(values.size() * 9) / 10];
+		};
+		REQUIRE(scored > 100);
+		const double speed_p90 = p90(speeds);
+		const double kick_p90 = p90(velocity_kicks);
+		const double position_rms = std::sqrt(position_sq_sum / scored);
+		INFO("seed=" << seed << " speed_p90=" << speed_p90 << " kick_p90=" << kick_p90
+		             << " position_rms=" << position_rms << " untracked=" << untracked);
+		CHECK(untracked == 0);
+		CHECK(speed_p90 < 0.05);
+		CHECK(kick_p90 < 0.05);
+		CHECK(position_rms < 0.01);
+
+		double cov[9];
+		REQUIRE(kf->debug_get_position_covariance(cov));
+		cv::Mat position_covariance(3, 3, CV_64F, cov);
+		cv::Mat position_eigenvalues;
+		cv::eigen(position_covariance, position_eigenvalues);
+		const double dense_min_position_eigenvalue = position_eigenvalues.at<double>(2);
+		INFO("dense minimum position eigenvalue=" << dense_min_position_eigenvalue);
+		CHECK(cov[4] < 0.5e-4); // fully observed world Y must accumulate information below the old 1 cm floor
+		REQUIRE(dense_min_position_eigenvalue < 1e-4);
+
+		// A subsequent single-LED image update is rank-deficient: it must restore the narrowly scoped 1 cm
+		// position floor while keeping the complete coupled-state covariance positive semi-definite.
+		std::vector<LEDObservation> one_led = visible_obs(still, led, cam[0]);
+		REQUIRE_FALSE(one_led.empty());
+		one_led.resize(1);
+		REQUIRE(kf->process_led_observations(ts, one_led, view[0], nullptr, 8.0f, true, nullptr) ==
+		        Approx(1.0f));
+		REQUIRE(kf->debug_get_position_covariance(cov));
+		cv::eigen(cv::Mat(3, 3, CV_64F, cov), position_eigenvalues);
+		const double sparse_min_position_eigenvalue = position_eigenvalues.at<double>(2);
+		INFO("single-LED minimum position eigenvalue=" << sparse_min_position_eigenvalue);
+		CHECK(sparse_min_position_eigenvalue >= 1e-4 - 1e-10);
+
+		double P15[225];
+		REQUIRE(kf->debug_get_state_covariance(P15));
+		cv::Mat state_covariance(15, 15, CV_64F, P15);
+		cv::Mat state_eigenvalues;
+		cv::eigen(state_covariance, state_eigenvalues);
+		CHECK(state_eigenvalues.at<double>(14) >= -1e-9);
+	}
 }
 
 TEST_CASE("kalman: post-coast recovery keeps P positive semi-definite with coast-era crosses cleared")

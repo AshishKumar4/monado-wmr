@@ -30,6 +30,7 @@
 #include <array>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -399,6 +400,7 @@ load_led_model(const std::string &path, uint8_t device_id, struct t_constellatio
 struct MosaicFrame
 {
 	int64_t t_ns;
+	int64_t callback_frontier_ns;
 	int exposure;
 	std::string cam_png[XRT_TRACKING_MAX_SLAM_CAMS];
 };
@@ -439,13 +441,14 @@ index_euroc(const std::string &mav0, int cam_count)
 
 struct ImuRow
 {
-	int64_t t_ns;
+	int64_t arrival_ns;
+	int64_t sample_ns;
 	float ax, ay, az, gx, gy, gz;
 };
 
 struct FrameRow
 {
-	int64_t t_ns;
+	int64_t arrival_ns;
 	int64_t hw_ts_ns;
 	uint8_t cam_id;
 	uint32_t frame_seq;
@@ -487,7 +490,7 @@ load_frame_telemetry(const std::string &telemetry_dir)
 	for (size_t p = 0; p + row_size <= bin.size(); p += row_size) {
 		const char *r = bin.data() + p;
 		FrameRow row{};
-		memcpy(&row.t_ns, r + off_t, 8);
+		memcpy(&row.arrival_ns, r + off_t, 8);
 		memcpy(&row.hw_ts_ns, r + off_hw, 8);
 		row.cam_id = (uint8_t)r[off_cam];
 		memcpy(&row.frame_seq, r + off_seq, 4);
@@ -496,6 +499,127 @@ load_frame_telemetry(const std::string &telemetry_dir)
 		out.push_back(row);
 	}
 	return out;
+}
+
+bool
+attach_callback_frontiers(std::vector<MosaicFrame> *frames, const std::string &telemetry_dir, int cam_count)
+{
+	if (frames == nullptr || frames->empty()) {
+		return false;
+	}
+	struct Frontier
+	{
+		int rows = 0;
+		int64_t arrival_ns = INT64_MIN;
+	};
+	std::unordered_map<int64_t, Frontier> by_frame_time;
+	for (const FrameRow &row : load_frame_telemetry(telemetry_dir)) {
+		if (row.cam_id >= cam_count) {
+			continue;
+		}
+		Frontier &frontier = by_frame_time[row.hw_ts_ns];
+		frontier.rows++;
+		frontier.arrival_ns = std::max(frontier.arrival_ns, row.arrival_ns);
+	}
+
+	size_t invalid = 0;
+	for (MosaicFrame &frame : *frames) {
+		const auto it = by_frame_time.find(frame.t_ns);
+		if (it == by_frame_time.end() || it->second.rows != cam_count) {
+			if (invalid < 8) {
+				fprintf(stderr,
+				        "frame callback frontier unavailable: t=%lld rows=%d expected=%d arrival=%lld\n",
+				        (long long)frame.t_ns, it == by_frame_time.end() ? 0 : it->second.rows, cam_count,
+				        (long long)(it == by_frame_time.end() ? INT64_MIN : it->second.arrival_ns));
+			}
+			invalid++;
+			continue;
+		}
+		frame.callback_frontier_ns = it->second.arrival_ns;
+	}
+	if (invalid != 0) {
+		fprintf(stderr,
+		        "cannot reproduce the live callback frontier: %zu/%zu replay frames lack one complete "
+		        "frame.t_mono_ns frontier\n",
+		        invalid, frames->size());
+		return false;
+	}
+
+	// Live consumes frames in causal arrival order, which is not necessarily sample-time order:
+	// captures can contain late/out-of-order frame timestamps. Replay the recorded callback
+	// frontiers in their original order so those frames exercise the same OOSM path.
+	std::stable_sort(frames->begin(), frames->end(), [](const MosaicFrame &a, const MosaicFrame &b) {
+		return a.callback_frontier_ns < b.callback_frontier_ns;
+	});
+	return true;
+}
+
+/* Live per-device tracker-registration time: the production driver adds a controller to the
+ * constellation tracker only once its LED model/calibration is up (t_constellation_tracker_add_device,
+ * typically ~0.5 s after the first camera frame), so early frames are processed with NO devices. The
+ * tracker-side search and mask streams emit rows per processed frame per REGISTERED device, so the
+ * first row per device dates its registration to within one frame group. Registering every device
+ * before frame 0 instead (the old harness behaviour) makes the replay search frame groups the live
+ * tracker never searched for that device — measured on the 2026-07-23 capture: 29 extra cold groups,
+ * which dephases the wave-C cold_deep_view_rr round-robin (29 % 3 views = 2) and flips the deep-search
+ * camera on BOTH devices from the first mutual frame onward. Row times are matched against the frame
+ * groups actually being replayed (@p replayed_ts): search stamps the frame's push timestamp directly,
+ * while mask carries it in hw_ts_ns (mask.t_mono_ns is only the emission time). The membership test
+ * makes stale-launch or filtered-capture rows inert instead of poisoning the min. Returns false when
+ * the capture contains no registration evidence: replay must report that uncertainty rather than
+ * silently inventing a frame-zero registration. */
+bool
+load_device_registration_time(const std::string &telemetry_dir,
+                              int device_id,
+                              const std::unordered_set<int64_t> &replayed_ts,
+                              int64_t *out_t_reg)
+{
+	if (out_t_reg == nullptr) {
+		return false;
+	}
+	std::string mtxt = read_file(telemetry_dir + "/manifest.json");
+	cJSON *root = cJSON_Parse(mtxt.c_str());
+	if (root == nullptr) {
+		return false;
+	}
+	int64_t t_reg = INT64_MAX;
+	const cJSON *streams = cJSON_GetObjectItemCaseSensitive(root, "streams");
+	for (const char *stream : {"search", "mask"}) {
+		const cJSON *st = cJSON_GetObjectItemCaseSensitive(streams, stream);
+		int row_size = (int)jnum(st, "row_size");
+		int off_t = -1, off_dev = -1;
+		const char *timestamp_field = strcmp(stream, "mask") == 0 ? "hw_ts_ns" : "t_mono_ns";
+		const cJSON *fld = nullptr;
+		cJSON_ArrayForEach(fld, cJSON_GetObjectItemCaseSensitive(st, "fields"))
+		{
+			const char *nm = cJSON_GetObjectItemCaseSensitive(fld, "name")->valuestring;
+			int off = (int)jnum(fld, "offset");
+			if (strcmp(nm, timestamp_field) == 0) off_t = off;
+			else if (strcmp(nm, "device_id") == 0) off_dev = off;
+		}
+		if (row_size <= 0 || off_t < 0 || off_dev < 0) {
+			continue;
+		}
+		std::string bin = read_file(telemetry_dir + "/" + stream + ".bin");
+		for (size_t p = 0; p + row_size <= bin.size(); p += row_size) {
+			if ((uint8_t)bin[p + off_dev] != device_id) {
+				continue;
+			}
+			int64_t t = 0;
+			memcpy(&t, bin.data() + p + off_t, 8);
+			if (replayed_ts.find(t) == replayed_ts.end()) {
+				continue;
+			}
+			t_reg = std::min(t_reg, t);
+			break; // rows are chronological within a stream: the first match is the min
+		}
+	}
+	cJSON_Delete(root);
+	if (t_reg == INT64_MAX) {
+		return false;
+	}
+	*out_t_reg = t_reg;
+	return true;
 }
 
 std::vector<ImuRow>
@@ -510,19 +634,23 @@ load_imu(const std::string &telemetry_dir, int device_id)
 	const cJSON *imu = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(root, "streams"), "imu");
 	int row_size = (int)jnum(imu, "row_size");
 	const cJSON *fields = cJSON_GetObjectItemCaseSensitive(imu, "fields");
-	int off_t = -1, off_dev = -1, off_ax = -1, off_gx = -1; // manifest-driven, no hardcoded layout
+	int off_arrival = -1, off_sample = -1, off_dev = -1, off_ax = -1, off_gx = -1;
 	const cJSON *fld = nullptr;
 	cJSON_ArrayForEach(fld, fields)
 	{
 		const char *nm = cJSON_GetObjectItemCaseSensitive(fld, "name")->valuestring;
 		int off = (int)jnum(fld, "offset");
-		if (strcmp(nm, "t_mono_ns") == 0) off_t = off;
+		if (strcmp(nm, "t_mono_ns") == 0) off_arrival = off;
+		else if (strcmp(nm, "hw_ts_ns") == 0) off_sample = off;
 		else if (strcmp(nm, "device_id") == 0) off_dev = off;
 		else if (strcmp(nm, "ax") == 0) off_ax = off;
 		else if (strcmp(nm, "gx") == 0) off_gx = off;
 	}
 	cJSON_Delete(root);
-	if (row_size <= 0 || off_t < 0 || off_dev < 0 || off_ax < 0 || off_gx < 0) {
+	if (row_size <= 0 || off_arrival < 0 || off_sample < 0 || off_dev < 0 || off_ax < 0 || off_gx < 0) {
+		fprintf(stderr,
+		        "IMU telemetry schema missing t_mono_ns arrival time or hw_ts_ns sample time in %s\n",
+		        telemetry_dir.c_str());
 		return out;
 	}
 	std::string bin = read_file(telemetry_dir + "/imu.bin");
@@ -532,16 +660,188 @@ load_imu(const std::string &telemetry_dir, int device_id)
 			continue;
 		}
 		ImuRow row{};
-		memcpy(&row.t_ns, r + off_t, 8);
+		memcpy(&row.arrival_ns, r + off_arrival, 8);
+		memcpy(&row.sample_ns, r + off_sample, 8);
 		memcpy(&row.ax, r + off_ax, 4);
 		memcpy(&row.ay, r + off_ax + 4, 4);
 		memcpy(&row.az, r + off_ax + 8, 4);
 		memcpy(&row.gx, r + off_gx, 4);
 		memcpy(&row.gy, r + off_gx + 4, 4);
 		memcpy(&row.gz, r + off_gx + 8, 4);
+		if (!out.empty() && row.arrival_ns < out.back().arrival_ns) {
+			fprintf(stderr,
+			        "IMU telemetry arrival order is not chronological for device %d: %lld->%lld\n",
+			        device_id, (long long)out.back().arrival_ns, (long long)row.arrival_ns);
+			return {};
+		}
 		out.push_back(row);
 	}
 	return out;
+}
+
+template <typename Consumer>
+size_t
+consume_imu_until(const std::vector<ImuRow> &rows,
+                  size_t *next,
+                  int64_t arrival_frontier_ns,
+                  Consumer &&consume)
+{
+	if (next == nullptr) {
+		return 0;
+	}
+	const size_t first = *next;
+	while (*next < rows.size() && rows[*next].arrival_ns <= arrival_frontier_ns) {
+		consume(rows[*next]);
+		(*next)++;
+	}
+	return *next - first;
+}
+
+int
+run_clock_contract_self_test()
+{
+	char temp_template[] = "/tmp/offline-vio-clock-XXXXXX";
+	const char *temp_dir = mkdtemp(temp_template);
+	if (temp_dir == nullptr) {
+		fprintf(stderr, "clock contract self-test: mkdtemp failed\n");
+		return 1;
+	}
+	const fs::path dir = temp_dir;
+	const char manifest[] = R"JSON({
+  "streams": {
+    "imu": {
+      "row_size": 41,
+      "fields": [
+        {"name":"t_mono_ns","offset":0},
+        {"name":"hw_ts_ns","offset":8},
+        {"name":"device_id","offset":16},
+        {"name":"ax","offset":17},
+        {"name":"gx","offset":29}
+      ]
+    },
+    "frame": {
+      "row_size": 25,
+      "fields": [
+        {"name":"t_mono_ns","offset":0},
+        {"name":"hw_ts_ns","offset":8},
+        {"name":"cam_id","offset":16},
+        {"name":"frame_seq","offset":17},
+        {"name":"n_blobs","offset":21},
+        {"name":"exposure","offset":23}
+      ]
+    },
+    "search": {
+      "row_size": 9,
+      "fields": [
+        {"name":"t_mono_ns","offset":0},
+        {"name":"device_id","offset":8}
+      ]
+    },
+    "mask": {
+      "row_size": 17,
+      "fields": [
+        {"name":"t_mono_ns","offset":0},
+        {"name":"hw_ts_ns","offset":8},
+        {"name":"device_id","offset":16}
+      ]
+    }
+  }
+})JSON";
+	std::ofstream(dir / "manifest.json") << manifest;
+
+	auto write_rows = [&](const char *name, const std::vector<char> &rows) {
+		std::ofstream f(dir / name, std::ios::binary);
+		f.write(rows.data(), (std::streamsize)rows.size());
+	};
+	std::vector<char> imu_bytes(82, 0);
+	const int64_t imu_arrivals[2] = {3000, 5000};
+	const int64_t imu_samples[2] = {4000, 2000};
+	for (int i = 0; i < 2; i++) {
+		char *row = imu_bytes.data() + i * 41;
+		memcpy(row, &imu_arrivals[i], 8);
+		memcpy(row + 8, &imu_samples[i], 8);
+		row[16] = 1;
+	}
+	write_rows("imu.bin", imu_bytes);
+
+	std::vector<char> frame_bytes(50, 0);
+	const int64_t frame_arrivals[2] = {3500, 4500};
+	const int64_t frame_samples[2] = {1500, 1400};
+	for (int i = 0; i < 2; i++) {
+		char *row = frame_bytes.data() + i * 25;
+		memcpy(row, &frame_arrivals[i], 8);
+		memcpy(row + 8, &frame_samples[i], 8);
+		const uint32_t sequence = (uint32_t)i;
+		memcpy(row + 17, &sequence, 4);
+	}
+	write_rows("frame.bin", frame_bytes);
+
+	std::vector<char> mask_bytes(17, 0);
+	const int64_t mask_arrival = 3600;
+	memcpy(mask_bytes.data(), &mask_arrival, 8);
+	memcpy(mask_bytes.data() + 8, &frame_samples[0], 8);
+	mask_bytes[16] = 1;
+	write_rows("mask.bin", mask_bytes);
+	write_rows("search.bin", {});
+
+	bool ok = true;
+	auto check = [&](bool condition, const char *message) {
+		if (!condition) {
+			fprintf(stderr, "clock contract self-test: %s\n", message);
+			ok = false;
+		}
+	};
+
+	const std::vector<ImuRow> imu = load_imu(dir.string(), 1);
+	check(imu.size() == 2, "failed to load synthetic IMU rows");
+	if (imu.size() == 2) {
+		check(imu[0].arrival_ns == imu_arrivals[0] && imu[0].sample_ns == imu_samples[0],
+		      "IMU did not preserve distinct t_mono_ns arrival and hw_ts_ns sample clocks");
+		size_t next = 0;
+		std::vector<int64_t> delivered_samples;
+		const size_t first_count =
+		    consume_imu_until(imu, &next, frame_arrivals[0], [&](const ImuRow &row) {
+			    delivered_samples.push_back(row.sample_ns);
+		    });
+		check(first_count == 1 && delivered_samples == std::vector<int64_t>{imu_samples[0]},
+		      "arrival frontier did not select IMU by t_mono_ns");
+		check(!delivered_samples.empty() && delivered_samples[0] > frame_samples[0],
+		      "test fixture failed to exercise an IMU-newer-than-optical OOSM frontier");
+		const size_t second_count = consume_imu_until(imu, &next, imu_arrivals[1], [&](const ImuRow &row) {
+			delivered_samples.push_back(row.sample_ns);
+		});
+		check(second_count == 1 && delivered_samples.back() == imu_samples[1],
+		      "later arrival frontier did not preserve the IMU hw_ts_ns");
+		check(delivered_samples[1] < delivered_samples[0],
+		      "late IMU sample was not preserved in recorded arrival order");
+	}
+
+	std::vector<MosaicFrame> frames(2);
+	frames[0].t_ns = frame_samples[1];
+	frames[1].t_ns = frame_samples[0];
+	check(attach_callback_frontiers(&frames, dir.string(), 1) &&
+	          frames[0].t_ns == frame_samples[0] &&
+	          frames[0].callback_frontier_ns == frame_arrivals[0] &&
+	          frames[1].t_ns == frame_samples[1] &&
+	          frames[1].callback_frontier_ns == frame_arrivals[1],
+	      "frames were not replayed in causal frame.t_mono_ns order");
+
+	int64_t registration_ns = 0;
+	check(load_device_registration_time(dir.string(), 1, {frame_samples[0]}, &registration_ns) &&
+	          registration_ns == frame_samples[0],
+	      "mask registration did not use mask.hw_ts_ns");
+	check(!load_device_registration_time(dir.string(), 1, {mask_arrival}, &registration_ns),
+	      "mask.t_mono_ns was incorrectly accepted as registration evidence");
+	check(!load_device_registration_time(dir.string(), 2, {frame_samples[0]}, &registration_ns),
+	      "missing registration evidence was not reported explicitly");
+
+	std::error_code ec;
+	fs::remove_all(dir, ec);
+	if (!ok) {
+		return 1;
+	}
+	printf("clock contract self-test: PASS (schema, causal arrival order, OOSM frontier, registration uncertainty)\n");
+	return 0;
 }
 
 // ---- recorded head pose (gt) for the fake HMD: places the cameras in the gravity-aligned world ----
@@ -611,7 +911,8 @@ load_euroc_imu(const std::string &mav0)
 		double wx, wy, wz, ax, ay, az;
 		if (sscanf(line.c_str(), "%lld,%lf,%lf,%lf,%lf,%lf,%lf", &t, &wx, &wy, &wz, &ax, &ay, &az) == 7) {
 			ImuRow r{};
-			r.t_ns = t;
+			r.arrival_ns = t;
+			r.sample_ns = t;
 			r.ax = (float)ax;
 			r.ay = (float)ay;
 			r.az = (float)az;
@@ -635,7 +936,7 @@ apply_gravity_fix(std::vector<HeadPose> &gt, const std::vector<ImuRow> &himu)
 	size_t gi = 0;
 	for (const ImuRow &s : himu) {
 		while (gi + 1 < gt.size() &&
-		       llabs(gt[gi + 1].t_ns - s.t_ns) <= llabs(gt[gi].t_ns - s.t_ns)) {
+		       llabs(gt[gi + 1].t_ns - s.sample_ns) <= llabs(gt[gi].t_ns - s.sample_ns)) {
 			gi++;
 		}
 		struct xrt_vec3 a = {s.ax, s.ay, s.az}; // specific force ~ world-up in the head-IMU frame
@@ -892,9 +1193,9 @@ head_poses_from_imu(const std::vector<ImuRow> &hmd_imu)
 	for (const ImuRow &s : hmd_imu) {
 		const struct xrt_vec3 a = {s.ax, s.ay, s.az};
 		const struct xrt_vec3 g = {s.gx, s.gy, s.gz};
-		m_imu_3dof_update(&dof, (uint64_t)s.t_ns, &a, &g);
+		m_imu_3dof_update(&dof, (uint64_t)s.sample_ns, &a, &g);
 		HeadPose h{};
-		h.t_ns = s.t_ns;
+		h.t_ns = s.sample_ns;
 		h.pose.position = {0.0f, 0.0f, 0.0f};
 		h.pose.orientation = dof.rot;
 		out.push_back(h);
@@ -1100,6 +1401,14 @@ cb_get_unc(struct xrt_device *xdev, double *ps, double *os, double *ys, double *
 	return kalman_fusion_get_pose_uncertainty(reinterpret_cast<FakeController *>(xdev)->kf, ps, os, ys, ts);
 }
 bool
+cb_get_gravity_tilt_reference(struct xrt_device *xdev, struct xrt_quat *out_q, double *out_excess_m_s2)
+{
+	// Production wires this (wmr_controller_base_get_gravity_tilt_reference); without it the
+	// associator's gravity-corrected tilt-clamp/adjudication reference is dead in every replay.
+	return kalman_fusion_get_gravity_tilt_reference(reinterpret_cast<FakeController *>(xdev)->kf, out_q,
+	                                                out_excess_m_s2);
+}
+bool
 cb_get_predicted_pose(struct xrt_device *xdev, timepoint_ns when_ns, struct xrt_space_relation *out)
 {
 	// The matcher's raw prior — the filter's honest estimate, NOT the body-lock report (== production driver).
@@ -1195,6 +1504,9 @@ struct CtrlSession
 	std::string serial;
 	std::vector<ImuRow> imu;
 	size_t imu_ii = 0;
+	int64_t t_reg = INT64_MIN;
+	bool registration_time_known = false;
+	bool registered = false;
 	FILE *csv = nullptr;
 	FILE *render_csv = nullptr;
 	int opt_frames = 0;
@@ -1243,12 +1555,11 @@ trace_intrinsics_if_changed(CtrlSession &cs, int64_t t_ns, bool enabled)
 }
 
 static void
-feed_controller_imu_until(CtrlSession &cs, int64_t t_ns)
+feed_controller_imu_until(CtrlSession &cs, int64_t arrival_frontier_ns)
 {
-	while (cs.imu_ii < cs.imu.size() && cs.imu[cs.imu_ii].t_ns <= t_ns) {
-		const ImuRow &r = cs.imu[cs.imu_ii];
+	consume_imu_until(cs.imu, &cs.imu_ii, arrival_frontier_ns, [&](const ImuRow &r) {
 		struct xrt_imu_sample s = {};
-		s.timestamp_ns = r.t_ns;
+		s.timestamp_ns = r.sample_ns;
 		s.accel_m_s2 = {r.ax, r.ay, r.az};
 		s.gyro_rad_secs = {r.gx, r.gy, r.gz};
 		kalman_fusion_process_imu_data(cs.ctrl->kf, &s, nullptr, nullptr);
@@ -1256,8 +1567,7 @@ feed_controller_imu_until(CtrlSession &cs, int64_t t_ns)
 		struct xrt_pose hp_anchor;
 		kalman_fusion_update_body_anchor(cs.ctrl->kf,
 		                                 ctrl_head_pose(cs.ctrl.get(), s.timestamp_ns, &hp_anchor));
-		cs.imu_ii++;
-	}
+	});
 }
 
 static bool
@@ -1326,6 +1636,9 @@ write_prediction_row(FILE *csv, CtrlSession &cs, int64_t t_ns, int64_t frame_t_n
 int
 main(int argc, char **argv)
 {
+	if (argc == 2 && strcmp(argv[1], "--self-test-clock-contract") == 0) {
+		return run_clock_contract_self_test();
+	}
 	if (argc < 5) {
 		fprintf(stderr,
 		        "usage: %s <frames_dir> <hmd-cameras.json> <telemetry_dir> "
@@ -1405,6 +1718,9 @@ main(int argc, char **argv)
 			printf("using RECORDED SLAM head pose (%zu samples) -> faithful camera->world\n", gt.size());
 		}
 	}
+	if (!attach_callback_frontiers(&frames, telem, cams.cam_count)) {
+		return 1;
+	}
 	// Keep only frames within the UNION of all controllers' IMU windows. Any frame that falls inside
 	// at least one device's IMU window is replayed (per-device IMU readiness is enforced inside the
 	// loop below). This preserves single-device behaviour and lets dual-device replay cover the full
@@ -1417,8 +1733,10 @@ main(int argc, char **argv)
 				continue;
 			}
 			any = true;
-			lo_union = std::min(lo_union, cs.imu.front().t_ns - 100000000);
-			hi_union = std::max(hi_union, cs.imu.back().t_ns + 100000000);
+			for (const ImuRow &row : cs.imu) {
+				lo_union = std::min(lo_union, row.sample_ns - 100000000);
+				hi_union = std::max(hi_union, row.sample_ns + 100000000);
+			}
 		}
 		if (any) {
 			std::vector<MosaicFrame> kept;
@@ -1448,6 +1766,23 @@ main(int argc, char **argv)
 		fprintf(stderr, "no frames to replay\n");
 		return 1;
 	}
+	{
+		std::unordered_set<int64_t> replayed_ts;
+		for (const MosaicFrame &mf : frames) {
+			replayed_ts.insert(mf.t_ns);
+		}
+		for (CtrlSession &cs : sessions) {
+			cs.registration_time_known =
+			    load_device_registration_time(telem, cs.ctrl->device_id, replayed_ts, &cs.t_reg);
+			if (!cs.registration_time_known) {
+				fprintf(stderr,
+				        "WARNING: no tracker-registration evidence for device %u in replayed search/mask "
+				        "rows; live registration time is unknown, explicitly assuming pre-frame registration\n",
+				        cs.ctrl->device_id);
+				cs.t_reg = INT64_MIN;
+			}
+		}
+	}
 	bool any_imu = false;
 	for (const CtrlSession &cs : sessions) {
 		if (!cs.imu.empty()) {
@@ -1473,8 +1808,12 @@ main(int argc, char **argv)
 	const int64_t render_period_ns =
 	    render_hz > 0.0 ? std::max<int64_t>(1, (int64_t)llround(1.0e9 / render_hz)) : 0;
 	const bool debug_intrinsics = env_int("G2_REPLAY_DEBUG_INTRINSICS", 0) != 0;
-	const int64_t replay_start_ns = frames.front().t_ns;
-	const int64_t replay_end_ns = frames.back().t_ns;
+	const auto replay_time_bounds =
+	    std::minmax_element(frames.begin(), frames.end(), [](const MosaicFrame &a, const MosaicFrame &b) {
+		    return a.t_ns < b.t_ns;
+	    });
+	const int64_t replay_start_ns = replay_time_bounds.first->t_ns;
+	const int64_t replay_end_ns = replay_time_bounds.second->t_ns;
 	std::vector<DropWindow> drop_windows;
 	if (drop_burst_count > 0 && drop_burst_max_ms > 0.0 && replay_end_ns > replay_start_ns) {
 		if (drop_burst_max_ms < drop_burst_min_ms) {
@@ -1616,11 +1955,23 @@ main(int argc, char **argv)
 	cbs.cache_pnp_pose_candidate = cb_cache_pnp_pose_candidate;
 	cbs.notify_world_reanchor = cb_notify_world_reanchor;
 	cbs.get_pose_uncertainty = cb_get_unc;
+	cbs.get_gravity_tilt_reference = cb_get_gravity_tilt_reference;
 	cbs.get_predicted_pose = cb_get_predicted_pose;
 	cbs.get_last_optical_age_ms = cb_get_last_optical_age_ms;
 	cbs.predict_led_gate = cb_predict_gate;
-	for (CtrlSession &cs : sessions) {
-		t_constellation_tracker_add_device(tracker, &cs.ctrl->base, &cbs);
+	/* Devices are registered inside the frame loop at their live registration times (see
+	 * load_device_registration_time): the production tracker processed the pre-registration frames
+	 * with no devices, and replaying them registered would cold-search groups live never did. The
+	 * IMU feed is NOT gated on registration — live, each controller's fusion consumes IMU from the
+	 * moment the controller connects, before the tracker registration completes. */
+	for (const CtrlSession &cs : sessions) {
+		if (cs.registration_time_known) {
+			printf("  device %u: live tracker registration at t=%lld\n", cs.ctrl->device_id,
+			       (long long)cs.t_reg);
+		} else {
+			printf("  device %u: tracker registration UNKNOWN; explicit pre-frame fallback\n",
+			       cs.ctrl->device_id);
+		}
 	}
 
 	// Open per-device CSVs. out_dir is created if missing.
@@ -1687,6 +2038,14 @@ main(int argc, char **argv)
 		}
 	};
 	for (const MosaicFrame &mf : frames) {
+		// Register each device with the tracker at its live registration time (session order for
+		// same-frame ties — production registers left before right on the shared tunnel).
+		for (CtrlSession &cs : sessions) {
+			if (!cs.registered && cs.t_reg <= mf.t_ns) {
+				t_constellation_tracker_add_device(tracker, &cs.ctrl->base, &cbs);
+				cs.registered = true;
+			}
+		}
 		if (render_period_ns > 0) {
 			sample_render_until(mf.t_ns - 1, mf.t_ns);
 		}
@@ -1696,18 +2055,22 @@ main(int argc, char **argv)
 		const bool drop_optical = drop_window && !mask_mode;
 		dropped_frame_groups += drop_window ? 1 : 0;
 
-		// Feed each device's IMU samples up to this frame's time so its matcher prior
-		// (kalman_fusion_get_prediction) is current. Per-device streams advance independently.
+		// Reproduce the live callback frontier: frame.t_mono_ns is emitted after each camera's
+		// blob extraction, so the final camera row is the recorded lower bound immediately before
+		// the tracker reads current pose/covariance/gravity state. Advance IMU in recorded arrival
+		// order through that frontier, but preserve every sample's hw_ts_ns as the ESKF timestamp.
+		// Samples newer than the optical fold at T+td therefore make the fold take the same OOSM
+		// rewind path as live instead of freezing replay at an invented fixed horizon.
 		for (CtrlSession &cs : sessions) {
-			feed_controller_imu_until(cs, mf.t_ns);
+			feed_controller_imu_until(cs, mf.callback_frontier_ns);
 			std::lock_guard<std::mutex> lk(cs.ctrl->cap_lock);
 			cs.ctrl->opt_valid = false;
 			cs.ctrl->opt_position_valid = false;
-				cs.ctrl->opt_position = {};
-				cs.ctrl->opt_kind = 0;
-				cs.ctrl->opt_led_count = 0;
-				cs.ctrl->opt_led_folded = 0;
-			}
+			cs.ctrl->opt_position = {};
+			cs.ctrl->opt_kind = 0;
+			cs.ctrl->opt_led_count = 0;
+			cs.ctrl->opt_led_folded = 0;
+		}
 
 		bool masked_this_frame = false;
 		const std::vector<MaskCircle> *frame_mask = nullptr;

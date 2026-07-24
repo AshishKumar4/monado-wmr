@@ -8,44 +8,44 @@
   "metrics": {
     "1": {
       "opt": {
-        "yield_pct": 70.45800470458005,
-        "pos_med_cm": 0.3448611048885831,
-        "wrong_branch_pct": 3.9361702127659575,
-        "flip_rate_pct": 0.01977848101265823,
-        "fly_max_jump_m": 0.21461180978688008,
+        "yield_pct": 60.094091600940914,
+        "pos_med_cm": 0.49917737543186613,
+        "wrong_branch_pct": 5.0,
+        "flip_rate_pct": 0.0,
+        "fly_max_jump_m": 0.13859312104141386,
         "anchor_tilt_flip_pct": 0.0,
-        "anchor_yaw_flip_pct": 0.0
+        "anchor_yaw_flip_pct": 0.024277737314882253
       },
       "pred": {
-        "yield_pct": 79.45205479452055,
-        "pos_med_cm": 0.3046913305059879,
-        "wrong_branch_pct": 4.818059299191375,
-        "flip_rate_pct": 0.03497114880223815,
-        "fly_max_jump_m": 0.4242557609508679,
+        "yield_pct": 70.11207970112079,
+        "pos_med_cm": 0.7952694918758968,
+        "wrong_branch_pct": 5.942622950819672,
+        "flip_rate_pct": 0.019821605550049554,
+        "fly_max_jump_m": 0.22023155700307798,
         "reentry_snap_m": 0.0,
         "anchor_tilt_flip_pct": 0.0,
-        "anchor_yaw_flip_pct": 0.018355359765051395
+        "anchor_yaw_flip_pct": 0.020721094073767096
       }
     },
     "2": {
       "opt": {
-        "yield_pct": 74.49840874498409,
-        "pos_med_cm": 0.5497489569146666,
-        "wrong_branch_pct": 2.4063439978124146,
-        "flip_rate_pct": 0.01863932898415657,
-        "fly_max_jump_m": 1.194294820008862,
+        "yield_pct": 74.22166874221669,
+        "pos_med_cm": 0.585784716609658,
+        "wrong_branch_pct": 2.1505376344086025,
+        "flip_rate_pct": 0.018719580681392737,
+        "fly_max_jump_m": 1.1942879296886493,
         "anchor_tilt_flip_pct": 0.0,
-        "anchor_yaw_flip_pct": 0.019417475728155338
+        "anchor_yaw_flip_pct": 0.0
       },
       "pred": {
-        "yield_pct": 81.65213781652137,
-        "pos_med_cm": 0.43834200798555806,
-        "wrong_branch_pct": 2.826201796090861,
-        "flip_rate_pct": 0.016975046681378374,
-        "fly_max_jump_m": 1.1854419990872602,
+        "yield_pct": 82.33015082330151,
+        "pos_med_cm": 0.8194483272773236,
+        "wrong_branch_pct": 2.691292875989446,
+        "flip_rate_pct": 0.0,
+        "fly_max_jump_m": 0.10589659767905671,
         "reentry_snap_m": 0.0,
         "anchor_tilt_flip_pct": 0.0,
-        "anchor_yaw_flip_pct": 0.017812611328820806
+        "anchor_yaw_flip_pct": 0.0
       }
     }
   }

@@ -122,6 +122,7 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 	target_include_directories(offline_vio_replay PRIVATE ${OpenCV_INCLUDE_DIRS}
 							  ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/drivers)
 	set_target_properties(offline_vio_replay PROPERTIES FOLDER monado_tests)
+	add_test(NAME offline_vio_replay_clock_contract COMMAND offline_vio_replay --self-test-clock-contract)
 
 	# Standing regression guardrail: replays the faithful capture through offline_vio_replay and fails if a
 	# flip / wrong-branch / yield metric regresses past tolerance vs tests/regression_baseline.json. The

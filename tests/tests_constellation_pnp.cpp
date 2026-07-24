@@ -951,16 +951,16 @@ TEST_CASE("joint PnP: degenerate / empty inputs are rejected, not crashed")
 }
 
 // ===========================================================================
-// PER-BLOB MEASUREMENT NOISE (pos_var_px2) WIRING into the global blob<->LED assignment. The assignment is
-// ranked by the per-blob measurement-noise-weighted (Mahalanobis) cost (dx^2+dy^2)/pos_var_px2 — the ML
-// data-association cost — so a residual is judged relative to how uncertain that blob's centre is. Decoupled
+// PER-BLOB MEASUREMENT NOISE (pos_var_px2) WIRING into the greedy one-to-one blob<->LED assignment. Pairs
+// are ranked by twice the Gaussian negative log-likelihood, up to an additive constant:
+// (dx^2+dy^2)/pos_var_px2 + 2*log(pos_var_px2), so a residual
+// is judged relative to how uncertain that blob's centre is without rewarding unbounded variance. Decoupled
 // behavioural test through the PUBLIC matcher (pose_metrics_match_pose_to_blobs): two blobs compete for one
-// LED; raw pixel distance alone picks the closer blob, but the weighting picks the one the LED is more
-// statistically consistent with. The test has teeth: raw distance and the weighted cost choose DIFFERENT
-// blobs, so a no-op (unwired) matcher would assign the other one and fail.
+// LED; Mahalanobis distance alone incorrectly picks the farther high-variance blob, while the likelihood's
+// log-determinant picks the tighter, nearer centre.
 // ===========================================================================
 
-TEST_CASE("pos_var_px2: the blob<->LED assignment is ranked by the measurement-noise-weighted cost")
+TEST_CASE("pos_var_px2: blob assignment includes the Gaussian log-determinant")
 {
 	// One visible LED, single pinhole camera. dir faces the camera (-Z) so the LED passes the visibility
 	// test; a real LED radius gives a non-degenerate gate.
@@ -987,9 +987,8 @@ TEST_CASE("pos_var_px2: the blob<->LED assignment is ranked by the measurement-n
 	const double gate = probe.visible_leds[0].led_radius_px;
 	REQUIRE(gate > 2.5); // both candidate blobs must sit inside the gate
 
-	// blob 0: FAR (2.0 px) but very uncertain  -> Maha 4.0/16 = 0.25  (most consistent with its own noise)
-	// blob 1: NEAR (1.0 px) but a tight centre -> Maha 1.0/0.5 = 2.0
-	// raw distance picks blob 1 (1.0 < 4.0); the measurement-noise-weighted cost picks blob 0 (0.25 < 2.0).
+	// Mahalanobis distance alone prefers blob 0 (4/16 < 1/0.5), but the Gaussian likelihood includes
+	// normalization and prefers blob 1 (4/16 + 2log(16) > 1/0.5 + 2log(0.5)).
 	struct blob blobs[2];
 	blobs[0] = blob{};
 	blobs[0].x = led_px.x + 2.0f;
@@ -1007,13 +1006,48 @@ TEST_CASE("pos_var_px2: the blob<->LED assignment is ranked by the measurement-n
 	pose_metrics_match_pose_to_blobs(&pose, blobs, 2, &model, &cam, &mi);
 	REQUIRE(mi.num_visible_leds == 1);
 	REQUIRE(mi.visible_leds[0].matched_blob != nullptr);
-	// The weighted cost flipped the choice: the LED is assigned to blob 0 (far + uncertain), NOT the
-	// raw-closest blob 1. Unwired (raw dx^2+dy^2) this would be blob 1 and the check fails.
-	CHECK(mi.visible_leds[0].matched_blob == &blobs[0]);
+	CHECK(mi.visible_leds[0].matched_blob == &blobs[1]);
 
 	// And the accumulated reprojection_error stays in RAW px^2 (so the GOOD/STRONG thresholds keep their
-	// calibration): it equals blob 0's raw squared distance (2.0^2 = 4.0), not the weighted cost.
-	CHECK(mi.reprojection_error == Catch::Approx(4.0).margin(1e-3));
+	// calibration): it equals blob 1's raw squared distance (1.0^2 = 1.0), not the ranking cost.
+	CHECK(mi.reprojection_error == Catch::Approx(1.0).margin(1e-3));
+}
+
+TEST_CASE("priorless pose evaluation clears prior-only error channels")
+{
+	std::vector<t_constellation_led> leds(1);
+	leds[0] = t_constellation_led{};
+	leds[0].id = 0;
+	leds[0].pos = {0.f, 0.f, 0.f};
+	leds[0].dir = {0.f, 0.f, -1.f};
+	leds[0].radius_mm = 4.0f;
+	t_constellation_led_model model{};
+	model.id = MODEL_ID;
+	model.leds = leds.data();
+	model.num_leds = 1;
+
+	struct camera_model cam = make_pinhole();
+	struct xrt_pose pose = XRT_POSE_IDENTITY;
+	pose.position = {0.f, 0.f, 0.5f};
+
+	struct blob candidate{};
+	candidate.x = (float)CX;
+	candidate.y = (float)CX;
+	candidate.pos_var_px2 = 1.0f;
+	candidate.led_id = LED_INVALID_ID;
+
+	struct pose_metrics score{};
+	score.pos_error = {1.f, 2.f, 3.f};
+	score.orient_error = {4.f, 5.f, 6.f};
+	pose_metrics_evaluate_pose(&score, &pose, &candidate, 1, &model, &cam, nullptr);
+
+	CHECK_FALSE(POSE_HAS_FLAGS(&score, POSE_HAD_PRIOR));
+	CHECK(score.pos_error.x == 0.f);
+	CHECK(score.pos_error.y == 0.f);
+	CHECK(score.pos_error.z == 0.f);
+	CHECK(score.orient_error.x == 0.f);
+	CHECK(score.orient_error.y == 0.f);
+	CHECK(score.orient_error.z == 0.f);
 }
 
 // ===========================================================================
