@@ -149,6 +149,22 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 		regression_benchmark PROPERTIES ENVIRONMENT "PYTHONNOUSERSITE=1" SKIP_RETURN_CODE 77 LABELS
 										g2_regression)
 
+	# Standing CROSS-DEVICE IDENTITY gate: replays the pinned identity-swap fixture (a capture whose
+	# 300 ms optical blackouts made the two controllers trade LED rings) and fails if ANY accepted
+	# optical pose inside the frozen episode windows lands on the partner's cleaned-GT instead of its
+	# own. Distinct from regression_benchmark, which scores each device against its own reference and
+	# so cannot tell a swap from ordinary error. Skips 77 like the gates above when the capture,
+	# harness or scoring deps are absent.
+	add_test(
+		NAME identity_swap_regression
+		COMMAND ${G2_REGRESSION_PYTHON}
+				${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/telemetry/identity_swap_check.py
+				${CMAKE_CURRENT_BINARY_DIR}/identity_swap_regression --regression --bin
+				$<TARGET_FILE:offline_vio_replay>)
+	set_tests_properties(
+		identity_swap_regression PROPERTIES ENVIRONMENT "PYTHONNOUSERSITE=1" SKIP_RETURN_CODE 77 LABELS
+											g2_regression)
+
 	# Inertial coast-drift experiment + GATE: real ESKF on recorded IMU + optical (also with withheld-
 	# optical windows) to measure out-of-view dead-reckon drift, the frozen fraction, and the re-entry
 	# snap. As a tool it prints the per-gap table; with --check it compares the per-bin metrics against

@@ -112,6 +112,11 @@ enum g2_telem_event_type
 	 * (footer region carried image data), 2 = device timestamp regressed vs the last
 	 * accepted transfer, 3 = implausible forward device-timestamp jump. */
 	G2_TELEM_EV_CAMERA_XFER_DROPPED = 27,
+	/*! A visually-chosen observation was deferred because the cluster's DEVICE IDENTITY is
+	 * ambiguous: an alternative joint assignment that hands the SAME cluster to a partner
+	 * device costs less than the identity-defer margin extra (t_constellation_tracking.c,
+	 * association identity-ambiguity deferral). value = the margin in nats. */
+	G2_TELEM_EV_ASSOC_IDENTITY_DEFER = 28,
 };
 
 /* ---- Stream emit functions (POD rows; lock-free; safe from any single producer) ---- */

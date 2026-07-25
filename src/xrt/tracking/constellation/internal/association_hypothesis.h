@@ -196,6 +196,26 @@ association_hypotheses_shared_blob_count(const struct association_pose_hypothesi
 	return count;
 }
 
+/*! Are @p a and @p b rival explanations of the SAME physical cluster, i.e. do they place their device
+ * within @p max_separation_m of each other? Sharing a blob does not answer this: two adjacent
+ * controllers contend for one boundary blob routinely while each sits on its own prior, and
+ * conversely two poses on ONE ring split its blobs between them under joint exclusivity, so the
+ * shared count can be small while the claims are the same object. Position is the honest measure. */
+static inline bool
+association_hypotheses_same_cluster(const struct association_pose_hypothesis *a,
+                                    const struct association_pose_hypothesis *b,
+                                    float max_separation_m)
+{
+	if (a == NULL || b == NULL || (a->flags & ASSOC_HYP_HAS_POSE) == 0 ||
+	    (b->flags & ASSOC_HYP_HAS_POSE) == 0) {
+		return false;
+	}
+	const struct xrt_vec3 d = {a->pose_world.position.x - b->pose_world.position.x,
+	                           a->pose_world.position.y - b->pose_world.position.y,
+	                           a->pose_world.position.z - b->pose_world.position.z};
+	return d.x * d.x + d.y * d.y + d.z * d.z <= max_separation_m * max_separation_m;
+}
+
 static inline bool
 association_joint_pair_is_compatible(const struct association_pose_hypothesis *a,
                                      const struct association_pose_hypothesis *b)

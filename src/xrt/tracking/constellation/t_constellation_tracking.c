@@ -1511,8 +1511,14 @@ static float assoc_single_view_clutter_min_var_px2 = ASSOC_SINGLE_VIEW_CLUTTER_M
 #define ASSOC_IDENTITY_STEAL_MARGIN_M 0.06f
 #define ASSOC_IDENTITY_STEAL_SIGMA_M 0.04f
 #define ASSOC_IDENTITY_STEAL_BASE_NLL 24.0f
-#define ASSOC_IDENTITY_STEAL_OCCUPIED_SCALE 0.35f
+#define ASSOC_IDENTITY_STEAL_VACATED_SCALE 0.35f
 #define ASSOC_IDENTITY_STEAL_MAX_NLL 36.0f
+/* Identity-ambiguity commitment margin (nats): a visual observation defers when an alternative
+ * joint assignment that hands its cluster to a PARTNER device costs less than this much extra
+ * (~e^3 = 20:1 odds). Sized above the measured knife-edge margin band (|margin| <~ 2 nats across
+ * the 20260723 swap bifurcations, feed-epsilon flippable) and below the ~4-10 nat separation a
+ * dense (m >= 8) cluster develops once chirality + gravity tilt discriminate the true owner. */
+#define ASSOC_IDENTITY_DEFER_MARGIN_NLL 3.0f
 
 enum association_observation_kind
 {
@@ -3930,6 +3936,29 @@ association_prior_distance_m(const struct association_pose_hypothesis *candidate
 	return m_vec3_len(m_vec3_sub(candidate->pose_world.position, dev_state->P_world_obj_prior.position));
 }
 
+/* Has device @p j's chosen observation actually VACATED the identity device @p i is being charged for
+ * stealing? Holding a position of its own excuses the contest only if the partner went somewhere that
+ * is not device @p i's own prior. A mutual transposition — each device sitting on the other's prior —
+ * is self-consistent and would otherwise buy BOTH sides the excuse, which is precisely the assignment
+ * this term exists to reject: on xv1/periodic-300 t=60.918 it cut a 52.3-nat steal to 18.3, under the
+ * 28.0 nats of coasting, so the swapped pair won outright and both controllers stayed transposed for
+ * ~1 s. */
+static bool
+association_identity_partner_vacated(const struct constellation_tracking_sample *sample,
+                                     const struct association_pose_hypothesis *const chosen[],
+                                     const enum association_observation_kind chosen_kind[],
+                                     int i,
+                                     int j)
+{
+	if (chosen[j] == NULL || !association_observation_kind_owns_position(chosen_kind[j])) {
+		return false;
+	}
+	const float partner_own_d = association_prior_distance_m(chosen[j], &sample->devices[j]);
+	return association_identity_steal_excess_m(partner_own_d,
+	                                           association_prior_distance_m(chosen[j],
+	                                                                        &sample->devices[i])) <= 0.0f;
+}
+
 static float
 association_cross_device_identity_nll(const struct constellation_tracking_sample *sample,
                                       const struct association_pose_hypothesis *const chosen[],
@@ -3962,8 +3991,8 @@ association_cross_device_identity_nll(const struct constellation_tracking_sample
 
 			const float s = steal_m / ASSOC_IDENTITY_STEAL_SIGMA_M;
 			float nll = ASSOC_IDENTITY_STEAL_BASE_NLL + 0.5f * s * s;
-			if (chosen[j] != NULL && association_observation_kind_owns_position(chosen_kind[j])) {
-				nll *= ASSOC_IDENTITY_STEAL_OCCUPIED_SCALE;
+			if (association_identity_partner_vacated(sample, chosen, chosen_kind, i, j)) {
+				nll *= ASSOC_IDENTITY_STEAL_VACATED_SCALE;
 			}
 			if (nll > ASSOC_IDENTITY_STEAL_MAX_NLL) {
 				nll = ASSOC_IDENTITY_STEAL_MAX_NLL;
@@ -4306,6 +4335,11 @@ association_apply_joint_contention(struct t_constellation_tracker *ct,
 	}
 }
 
+/* @p banned_slot / @p banned_hyp (optional, -1 / NULL to disable): exclude every hypothesis of
+ * @p banned_slot that touches ANY blob of @p banned_hyp — the "this cluster is NOT this device's"
+ * counterfactual the identity-ambiguity margin is measured against. Touching one blob is enough to
+ * ban: a clean alternative world must not smuggle any of the contested blobs back to the device
+ * whose claim is being withdrawn. */
 static void
 association_select_joint_recursive(const struct association_device_work work[],
                                    const struct constellation_tracking_sample *sample,
@@ -4314,6 +4348,8 @@ association_select_joint_recursive(const struct association_device_work work[],
                                    const struct association_pose_hypothesis *chosen[],
                                    enum association_observation_kind chosen_kind[],
                                    float cost,
+                                   int banned_slot,
+                                   const struct association_pose_hypothesis *banned_hyp,
                                    struct association_joint_choice *best)
 {
 	if (index == n_devices) {
@@ -4341,11 +4377,14 @@ association_select_joint_recursive(const struct association_device_work work[],
 		chosen[index] = NULL;
 		chosen_kind[index] = ASSOC_OBS_ABSENT;
 		association_select_joint_recursive(work, sample, n_devices, index + 1, chosen, chosen_kind,
-		                                   cost + absent_cost, best);
+		                                   cost + absent_cost, banned_slot, banned_hyp, best);
 	}
 
 	for (int h = 0; h < work[index].count; h++) {
 		const struct association_pose_hypothesis *candidate = &work[index].hyps[h];
+		if (index == banned_slot && association_hypotheses_share_blob(candidate, banned_hyp)) {
+			continue;
+		}
 		const enum association_observation_kind kinds[] = {
 		    ASSOC_OBS_POSE_LOCK,
 		    ASSOC_OBS_POSITION_ONLY,
@@ -4370,7 +4409,7 @@ association_select_joint_recursive(const struct association_device_work work[],
 			chosen[index] = candidate;
 			chosen_kind[index] = kind;
 			association_select_joint_recursive(work, sample, n_devices, index + 1, chosen, chosen_kind,
-			                                   cost + option_cost, best);
+			                                   cost + option_cost, banned_slot, banned_hyp, best);
 		}
 	}
 	chosen[index] = NULL;
@@ -4970,12 +5009,63 @@ constellation_associate_covariance_frame(struct t_constellation_tracker *ct,
 	const struct association_pose_hypothesis *current[CONSTELLATION_MAX_DEVICES] = {0};
 	enum association_observation_kind current_kind[CONSTELLATION_MAX_DEVICES] = {0};
 	struct association_joint_choice best = {0};
-	association_select_joint_recursive(work, sample, sample->n_devices, 0, current, current_kind, 0.0f, &best);
+	association_select_joint_recursive(work, sample, sample->n_devices, 0, current, current_kind, 0.0f, -1, NULL,
+	                                   &best);
 	if (!best.valid) {
 		for (int i = 0; i < sample->n_devices; i++) {
 			association_fold_prior_leds(ct, &sample->devices[i], sample);
 		}
 		return;
+	}
+
+	/* Identity-ambiguity commitment discipline. A visual observation may only feed the filter when
+	 * the joint evidence actually pins the cluster's DEVICE IDENTITY: re-solve the joint selection
+	 * with this device banned from its chosen cluster, and if a PARTNER takes THAT SAME CLUSTER in
+	 * an alternative assignment costing < ASSOC_IDENTITY_DEFER_MARGIN_NLL extra, the identity is a
+	 * near coin-flip (at 4-7 bloomed LEDs both chiral models fit and the tilt clamp can erase the
+	 * gravity objection). Committing would collapse the ESKF covariance onto a possibly-wrong ring
+	 * and poison every later prior objection into DEFENDING the swap, so the observation defers
+	 * until accumulating LEDs separate the permutations. Whether to defer is priced purely by the
+	 * evidence margin; geometry only identifies WHICH pair of claims are rivals.
+	 * "Same cluster" means the two claims place their device at the same POINT, within
+	 * the identity discrimination margin. A shared blob does not answer it in either direction:
+	 * two adjacent controllers contend for one boundary blob while each sits on its own prior
+	 * (xv1 t=52.122 s, 1 shared blob of 16, poses 10.2 cm apart, both priors within 3.7 cm of
+	 * their own device -- contention, not identity), and two poses on ONE ring split its blobs
+	 * between them under joint exclusivity (xv1 t=60.996 s, 1 shared blob of 5, poses 2.1 cm
+	 * apart, the claim 18.1 cm from its own prior and 0.7 cm from the partner's -- a steal).
+	 * Measured separations: 2.1 / 2.2 / 3.0 cm on the real bifurcations against 10.2 cm on the
+	 * contention frame. */
+	bool identity_deferred[CONSTELLATION_MAX_DEVICES] = {false};
+	for (int slot = 0; slot < sample->n_devices; slot++) {
+		if (sample->n_devices < 2 || best.chosen[slot] == NULL ||
+		    !association_observation_kind_visual(best.kind[slot])) {
+			continue;
+		}
+		struct association_joint_choice alt = {0};
+		association_select_joint_recursive(work, sample, sample->n_devices, 0, current, current_kind, 0.0f,
+		                                   slot, best.chosen[slot], &alt);
+		if (!alt.valid || alt.total_cost - best.total_cost >= ASSOC_IDENTITY_DEFER_MARGIN_NLL) {
+			continue;
+		}
+		for (int other = 0; other < sample->n_devices; other++) {
+			if (other == slot || !association_observation_kind_visual(alt.kind[other]) ||
+			    !association_hypotheses_same_cluster(alt.chosen[other], best.chosen[slot],
+			                                         ASSOC_IDENTITY_STEAL_MARGIN_M)) {
+				continue;
+			}
+			identity_deferred[slot] = true;
+			if (g2_telem_enabled()) {
+				const struct constellation_tracker_device *cdev =
+				    ct->devices + sample->devices[slot].dev_index;
+				const struct xrt_device *xdev =
+				    cdev->connection != NULL ? cdev->connection->xdev : NULL;
+				g2_telem_event(telem_device_id(xdev), sample->timestamp,
+				               G2_TELEM_EV_ASSOC_IDENTITY_DEFER,
+				               alt.total_cost - best.total_cost);
+			}
+			break;
+		}
 	}
 
 	/* The joint selection guarantees mutual blob-exclusivity of best.chosen; a yaw-belief override
@@ -4993,6 +5083,14 @@ constellation_associate_covariance_frame(struct t_constellation_tracker *ct,
 		enum association_observation_kind choice_kind = best.kind[slot];
 		const struct association_pose_hypothesis *best_lockable =
 		    association_best_lockable_local(&work[slot], NULL, 0);
+
+		if (identity_deferred[slot]) {
+			/* No visual commit AND no prior-LED folds: a contested slot's prior labels may
+			 * themselves be swap-poisoned, and one frame of coast is the honest price of an
+			 * unresolved identity. */
+			committed[slot] = NULL;
+			continue;
+		}
 
 		if (device->yaw_belief.active) {
 			committed[slot] = NULL;
