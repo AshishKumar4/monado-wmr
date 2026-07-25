@@ -3932,12 +3932,16 @@ TEST_CASE("kalman: full accel ellipsoid calibration recovers a known per-axis sc
 	}
 	double T[9];
 	REQUIRE(kf->debug_get_accel_calibration(T) == true); // fitted from the orientations
-	CHECK(T[0] == Approx(1.0 / sx).margin(0.04));         // diagonal ~ 1/S (recovers the per-axis scale)
-	CHECK(T[4] == Approx(1.0 / sy).margin(0.04));
-	CHECK(T[8] == Approx(1.0 / sz).margin(0.04));
-	CHECK(std::abs(T[1]) < 0.05); // ~no spurious misalignment (off-diagonal near 0)
-	CHECK(std::abs(T[2]) < 0.05);
-	CHECK(std::abs(T[5]) < 0.05);
+	// The 14 orientations are exact and rest-only, so the only input error is the float32 accel
+	// quantisation (~6e-8 relative); the fit lands within 5.3e-6 of S^-1 on every axis. 1e-4 is 20x
+	// that residual yet 99x tighter than the SMALLEST identity gap (|1 - 1/sz| = 0.0099), so an
+	// unfitted/identity T cannot pass -- which is what makes this the magnitude pin.
+	CHECK(T[0] == Approx(1.0 / sx).margin(1e-4));
+	CHECK(T[4] == Approx(1.0 / sy).margin(1e-4));
+	CHECK(T[8] == Approx(1.0 / sz).margin(1e-4));
+	CHECK(std::abs(T[1]) < 1e-4); // a diagonal S must fit diagonal: no spurious misalignment
+	CHECK(std::abs(T[2]) < 1e-4);
+	CHECK(std::abs(T[5]) < 1e-4);
 }
 
 TEST_CASE("kalman: reported pose uncertainty falls with tracking and rises when optical is lost in motion")
