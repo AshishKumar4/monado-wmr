@@ -141,7 +141,12 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 		COMMAND ${G2_REGRESSION_PYTHON}
 				${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/telemetry/regression_check.py
 				--bin $<TARGET_FILE:offline_vio_replay> --baseline
-				${CMAKE_CURRENT_SOURCE_DIR}/regression_baseline.json)
+				${CMAKE_CURRENT_SOURCE_DIR}/regression_baseline.json --out
+				${CMAKE_CURRENT_BINARY_DIR}/regression_benchmark)
+	# --out is build-dir scoped like identity_swap_regression below, NOT the tool's global /tmp default:
+	# two checkouts running ctest concurrently otherwise interleave their replay CSVs in one directory,
+	# which fails the run at best (observed: csv field-limit error) and scores one binary against the
+	# other's rows at worst -- a gate reading someone else's evidence.
 	# regression_check.py exits 77 on every skip path (missing scoring deps / capture / binary /
 	# controller jsons / baseline), mirroring coast_regression below: a capture-less checkout
 	# reports a LOUD ctest SKIP, never a silent pass.
