@@ -4525,7 +4525,7 @@ TEST_CASE("kalman: real recorded session corpus replays stay finite and bounded"
 
 		size_t ip = 0; // optical-pose cursor
 		bool ever_tracked = false;
-		float max_pos = 0.0f, max_speed = 0.0f;
+		float max_pos = 0.0f, max_speed = 0.0f, max_pos_tracked = 0.0f;
 
 		for (const g2replay::Imu &s : ds.imu) {
 			// Feed every optical pose up to this IMU time first, preserving the recorded ordering/lag.
@@ -4547,10 +4547,20 @@ TEST_CASE("kalman: real recorded session corpus replays stay finite and bounded"
 			max_speed = std::max(max_speed, std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z));
 			if (rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) {
 				ever_tracked = true;
+				max_pos_tracked = std::max(max_pos_tracked, std::sqrt(pp.x * pp.x + pp.y * pp.y + pp.z * pp.z));
 			}
 		}
 
-		CHECK(max_pos < 5.0f);    // a degenerate optical solve never captures the filter (plausibility bound)
+		// A degenerate optical solve never captures the filter. The bound is the filter's OWN contract,
+		// not a number that happens to fit the tidiest session: with no live HMD pose (this harness has
+		// none) it refuses to ADOPT any optical position beyond MAX_WORLD_POS_M of the origin, so a
+		// tracked report can exceed that only by dead-reckoning, and an untracked one only until the
+		// freeze horizon stops it. The clean sessions matter here -- ~1 % of their recorded optical
+		// solves sit past 3.4 m and a few past 5 m -- and the 33 m degenerate that motivated the check
+		// misses either bound by an order of magnitude.
+		constexpr float MAX_WORLD_POS_M = 4.0f; // EskfFusion::MAX_WORLD_POS_M (degraded, no HMD pose)
+		CHECK(max_pos_tracked < MAX_WORLD_POS_M + 1.0f); // dead-reckon inside the 0.5 s freeze horizon
+		CHECK(max_pos < 2.0f * MAX_WORLD_POS_M);
 		CHECK(max_speed < 15.0f); // velocity watchdog (clamps ~12 m/s) bounds any dead-reckon runaway
 		if (ds.pose.size() >= 5) {
 			CHECK(ever_tracked); // a session with real optical must achieve a lock
