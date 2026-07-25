@@ -92,18 +92,46 @@ TEST_CASE("yaw belief: a sustained pure-yaw tie resolves over frames; temporal_n
 	const struct xrt_quat A = quat_axis_deg(0, 1, 0, 0);
 	const struct xrt_quat B = quat_axis_deg(0, 1, 0, 180);
 
-	// NEGATIVE CONTROL (the "temporal_nll alone could not" requirement): on the seed frame there is NO trusted
-	// continuity reference. temporal_nll early-returns / contributes 0, so it cannot separate A from B — the pick
-	// would be a coin-flip. (Even priced against the controller's own held heading, both twins are equidistant.)
+	// NEGATIVE CONTROL (the "temporal_nll alone could not" requirement): at the seed there is no trusted YAW
+	// reference (association_temporal_yaw_nll early-returns 0 with an absent/stale ref), so the only channel
+	// left is the driftless gravity tilt — and that channel provably cannot separate pure-yaw twins.
+	// Price both against a reference that is BOTH tilted and yawed, ref = Y(40) . T(25), so neither channel is
+	// trivially zero. The split is q_rel = q_cand . q_prior^-1, decomposed swing(tilt) . twist(yaw) about up:
+	//   A: q_rel = T(-25) . Y(-40)                       -> tilt 25, yaw 40
+	//   B: q_rel = Y(180) . T(-25) . Y(-40) = T(25) . Y(140) -> tilt 25, yaw 140
+	// because left-multiplying by the 180-deg world-up twin rotation CONJUGATES the swing (angle preserved)
+	// and rotates the twist by 180 deg. Hence tilt_A == tilt_B exactly and yaw_A + yaw_B == 180 exactly.
 	{
-		const double cA = temporal_cost(A, A); // a stale/absent reference ties both: cost is symmetric
+		const struct xrt_vec3 up = {0.f, 1.f, 0.f};
+		const struct xrt_quat qt = quat_axis_deg(1, 0, 0, 25), qy = quat_axis_deg(0, 1, 0, 40);
+		struct xrt_quat ref;
+		math_quat_rotate(&qy, &qt, &ref);
+		math_quat_normalize(&ref);
+
+		double tiltA = 0, yawA = 0, tiltB = 0, yawB = 0;
+		pose_metrics_prior_orient_split(&A, &ref, &up, &tiltA, &yawA);
+		pose_metrics_prior_orient_split(&B, &ref, &up, &tiltB, &yawB);
+		// float32 quats: |d(2 acos w)/dw| ~ 9 at these angles, so ~1e-6 rad of slop; 1e-5 is 10x that.
+		CHECK(tiltA == Catch::Approx(25.0 * M_PI / 180.0).margin(1e-5));  // tilt channel is LIVE, not 0
+		CHECK(tiltB == Catch::Approx(25.0 * M_PI / 180.0).margin(1e-5));  // ...and identical for the twin
+		CHECK(yawA == Catch::Approx(40.0 * M_PI / 180.0).margin(1e-5));
+		CHECK(yawB == Catch::Approx(140.0 * M_PI / 180.0).margin(1e-5));  // all separation lives in yaw
+
+		// The same statement at the cost API the matcher calls: with the yaw axis dropped (sigma <= 0 is +inf,
+		// i.e. no trusted yaw reference) the gravity-only prior charge is EQUAL and non-zero for both twins —
+		// it is a live term that still cannot break the seed tie.
+		const double tilt_only_A =
+		    pose_metrics_prior_orient_cost(&A, &ref, &up, p.tilt_sigma_rad, -1.0, p.huber_knee, p.weight);
+		const double tilt_only_B =
+		    pose_metrics_prior_orient_cost(&B, &ref, &up, p.tilt_sigma_rad, -1.0, p.huber_knee, p.weight);
+		// tilt_sigma is 180 deg, so d2 = (25/180)^2 = 0.01929, below the knee -> cost == d2 * weight.
+		CHECK(tilt_only_A == Catch::Approx(0.019290).margin(1e-5));
+		CHECK(tilt_only_B == Catch::Approx(tilt_only_A).margin(1e-9));
+
+		// And a 180-deg flip against a LIVE yaw reference saturates the cap (so the term IS the right lever
+		// once a reference EXISTS — which is exactly the regime the belief hands off to).
+		const double cA = temporal_cost(A, A);
 		const double cB = temporal_cost(B, A);
-		// With the reference == A the term already "knows" the answer; the point of the seed regime is there is
-		// NO such reference. Model that: with no reference the term is identically 0 for both -> tie unbroken.
-		const double c_seed_A = 0.0, c_seed_B = 0.0;
-		CHECK(c_seed_A == Catch::Approx(c_seed_B)); // the single-frame term cannot break the seed tie
-		// And a 180-deg flip against a reference saturates the cap (so the term IS the right lever once a
-		// reference EXISTS — which is exactly the regime the belief hands off to).
 		CHECK(cA < 0.5);
 		CHECK(cB == Catch::Approx(p.cap));
 	}
