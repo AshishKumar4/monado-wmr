@@ -189,9 +189,9 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 	# The corpus is THREE real recorded sessions x BOTH controllers (captures 20260524-200416-headpose,
 	# 20260526-175615-clean and 20260528-080421-xv-session1, extracted by
 	# tools/telemetry/make_replay_fixture.py), and the withhold list is the set of coast horizons each leg
-	# is replayed at. One session's natural gaps are ~all optical cadence, which
-	# left every bin past 100 ms holding a handful of samples -- below the gate's minimum, so the whole
-	# out-of-view regime was printed and ignored. The horizons hide the recorded optical stream for that
+	# is replayed at. One session's natural gaps are ~all optical cadence, which left every bin past
+	# 100 ms holding a handful of samples -- below the gate's minimum, so the whole out-of-view regime
+	# was printed and ignored. The horizons hide the recorded optical stream for that
 	# long every --recover seconds, so the filter dead-reckons a real controller through a real
 	# out-of-view window and is scored against the real pose that ends it; pooled over the corpus every
 	# bin clears the gating minimum. Losing that coverage is itself a gated failure.

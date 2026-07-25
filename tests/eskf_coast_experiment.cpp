@@ -422,10 +422,10 @@ print_guard_table(const std::vector<Guard> &guards)
 //! @p recover_ns. Appends its coast samples to @p samples and returns what the leg replayed. Every leg
 //! is independent (own filter, own bootstrap), so a corpus is just a loop.
 LegResult
-run_leg(const g2replay::Dataset &ds, const std::string &fixture, int64_t withhold_ns, int64_t recover_ns,
-        const double *mg, const double *ta, std::vector<Sample> &samples)
+run_leg(const g2replay::Dataset &ds, int64_t withhold_ns, int64_t recover_ns, const double *mg,
+        const double *ta, std::vector<Sample> &samples)
 {
-	LegResult leg{fixture, withhold_ns * 1e-9, 0, 0, 0, 0, 0.0};
+	LegResult leg{ds.name, withhold_ns * 1e-9, 0, 0, 0, 0, 0.0};
 	const int64_t t0 = ds.imu.front().t_ns;
 	const int64_t bootstrap_ns = t0 + (int64_t)(BOOTSTRAP_S * 1e9);
 	const size_t samples_before = samples.size();
@@ -644,7 +644,7 @@ main(int argc, char **argv)
 	const int64_t recover_ns = (int64_t)(recover_s * 1e9);
 	for (size_t i = 0; i < corpus.size(); i++) {
 		for (double w : withholds_s) {
-			const LegResult leg = run_leg(corpus[i], corpus[i].name, (int64_t)(w * 1e9), recover_ns,
+			const LegResult leg = run_leg(corpus[i], (int64_t)(w * 1e9), recover_ns,
 			                              have_intrinsics ? mg : nullptr, ta, samples);
 			reentry_snap_max_m = std::max(reentry_snap_max_m, leg.snap_max_m);
 			legs.push_back(leg);
