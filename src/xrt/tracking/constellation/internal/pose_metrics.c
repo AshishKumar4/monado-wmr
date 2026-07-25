@@ -351,23 +351,168 @@ pose_metrics_pkf_permanent_augmented(const double *L, const double *L_clutter, i
 	return per;
 }
 
-/* Detection NLL for a finished assignment, plus the all-missed reference for matched LEDs. */
+/* Fraction of a disc of radius @p r, whose centre sits @p dist from the centre of a disc of radius
+ * @p big, that lies inside the big one — the exact circle-circle lens area over pi*r^2. Continuous in
+ * @p dist, so there is no cliff at contact, and it introduces no scale of its own: both radii come from
+ * the caller (one measured off the blob, one predicted from the pose and the LED model). */
+static double
+disc_overlap_fraction(double dist, double big, double r)
+{
+	if (!(r > 0.0) || !(big > 0.0) || dist >= big + r) {
+		return 0.0;
+	}
+	if (dist <= big - r) {
+		return 1.0;
+	}
+	if (dist <= r - big) {
+		return (big * big) / (r * r); /* the big disc is entirely inside the LED's own image */
+	}
+	const double d2 = dist * dist, r2 = r * r, b2 = big * big;
+	const double ca = (d2 + r2 - b2) / (2.0 * dist * r);
+	const double cb = (d2 + b2 - r2) / (2.0 * dist * big);
+	const double lens = r2 * acos(ca > 1.0 ? 1.0 : (ca < -1.0 ? -1.0 : ca)) +
+	                    b2 * acos(cb > 1.0 ? 1.0 : (cb < -1.0 ? -1.0 : cb)) -
+	                    0.5 * sqrt((-dist + r + big) * (dist + r - big) * (dist - r + big) * (dist + r + big));
+	const double frac = lens / (M_PI * r2);
+	return !(frac > 0.0) ? 0.0 : (frac > 1.0 ? 1.0 : frac); /* the !> form also rejects NaN */
+}
+
+/* One candidate absolution: unmatched LED @p led_idx hidden inside the matched blob at @p slot. Only the
+ * best-containing blob is kept per unmatched LED — blobs are disjoint connected components, so an LED's
+ * light can physically sit in at most one — which bounds the list by the visible-LED count. */
+struct merge_candidate
+{
+	double overlap;
+	int led_idx;
+	int slot;
+};
+
+/* Detection NLL for a finished assignment, plus the all-missed reference for matched LEDs.
+ *
+ * A visible LED the assignment left unmatched is not automatically evidence against the pose: when two
+ * LED images overlap, the detector reports ONE blob, so the second LED cannot produce a blob of its own
+ * and owes no miss cost. That is a statement about light, and it is priced from what the blob's own
+ * pixels measured — never from a chosen scale:
+ *
+ *   containment: the detected light is modelled as a disc of the blob's measured area (R = sqrt(area/pi))
+ *     and the LED's image as a disc of its predicted radius at that range, so the fraction of the LED's
+ *     image inside that light (exact lens area) is the share of its photons that would have landed in an
+ *     already-explained blob, read as P(no separate detection). The centroid variance pos_var_px2 is
+ *     deliberately NOT the scale here: it is the uncertainty of the centre ESTIMATE, not the extent of
+ *     the light, and using it as a merge radius absolves LEDs that fall outside the blob entirely.
+ *   capacity: a blob can hide only as many LEDs as its light accounts for. Its area measures
+ *     area/(pi*r^2) LED-equivalents, one of them the LED it is matched to, and the rest is merge
+ *     capacity — minus the one-pixel quantum of the area count itself. A crisp single-LED blob measures
+ *     ~1 LED-equivalent and so absolves nothing; a bloomed/merged blob measures more, and that surplus
+ *     is exactly the merge this term exists for. pi*r^2 is a prediction, not a measurement, and it is
+ *     the one calibrated input here: it tracks the observed single-LED blob area to ~3 % on a crisp
+ *     capture, but it drifts with bloom and with range (r ~ 1/z while a threshold-limited blob stops
+ *     shrinking), so a far or bloomed single LED can carry a fraction of a spurious LED-equivalent.
+ *
+ * Absolutions are ASSIGNED — strongest containment first, each claiming a whole LED-equivalent of the
+ * blob's remaining capacity, each LED absolved at most once. */
 static void
 compute_data_nll(struct pose_metrics_blob_match_info *match_info)
 {
+	/* Residual merge capacity in LED-equivalents of measured light, and the equivalent-disc radius of
+	 * the measured light, per matched LED slot. */
+	double capacity[MAX_OBJECT_LEDS];
+	double light_radius_px[MAX_OBJECT_LEDS];
+	struct merge_candidate cands[MAX_OBJECT_LEDS];
+	int n_cands = 0;
+	bool any_surplus = false;
+	for (int i = 0; i < match_info->num_visible_leds; i++) {
+		const struct pose_metrics_visible_led_info *led = match_info->visible_leds + i;
+		capacity[i] = 0.0;
+		light_radius_px[i] = 0.0;
+		if (led->matched_blob == NULL || !(led->led_radius_px > 0.0)) {
+			continue;
+		}
+		/* area is a count of thresholded pixels, so its resolution is one pixel: charge that quantum
+		 * against the surplus rather than reading evidence out of the measurement's own last digit. */
+		const double led_area = M_PI * led->led_radius_px * led->led_radius_px;
+		const double surplus = ((double)led->matched_blob->area - 1.0) / led_area - 1.0;
+		capacity[i] = surplus > 0.0 ? surplus : 0.0;
+		light_radius_px[i] = sqrt((double)led->matched_blob->area / M_PI);
+		any_surplus |= capacity[i] > 0.0;
+	}
+	for (int i = 0; any_surplus && i < match_info->num_visible_leds; i++) {
+		const struct pose_metrics_visible_led_info *led = match_info->visible_leds + i;
+		if (led->matched_blob != NULL) {
+			continue;
+		}
+		struct merge_candidate best = {.overlap = 0.0, .led_idx = i, .slot = -1};
+		for (int j = 0; j < match_info->num_visible_leds; j++) {
+			if (capacity[j] <= 0.0) {
+				continue;
+			}
+			const struct blob *b = match_info->visible_leds[j].matched_blob;
+			const double dx = led->pos_px.x - b->x;
+			const double dy = led->pos_px.y - b->y;
+			const double overlap = disc_overlap_fraction(sqrt(dx * dx + dy * dy), light_radius_px[j],
+			                                             led->led_radius_px);
+			if (overlap > best.overlap) {
+				best.overlap = overlap;
+				best.slot = j;
+			}
+		}
+		if (best.slot >= 0) {
+			cands[n_cands++] = best;
+		}
+	}
+
+	/* Insertion sort by descending overlap, ties by LED index so a replay resolves identically every
+	 * run. The list is empty whenever no blob carries surplus light — most of a crisp capture, but only
+	 * a minority of a bloomed one, where it holds a handful of entries. */
+	for (int i = 1; i < n_cands; i++) {
+		const struct merge_candidate cur = cands[i];
+		int j = i;
+		while (j > 0 && (cands[j - 1].overlap < cur.overlap ||
+		                 (cands[j - 1].overlap == cur.overlap && cands[j - 1].led_idx > cur.led_idx))) {
+			cands[j] = cands[j - 1];
+			j--;
+		}
+		cands[j] = cur;
+	}
+
+	/* One absolution claims one WHOLE LED-equivalent of the surplus, at the confidence the LED is
+	 * contained. Two reasons it is a whole unit and not the granted probability:
+	 *   - the alternatives are mutually exclusive, not independent. Charging only the probability
+	 *     would let N LEDs share one LED-equivalent at g = 1/N each, and -log(1-p+p*g) is concave,
+	 *     so the sum of their marginal reliefs runs to several times what one full absolution buys
+	 *     (32 LEDs sharing one unit collect ~15 nats where one collects 3.0).
+	 *   - a pixel count cannot tell one LED from several stacked on the same spot, so charging the
+	 *     incremental union area two overlapping images add would hand a pose that collapses the
+	 *     model onto a few blobs an unbounded excuse — the failure this term replaces.
+	 * A blob therefore excuses at most ceil(capacity) LEDs, however they are arranged. */
+	double p_merge[MAX_OBJECT_LEDS] = {0};
+	for (int i = 0; i < n_cands; i++) {
+		const struct merge_candidate *c = cands + i;
+		if (capacity[c->slot] <= 0.0) {
+			continue; /* an earlier, better-contained LED already spent this blob's surplus */
+		}
+		const double claim = capacity[c->slot] < 1.0 ? capacity[c->slot] : 1.0;
+		p_merge[c->led_idx] = c->overlap < claim ? c->overlap : claim;
+		capacity[c->slot] -= claim;
+	}
+
 	double nll_detection = 0.0;
 	double nll_missed_if_matched = 0.0;
 	for (int i = 0; i < match_info->num_visible_leds; i++) {
-		const struct pose_metrics_visible_led_info *led_info = match_info->visible_leds + i;
+		struct pose_metrics_visible_led_info *led_info = match_info->visible_leds + i;
 		const double w = led_visibility_weight(led_info->facing_dot);
 		double p = DATA_NLL_P_MIN + (1.0 - DATA_NLL_P_MIN) * w;
 		if (p > 1.0 - DATA_NLL_P_MIN)
 			p = 1.0 - DATA_NLL_P_MIN; /* ceiling: keep -log(1-p) finite for a straight-on LED */
 		if (led_info->matched_blob != NULL) {
+			led_info->miss_nll = 0.0;
 			nll_detection += -log(p);
 			nll_missed_if_matched += -log(1.0 - p);
 		} else {
-			nll_detection += -log(1.0 - p); /* visible LED left unmatched: miss cost */
+			/* No SEPARATE blob was produced: either the LED went undetected, or its light merged
+			 * into one already explained. */
+			led_info->miss_nll = -log(1.0 - p + p * p_merge[i]);
+			nll_detection += led_info->miss_nll;
 		}
 	}
 	match_info->data_nll_detection = nll_detection;

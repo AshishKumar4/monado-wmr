@@ -1349,3 +1349,164 @@ TEST_CASE("work budget: wave-D takes are capped, drain the remainder, and never 
 	CHECK(g2_work_budget_take(&remaining, 2560) == 0); // exhausted stays at zero
 	CHECK(remaining == 0);
 }
+
+// ===========================================================================
+// Merged-LED miss pricing. When two LED images overlap, the detector reports ONE blob, so the
+// second LED cannot produce a blob of its own and must not be charged the full miss cost. The
+// excuse is read off the blob's own pixels: its measured area against the predicted single-LED
+// image area (capacity), and where the LED's image sits inside the measured light (containment).
+// Behavioural tests through the PUBLIC matcher, on data_nll_detection. Three properties, each of
+// which a plausible-but-wrong implementation violates:
+//   (a) CAPACITY  -- a blob measuring one LED's worth of light excuses nothing.
+//   (b) CONTAINMENT -- surplus light excuses only LEDs that actually fall inside that light; an
+//       LED beyond the measured extent pays in full however much surplus the blob carries. (The
+//       refuted max-over-blobs form excused LEDs far outside the blob, on a Gaussian tail whose
+//       scale was the centroid variance.)
+//   (c) BOUNDEDNESS -- one LED-equivalent of surplus excuses ONE LED, not every LED that overlaps.
+// ===========================================================================
+
+namespace {
+
+//! @p n_leds collinear LEDs @p step_m apart, all facing the camera, 0.5 m away.
+struct merge_scene
+{
+	std::vector<t_constellation_led> leds;
+	t_constellation_led_model model{};
+	struct camera_model cam = make_pinhole();
+	struct xrt_pose pose = XRT_POSE_IDENTITY;
+};
+
+merge_scene
+make_merge_scene(int n_leds, float step_m)
+{
+	merge_scene s;
+	s.leds.resize((size_t)n_leds);
+	for (int i = 0; i < n_leds; i++) {
+		s.leds[(size_t)i] = t_constellation_led{};
+		s.leds[(size_t)i].id = (uint16_t)i;
+		s.leds[(size_t)i].pos = {step_m * (float)i, 0.f, 0.f};
+		s.leds[(size_t)i].dir = {0.f, 0.f, -1.f};
+		s.leds[(size_t)i].radius_mm = 4.0f;
+		s.model.num_leds = n_leds;
+	}
+	s.model.id = MODEL_ID;
+	s.model.leds = s.leds.data();
+	s.pose.position = {0.f, 0.f, 0.5f};
+	return s;
+}
+
+//! The projected single-LED image radius, and LED 0's pixel position, for a scene.
+struct merge_probe
+{
+	double led_radius_px;
+	struct xrt_vec2 led0_px;
+	double separation_px;
+	double facing_dot; //!< the scene's own geometry decides the detection odds; do not assume them
+};
+
+merge_probe
+probe_scene(merge_scene &s)
+{
+	struct pose_metrics_blob_match_info probe{};
+	pose_metrics_match_pose_to_blobs(&s.pose, nullptr, 0, &s.model, &s.cam, &probe);
+	REQUIRE(probe.num_visible_leds == s.model.num_leds);
+	const double dx = probe.visible_leds[1].pos_px.x - probe.visible_leds[0].pos_px.x;
+	const double dy = probe.visible_leds[1].pos_px.y - probe.visible_leds[0].pos_px.y;
+	return {probe.visible_leds[0].led_radius_px, probe.visible_leds[0].pos_px, std::sqrt(dx * dx + dy * dy),
+	        probe.visible_leds[1].facing_dot};
+}
+
+/*! data_nll_detection with ONE blob of @p area_px2 on LED 0's projection. The bounding box is sized
+ *  consistently with the area (a real blob always satisfies area <= width*height, and the matcher
+ *  rejects a blob wider than 4*led_radius_px), so the scene stays physically reachable. */
+double
+detection_nll_with_blob(merge_scene &s, const merge_probe &pr, double area_px2)
+{
+	const uint16_t side = (uint16_t)std::ceil(std::sqrt(area_px2));
+	REQUIRE((double)side <= pr.led_radius_px * 4.0); // the matcher would reject a wider blob
+
+	struct blob b = blob{};
+	b.x = pr.led0_px.x;
+	b.y = pr.led0_px.y;
+	b.pos_var_px2 = 1.0f;
+	b.area = (uint32_t)std::lround(area_px2);
+	b.width = b.height = side;
+	b.led_id = LED_INVALID_ID;
+
+	struct pose_metrics_blob_match_info mi{};
+	pose_metrics_match_pose_to_blobs(&s.pose, &b, 1, &s.model, &s.cam, &mi);
+	REQUIRE(mi.matched_blobs == 1);
+	return mi.data_nll_detection;
+}
+
+//! Miss / hit cost in nats for a visible LED at @p facing_dot that produced no blob / a blob.
+double
+full_miss_nats(double facing_dot)
+{
+	return -std::log(1.0 - pose_metrics_pkf_detection_prob(facing_dot));
+}
+
+double
+hit_nats(double facing_dot)
+{
+	return -std::log(pose_metrics_pkf_detection_prob(facing_dot));
+}
+
+} // namespace
+
+TEST_CASE("merged-LED pricing: only SURPLUS measured light excuses an unmatched LED")
+{
+	// Two LEDs 6 mm apart at 0.5 m: their projected images overlap, so a merge is geometrically
+	// possible and only the blob's measured light decides whether it happened.
+	merge_scene s = make_merge_scene(2, 0.006f);
+	const merge_probe pr = probe_scene(s);
+	const double one_led_area = M_PI * pr.led_radius_px * pr.led_radius_px;
+	REQUIRE(pr.separation_px < 2.0 * pr.led_radius_px); // the two images really do overlap
+
+	const double hit = hit_nats(pr.facing_dot);
+	const double full_miss = full_miss_nats(pr.facing_dot);
+	REQUIRE(full_miss > 1.0); // a straight-on LED going undetected is expensive
+
+	// One LED-equivalent of light: the blob holds exactly the LED it is matched to, so the second
+	// LED is a genuine miss and pays in full.
+	CHECK(detection_nll_with_blob(s, pr, one_led_area) == Catch::Approx(hit + full_miss).margin(1e-6));
+
+	// Surplus light: the blob measures well over one LED, so the overlapping second LED is excused.
+	const double merged = detection_nll_with_blob(s, pr, 3.0 * one_led_area);
+	CHECK(merged < hit + full_miss - 1.0);
+}
+
+TEST_CASE("merged-LED pricing: surplus light excuses only what falls INSIDE it")
+{
+	// Same surplus blob, but the second LED now sits 14 mm away — outside the measured light's
+	// extent entirely. Surplus alone must not excuse it: this is the property the refuted
+	// max-over-blobs form violated, absolving LEDs on a tail whose scale was the centroid variance.
+	merge_scene s = make_merge_scene(2, 0.014f);
+	const merge_probe pr = probe_scene(s);
+	const double one_led_area = M_PI * pr.led_radius_px * pr.led_radius_px;
+	const double surplus_area = 3.0 * one_led_area;
+	const double light_radius = std::sqrt(surplus_area / M_PI);
+	REQUIRE(pr.separation_px > light_radius + pr.led_radius_px); // genuinely outside the light
+
+	CHECK(detection_nll_with_blob(s, pr, surplus_area) ==
+	      Catch::Approx(hit_nats(pr.facing_dot) + full_miss_nats(pr.facing_dot)).margin(1e-6));
+}
+
+TEST_CASE("merged-LED pricing: one LED-equivalent of surplus excuses exactly one LED")
+{
+	// Three LEDs whose images all overlap one blob carrying ~one LED-equivalent of SURPLUS light.
+	// It can hide one of the two unmatched LEDs; the other still pays in full. The refuted
+	// unbounded form forgave both, and charging only the granted probability would let them share
+	// the surplus and — the relief being concave — collect more than one full absolution.
+	merge_scene s2 = make_merge_scene(2, 0.004f);
+	merge_scene s3 = make_merge_scene(3, 0.004f);
+	const merge_probe pr = probe_scene(s3);
+	const double two_led_area = 2.0 * M_PI * pr.led_radius_px * pr.led_radius_px;
+	const double full_miss = full_miss_nats(pr.facing_dot);
+
+	const double two = detection_nll_with_blob(s2, pr, two_led_area);
+	const double three = detection_nll_with_blob(s3, pr, two_led_area);
+
+	// The surplus is spent on the nearer LED, so the third arrives to a full miss.
+	CHECK(three - two == Catch::Approx(full_miss).margin(1e-6));
+}

@@ -80,6 +80,11 @@ struct pose_metrics_visible_led_info
 	double gate_ax_px;
 	double gate_ay_px;
 	struct blob *matched_blob;
+	/* Miss cost in nats actually charged for this LED by compute_data_nll: 0 when it is matched,
+	 * otherwise -log(P(no separate blob)) AFTER any merge discount. A downstream term that excuses
+	 * the same miss for another reason (partner occlusion) must discount THIS, not the undiscounted
+	 * -log(1-p), or one LED is forgiven twice. */
+	double miss_nll;
 };
 
 struct pose_metrics_blob_match_info

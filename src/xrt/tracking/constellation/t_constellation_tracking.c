@@ -1999,10 +1999,10 @@ association_partner_occlusion_credit(const struct constellation_tracking_sample 
 				p_occl = p;
 			}
 		}
-		if (p_occl > 0.0) {
-			const double p = pose_metrics_pkf_detection_prob(led->facing_dot);
-			credit += p_occl * -log(1.0 - p);
-		}
+		/* Discount the miss cost this LED was ACTUALLY charged, which the merge model may already
+		 * have reduced — crediting the undiscounted -log(1-p) here forgives a merged-and-occluded
+		 * LED twice and spills the excess onto the matched LEDs' terms. */
+		credit += p_occl * led->miss_nll;
 	}
 	return credit < match_info->data_nll_detection ? credit : match_info->data_nll_detection;
 }
