@@ -177,13 +177,32 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 	set_target_properties(eskf_coast_experiment PROPERTIES FOLDER monado_tests)
 
 	# Standing controller out-of-view / coast regression gate: drives the real ESKF over the committed
-	# head-pose coast fixture and fails if pos drift / flip% / frozen% / the re-entry snap regress past
-	# tolerance vs tests/coast_baseline.json. The binary exits 77 (LOUD ctest SKIP) when the fixture or
-	# baseline is absent, so a fixture-less checkout reports "not run", never a silent pass.
-	add_test(
-		NAME coast_regression
-		COMMAND eskf_coast_experiment ${CMAKE_CURRENT_SOURCE_DIR}/data/headpose_left.replay --check
-				${CMAKE_CURRENT_SOURCE_DIR}/coast_baseline.json)
+	# coast corpus and fails if pos drift / flip% / frozen% / the re-entry snap regress past tolerance vs
+	# tests/coast_baseline.json. The binary exits 77 (LOUD ctest SKIP) when a fixture or the baseline is
+	# absent, so a fixture-less checkout reports "not run", never a silent pass.
+	#
+	# The corpus is THREE real recorded sessions x BOTH controllers (captures 20260524-200416-headpose,
+	# 20260526-175615-clean and 20260528-080421-xv-session1, extracted by
+	# tools/telemetry/make_replay_fixture.py), and the withhold list is the set of coast horizons each leg
+	# is replayed at. One session's natural gaps are ~all optical cadence, which
+	# left every bin past 100 ms holding a handful of samples -- below the gate's minimum, so the whole
+	# out-of-view regime was printed and ignored. The horizons hide the recorded optical stream for that
+	# long every --recover seconds, so the filter dead-reckons a real controller through a real
+	# out-of-view window and is scored against the real pose that ends it; pooled over the corpus every
+	# bin clears the gating minimum. Losing that coverage is itself a gated failure.
+	set(G2_COAST_CORPUS
+		${CMAKE_CURRENT_SOURCE_DIR}/data/headpose_left.replay
+		${CMAKE_CURRENT_SOURCE_DIR}/data/headpose_right.replay
+		${CMAKE_CURRENT_SOURCE_DIR}/data/clean_left.replay
+		${CMAKE_CURRENT_SOURCE_DIR}/data/clean_right.replay
+		${CMAKE_CURRENT_SOURCE_DIR}/data/xv1_left.replay
+		${CMAKE_CURRENT_SOURCE_DIR}/data/xv1_right.replay)
+	set(G2_COAST_HORIZONS
+		--withhold 0 --withhold 0.13 --withhold 0.25 --withhold 0.40 --withhold 0.70 --withhold 1.40
+		--withhold 2.50)
+	add_test(NAME coast_regression
+			 COMMAND eskf_coast_experiment ${G2_COAST_CORPUS} ${G2_COAST_HORIZONS} --check
+					 ${CMAKE_CURRENT_SOURCE_DIR}/coast_baseline.json)
 	set_tests_properties(coast_regression PROPERTIES SKIP_RETURN_CODE 77 LABELS g2_regression)
 
 	# Decoupled unit tests for the constellation PnP mirror-twin enumeration (synthetic geometry,

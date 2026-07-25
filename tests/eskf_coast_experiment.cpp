@@ -22,8 +22,18 @@
  *           RE-ENTRY SNAP it produces — the max single-frame jump in the filter's *reported* position
  *           across a coast->fold transition — so the freeze horizon is a measured trade-off, not a guess.
  *
- *        Optionally (withhold>0) it also imposes artificial coast windows to probe horizons longer
- *        than the natural gap distribution.
+ *        CORPUS + COAST HORIZONS. A single recorded session's natural gap distribution is dominated by
+ *        the 20-50 ms optical cadence: its long-gap bins hold a handful of samples, far too few to gate
+ *        (they were printed and ignored, so the out-of-view regime the user actually feels — "the
+ *        controller disappears, holds, then snaps" — was unguarded). The run is therefore a matrix of
+ *        LEGS: every fixture in the corpus x every coast horizon. A horizon > 0 withholds the optical
+ *        stream for that long every recover_s, so the filter must dead-reckon a real controller through
+ *        a real out-of-view window and is then measured against the real optical pose that ends it.
+ *        Nothing is synthesised: the IMU, the motion and the truth pose are all recorded hardware; only
+ *        the choice of which real poses to hide is ours. Each leg runs its own filter instance; the
+ *        samples pool into the same gap bins (a bin is defined by the ACTUAL gap, so natural and
+ *        withheld coasts of the same length are the same measurement), which is what lifts the long
+ *        bins past MIN_N_TO_GATE and makes them gate.
  *
  *        Bad OPTICAL truth (degenerate PnP fly-aways the live filter itself rejects) would masquerade
  *        as huge "drift"; we reject a pose as untrustworthy truth when it implies a controller speed
@@ -38,8 +48,12 @@
  *        exits 77 (ctest SKIP) with a LOUD reason — never a silent pass. --update (re)writes the
  *        baseline from the current tree.
  *
- * Usage: eskf_coast_experiment <file.replay> [withhold_seconds=0] [recover_seconds=2.0]
+ * Usage: eskf_coast_experiment <file.replay>... [--withhold S]... [--recover S=2.0]
  *          [--intrinsics M_g[9] T_a[9]] [--check baseline.json | --update baseline.json]
+ *
+ * Every .replay is a leg source and every --withhold a coast horizon in seconds (repeat either; with no
+ * --withhold only the natural gaps are measured). --recover is the optical-visible interval between two
+ * imposed coast windows.
  *
  * --intrinsics seeds the optically-derived IMU intrinsics (gyro M_g then accel T_a, 18 row-major
  * doubles) through the SAME kalman_fusion_set_imu_intrinsics the driver's cache loader uses, so an
@@ -179,13 +193,28 @@ key_for_label(const char *label)
 	return label;
 }
 
-void
-print_table(const char *name, bool have_intrinsics, double withhold_s, int folded, size_t nsamples,
-            int rejected_truth, int withheld, double reentry_snap_max_m,
-            const std::vector<BinMetrics> &bins)
+//! One (fixture, coast horizon) leg: what it replayed and what it contributed to the pool.
+struct LegResult
 {
-	printf("# %s  intrinsics=%s  withhold=%.2fs  folded=%d  samples=%zu  rejected-bad-truth=%d  withheld=%d\n",
-	       name, have_intrinsics ? "on" : "identity", withhold_s, folded, nsamples, rejected_truth, withheld);
+	std::string fixture;
+	double withhold_s;
+	int folded, rejected_truth, withheld;
+	size_t nsamples;
+	double snap_max_m;
+};
+
+void
+print_table(bool have_intrinsics, const std::vector<LegResult> &legs, size_t nsamples,
+            double reentry_snap_max_m, const std::vector<BinMetrics> &bins)
+{
+	printf("# corpus: %zu legs  intrinsics=%s  pooled samples=%zu\n", legs.size(),
+	       have_intrinsics ? "on" : "identity", nsamples);
+	printf("# %-22s %8s %7s %8s %9s %8s %8s\n", "leg", "withhold", "folded", "samples", "bad-truth",
+	       "withheld", "snap cm");
+	for (const LegResult &l : legs) {
+		printf("# %-22s %7.2fs %7d %8zu %9d %8d %8.1f\n", l.fixture.c_str(), l.withhold_s, l.folded,
+		       l.nsamples, l.rejected_truth, l.withheld, l.snap_max_m * 100);
+	}
 	printf("# re-entry snap (max reported-pos jump across a coast->fold, gap>%.0fms) = %.1f cm\n",
 	       SNAP_GAP_S * 1e3, reentry_snap_max_m * 100);
 	printf("# gap         all  drift  frozen%%  clean pos drift (cm)      ori err (deg)\n");
@@ -278,14 +307,18 @@ struct Guard
 	std::string where;  // e.g. "bin 100-200ms"
 	std::string metric; // e.g. "pos_p95_cm"
 	double cur, base, tol;
-	bool gated;           // false => reported only (bin too sparse to gate reliably)
-	bool vanished = false; // baseline bin with no samples in the current run (always a regression)
+	bool gated;       // false => reported only (bin too sparse to gate reliably)
+	bool hard = false; // unconditional failure (bin vanished / gating coverage lost); tol does not apply
 };
 
 // Tolerances. The replay is deterministic so these only need to absorb legitimate filter improvements
 // (which lower drift/flips/snap) and tiny numerical jitter — they are one-sided "may not RISE by".
 // Position tolerances scale with the metric (a long-coast bin legitimately drifts more); flips/snap
-// are absolute. Sparse bins (n < MIN_N_TO_GATE) are reported but not gated to avoid single-sample flak.
+// are absolute. A bin below MIN_N_TO_GATE is reported but not gated: a one- or two-sample percentile
+// says nothing about the tracker, and a drift median over 2 samples swings wildly when a flip
+// reclassifies one of them. The corpus x coast-horizon matrix exists to keep every bin above that line
+// — and losing that coverage is itself a gated failure (see compare()), so the "too sparse to gate"
+// escape can never quietly reopen.
 constexpr int MIN_N_TO_GATE = 20;
 constexpr double POS_REL_TOL = 0.50;     // a guarded pos metric may rise up to 50% over baseline
 constexpr double POS_ABS_TOL_CM = 3.0;   // ...or 3 cm, whichever is larger (covers small-baseline bins)
@@ -323,6 +356,17 @@ compare(const std::vector<BinMetrics> &bins, double reentry_snap_max_m, const cJ
 		}
 		bool f;
 		const std::string where = std::string("bin ") + key;
+		// Gating coverage may not shrink. The replay is deterministic, so a bin that carried enough
+		// samples to gate when the baseline was pinned and no longer does has lost a guard — that is a
+		// regression to report, never a reason to stop guarding it.
+		const double base_n = jget(jb, "n", &f);
+		const double base_n_all = jget(jb, "n_all", &f);
+		if (base_n >= MIN_N_TO_GATE && m.n < MIN_N_TO_GATE) {
+			guards.push_back({where, "(drift coverage)", (double)m.n, base_n, 0, true, true});
+		}
+		if (base_n_all >= MIN_N_TO_GATE && m.n_all < MIN_N_TO_GATE) {
+			guards.push_back({where, "(bin coverage)", (double)m.n_all, base_n_all, 0, true, true});
+		}
 		// Drift metrics gate on the clean (non-flipped) sample count; flip/frozen on the full count.
 		guard_pos(guards, where, "pos_med_cm", m.pos_med_cm, jget(jb, "pos_med_cm", &f), m.n);
 		guard_pos(guards, where, "pos_p95_cm", m.pos_p95_cm, jget(jb, "pos_p95_cm", &f), m.n);
@@ -355,7 +399,7 @@ compare(const std::vector<BinMetrics> &bins, double reentry_snap_max_m, const cJ
 	guards.push_back({"global", "reentry_snap_max_cm", reentry_snap_max_m * 100, snap_base,
 	                  SNAP_ABS_TOL_CM, snap_found});
 	for (Guard &gd : guards) {
-		if (gd.gated && (gd.vanished || gd.cur - gd.base > gd.tol))
+		if (gd.gated && (gd.hard || gd.cur - gd.base > gd.tol))
 			ok = false;
 	}
 	return ok;
@@ -367,101 +411,30 @@ print_guard_table(const std::vector<Guard> &guards)
 	printf("%-16s %-14s %9s %9s %9s  %s\n", "where", "metric", "current", "baseline", "tol", "status");
 	printf("%s\n", std::string(72, '-').c_str());
 	for (const Guard &g : guards) {
-		const bool fail = g.gated && (g.vanished || g.cur - g.base > g.tol);
+		const bool fail = g.gated && (g.hard || g.cur - g.base > g.tol);
 		const char *status = !g.gated ? "report" : (fail ? "FAIL" : "ok");
 		printf("%-16s %-14s %9.2f %9.2f %9.2f  %s%s\n", g.where.c_str(), g.metric.c_str(), g.cur, g.base,
 		       g.tol, status, fail ? "  <== REGRESSION" : "");
 	}
 }
 
-} // namespace
-
-int
-main(int argc, char **argv)
+//! Replay ONE leg: a fixture driven through a fresh filter with @p withhold_ns of optical hidden every
+//! @p recover_ns. Appends its coast samples to @p samples and returns what the leg replayed. Every leg
+//! is independent (own filter, own bootstrap), so a corpus is just a loop.
+LegResult
+run_leg(const g2replay::Dataset &ds, const std::string &fixture, int64_t withhold_ns, int64_t recover_ns,
+        const double *mg, const double *ta, std::vector<Sample> &samples)
 {
-	if (argc < 2) {
-		fprintf(stderr,
-		        "usage: %s <file.replay> [withhold_seconds=0] [recover_seconds=2.0] "
-		        "[--intrinsics M_g[9] T_a[9]] [--check baseline.json | --update baseline.json]\n",
-		        argv[0]);
-		return 2;
-	}
-
-	// Parse the option flags first so the positionals (replay, withhold, recover) may sit anywhere.
-	double mg[9], ta[9];
-	bool have_intrinsics = false;
-	std::string check_path, update_path;
-	std::vector<char *> pos; // positional args once the options are removed
-	pos.push_back(argv[0]);
-	for (int i = 1; i < argc; i++) {
-		const std::string a = argv[i];
-		if (a == "--intrinsics") {
-			if (i + 18 >= argc) {
-				fprintf(stderr, "--intrinsics needs 18 doubles (M_g[9] T_a[9])\n");
-				return 2;
-			}
-			for (int k = 0; k < 9; k++) {
-				mg[k] = atof(argv[i + 1 + k]);
-				ta[k] = atof(argv[i + 10 + k]);
-			}
-			have_intrinsics = true;
-			i += 18;
-		} else if (a == "--check") {
-			if (i + 1 >= argc) {
-				fprintf(stderr, "--check needs a baseline.json path\n");
-				return 2;
-			}
-			check_path = argv[++i];
-		} else if (a == "--update") {
-			if (i + 1 >= argc) {
-				fprintf(stderr, "--update needs a baseline.json path\n");
-				return 2;
-			}
-			update_path = argv[++i];
-		} else {
-			pos.push_back(argv[i]);
-		}
-	}
-	if (!check_path.empty() && !update_path.empty()) {
-		fprintf(stderr, "--check and --update are mutually exclusive\n");
-		return 2;
-	}
-
-	const char *replay_path = pos[1];
-	g2replay::Dataset ds;
-	if (!g2replay::load(replay_path, ds)) {
-		// LOUD skip — the registered ctest's SKIP_RETURN_CODE turns this into a visible ctest SKIP, never
-		// a silent pass. A capture-less / fixture-less checkout therefore reports "not run", with the why.
-		fprintf(stderr,
-		        "SKIP: coast fixture absent or unreadable (%s) -- the coast gate did not run. Generate it "
-		        "with tools/telemetry/make_replay_fixture.py from a real capture.\n",
-		        replay_path);
-		return EXIT_SKIP;
-	}
-	if (ds.imu.empty() || ds.pose.empty()) {
-		fprintf(stderr, "SKIP: replay has no imu (%zu) or pose (%zu) -- coast gate did not run\n",
-		        ds.imu.size(), ds.pose.size());
-		return EXIT_SKIP;
-	}
-
-	const double withhold_s = (pos.size() > 2) ? atof(pos[2]) : 0.0;
-	const int64_t withhold_ns = (int64_t)(withhold_s * 1e9);
-	const int64_t recover_ns = (int64_t)((pos.size() > 3 ? atof(pos[3]) : 2.0) * 1e9);
+	LegResult leg{fixture, withhold_ns * 1e-9, 0, 0, 0, 0, 0.0};
 	const int64_t t0 = ds.imu.front().t_ns;
 	const int64_t bootstrap_ns = t0 + (int64_t)(BOOTSTRAP_S * 1e9);
+	const size_t samples_before = samples.size();
 
 	struct KalmanFusionInterfaceWrapper *kf = kalman_fusion_create();
-	if (have_intrinsics) {
+	if (mg != nullptr) {
 		kalman_fusion_set_imu_intrinsics(kf, mg, ta); // production cache-load path; identity = no-op
-		double rmg[9], rta[9];
-		const bool applied = kalman_fusion_get_imu_intrinsics(kf, rmg, rta);
-		printf("# intrinsics applied=%s  M_g=[%.4f %.4f %.4f; %.4f %.4f %.4f; %.4f %.4f %.4f]\n",
-		       applied ? "yes" : "REJECTED(identity)", rmg[0], rmg[1], rmg[2], rmg[3], rmg[4], rmg[5],
-		       rmg[6], rmg[7], rmg[8]);
 	}
 
-	std::vector<Sample> samples;
-	int folded = 0, rejected_truth = 0, withheld = 0;
 	int64_t last_fold_ns = 0;           // last optical actually folded (gap reference)
 	float last_fold_pos[3] = {0, 0, 0}; // its position, for the bad-truth speed gate
 	bool have_fold = false;
@@ -469,11 +442,10 @@ main(int argc, char **argv)
 	// Re-entry snap: the visible jump in the filter's REPORTED position across a coast->fold. We hold
 	// the last reported position; when a fold ends a gap > SNAP_GAP_S we read the prediction again right
 	// after process_pose and take the largest such single-frame jump.
-	double reentry_snap_max_m = 0.0;
 	bool have_reported = false;
 	float last_reported_pos[3] = {0, 0, 0};
 
-	// Artificial-withhold bookkeeping (only when withhold_s>0).
+	// Artificial-withhold bookkeeping (only when withhold_ns > 0).
 	bool in_coast = false;
 	int64_t coast_end = 0, next_coast = t0 + recover_ns;
 
@@ -482,14 +454,14 @@ main(int argc, char **argv)
 		while (ip < ds.pose.size() && ds.pose[ip].t_ns <= s.t_ns) {
 			const g2replay::Pose &p = ds.pose[ip];
 
-			// Optional artificial coast window: pretend the controller left view.
+			// Imposed coast window: pretend the controller left view for this long.
 			if (withhold_ns > 0) {
 				if (!in_coast && p.t_ns >= next_coast) {
 					in_coast = true;
 					coast_end = p.t_ns + withhold_ns;
 				}
 				if (in_coast && p.t_ns < coast_end) {
-					withheld++;
+					leg.withheld++;
 					ip++;
 					continue;
 				}
@@ -512,7 +484,7 @@ main(int argc, char **argv)
 				                               (tp[2] - last_fold_pos[2]) * (tp[2] - last_fold_pos[2]));
 				const bool plausible_truth = moved <= MAX_SPEED_M_S * gap_s + SPEED_MARGIN_M;
 				if (!plausible_truth) {
-					rejected_truth++; // degenerate optical; don't fold, don't compare
+					leg.rejected_truth++; // degenerate optical; don't fold, don't compare
 					ip++;
 					continue;
 				}
@@ -548,7 +520,7 @@ main(int argc, char **argv)
 					const double jump = std::sqrt((rp[0] - last_reported_pos[0]) * (rp[0] - last_reported_pos[0]) +
 					                              (rp[1] - last_reported_pos[1]) * (rp[1] - last_reported_pos[1]) +
 					                              (rp[2] - last_reported_pos[2]) * (rp[2] - last_reported_pos[2]));
-					reentry_snap_max_m = std::max(reentry_snap_max_m, jump);
+					leg.snap_max_m = std::max(leg.snap_max_m, jump);
 				}
 				last_reported_pos[0] = rp[0];
 				last_reported_pos[1] = rp[1];
@@ -561,7 +533,7 @@ main(int argc, char **argv)
 			last_fold_pos[1] = tp[1];
 			last_fold_pos[2] = tp[2];
 			have_fold = true;
-			folded++;
+			leg.folded++;
 			ip++;
 		}
 		struct xrt_imu_sample is = {};
@@ -571,10 +543,116 @@ main(int argc, char **argv)
 		kalman_fusion_process_imu_data(kf, &is, nullptr, nullptr);
 	}
 	kalman_fusion_destroy(kf);
+	leg.nsamples = samples.size() - samples_before;
+	return leg;
+}
+
+} // namespace
+
+int
+main(int argc, char **argv)
+{
+	// Parse the option flags first so the fixture paths may sit anywhere on the command line.
+	double mg[9], ta[9];
+	bool have_intrinsics = false;
+	std::string check_path, update_path;
+	std::vector<std::string> fixtures;
+	std::vector<double> withholds_s; // coast horizons; empty => natural gaps only
+	double recover_s = 2.0;
+	for (int i = 1; i < argc; i++) {
+		const std::string a = argv[i];
+		if (a == "--intrinsics") {
+			if (i + 18 >= argc) {
+				fprintf(stderr, "--intrinsics needs 18 doubles (M_g[9] T_a[9])\n");
+				return 2;
+			}
+			for (int k = 0; k < 9; k++) {
+				mg[k] = atof(argv[i + 1 + k]);
+				ta[k] = atof(argv[i + 10 + k]);
+			}
+			have_intrinsics = true;
+			i += 18;
+		} else if (a == "--withhold" || a == "--recover" || a == "--check" || a == "--update") {
+			if (i + 1 >= argc) {
+				fprintf(stderr, "%s needs an argument\n", a.c_str());
+				return 2;
+			}
+			const char *v = argv[++i];
+			if (a == "--withhold") {
+				withholds_s.push_back(atof(v));
+			} else if (a == "--recover") {
+				recover_s = atof(v);
+			} else if (a == "--check") {
+				check_path = v;
+			} else {
+				update_path = v;
+			}
+		} else {
+			fixtures.push_back(a);
+		}
+	}
+	if (fixtures.empty()) {
+		fprintf(stderr,
+		        "usage: %s <file.replay>... [--withhold S]... [--recover S=2.0] "
+		        "[--intrinsics M_g[9] T_a[9]] [--check baseline.json | --update baseline.json]\n",
+		        argv[0]);
+		return 2;
+	}
+	if (!check_path.empty() && !update_path.empty()) {
+		fprintf(stderr, "--check and --update are mutually exclusive\n");
+		return 2;
+	}
+	if (withholds_s.empty()) {
+		withholds_s.push_back(0.0); // natural gap distribution only
+	}
+
+	// Load the whole corpus up front: a missing fixture must stop the run LOUDLY (a silently smaller
+	// corpus would thin the long-gap bins back below the gating threshold, which is the exact failure
+	// this tool exists to prevent).
+	std::vector<g2replay::Dataset> corpus(fixtures.size());
+	for (size_t i = 0; i < fixtures.size(); i++) {
+		if (!g2replay::load(fixtures[i], corpus[i])) {
+			// LOUD skip — the registered ctest's SKIP_RETURN_CODE turns this into a visible ctest SKIP,
+			// never a silent pass. A capture-less checkout therefore reports "not run", with the why.
+			fprintf(stderr,
+			        "SKIP: coast fixture absent or unreadable (%s) -- the coast gate did not run. Generate "
+			        "it with tools/telemetry/make_replay_fixture.py from a real capture.\n",
+			        fixtures[i].c_str());
+			return EXIT_SKIP;
+		}
+		if (corpus[i].imu.empty() || corpus[i].pose.empty()) {
+			fprintf(stderr, "SKIP: %s has no imu (%zu) or pose (%zu) -- coast gate did not run\n",
+			        fixtures[i].c_str(), corpus[i].imu.size(), corpus[i].pose.size());
+			return EXIT_SKIP;
+		}
+	}
+
+	if (have_intrinsics) {
+		struct KalmanFusionInterfaceWrapper *probe = kalman_fusion_create();
+		kalman_fusion_set_imu_intrinsics(probe, mg, ta);
+		double rmg[9], rta[9];
+		const bool applied = kalman_fusion_get_imu_intrinsics(probe, rmg, rta);
+		printf("# intrinsics applied=%s  M_g=[%.4f %.4f %.4f; %.4f %.4f %.4f; %.4f %.4f %.4f]\n",
+		       applied ? "yes" : "REJECTED(identity)", rmg[0], rmg[1], rmg[2], rmg[3], rmg[4], rmg[5],
+		       rmg[6], rmg[7], rmg[8]);
+		kalman_fusion_destroy(probe);
+	}
+
+	std::vector<Sample> samples;
+	std::vector<LegResult> legs;
+	double reentry_snap_max_m = 0.0;
+	const int64_t recover_ns = (int64_t)(recover_s * 1e9);
+	for (size_t i = 0; i < corpus.size(); i++) {
+		for (double w : withholds_s) {
+			const LegResult leg = run_leg(corpus[i], corpus[i].name, (int64_t)(w * 1e9), recover_ns,
+			                              have_intrinsics ? mg : nullptr, ta, samples);
+			reentry_snap_max_m = std::max(reentry_snap_max_m, leg.snap_max_m);
+			legs.push_back(leg);
+		}
+	}
 
 	const std::vector<BinMetrics> bins = reduce_bins(samples);
-	print_table(replay_path, have_intrinsics, withhold_s, folded, samples.size(), rejected_truth, withheld,
-	            reentry_snap_max_m, bins);
+	print_table(have_intrinsics, legs, samples.size(), reentry_snap_max_m, bins);
 
 	if (!update_path.empty()) {
 		if (!write_baseline(update_path, reentry_snap_max_m, bins)) {
@@ -604,7 +682,8 @@ main(int argc, char **argv)
 		std::vector<Guard> guards;
 		const bool ok = compare(bins, reentry_snap_max_m, baseline, guards);
 		cJSON_Delete(baseline);
-		printf("\n=== coast regression check (%s) ===\n", replay_path);
+		printf("\n=== coast regression check (%zu fixtures x %zu coast horizons) ===\n", fixtures.size(),
+		       withholds_s.size());
 		print_guard_table(guards);
 		printf("\ntolerance: pos may rise <= max(%.0f%%, %.0fcm); flip%% <= +%.0f; frozen%% <= +%.0f; "
 		       "snap <= +%.0fcm; sparse bins (n<%d) reported not gated\n",
@@ -614,6 +693,13 @@ main(int argc, char **argv)
 		for (const Guard &gd : guards) {
 			n_gated += gd.gated ? 1 : 0;
 		}
+		printf("coverage: %zu of %zu guards gated", n_gated, guards.size());
+		for (const BinMetrics &m : bins) {
+			if (m.n < MIN_N_TO_GATE || m.n_all < MIN_N_TO_GATE) {
+				printf("; %s UNGATED (n=%d n_all=%d)", key_for_label(m.label), m.n, m.n_all);
+			}
+		}
+		printf("\n");
 		if (n_gated == 0) {
 			printf("\nRESULT: FAIL -- no guard was gateable (zero gated evidence); refusing to pass\n");
 			return 1;
