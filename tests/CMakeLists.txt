@@ -154,10 +154,25 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 	if(NOT G2_REGRESSION_PYTHON)
 		set(G2_REGRESSION_PYTHON ${Python3_EXECUTABLE})
 	endif()
+
+	# The scoring tools live in the research tree that contains this checkout, which is three levels
+	# up from the MAIN checkout and four or more from a git worktree — the project's normal way of
+	# working. A fixed ../../../ therefore silently pointed both standing gates at a nonexistent file
+	# in every worktree. Walk up until the tools are found; if they are not, keep the fixed path so
+	# the gates fail loudly rather than disappearing from the board.
+	set(G2_TELEMETRY_TOOLS ${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/telemetry)
+	set(_g2_probe ${CMAKE_CURRENT_SOURCE_DIR})
+	foreach(_ RANGE 8)
+		get_filename_component(_g2_probe ${_g2_probe} DIRECTORY)
+		if(EXISTS ${_g2_probe}/tools/telemetry/regression_check.py)
+			set(G2_TELEMETRY_TOOLS ${_g2_probe}/tools/telemetry)
+			break()
+		endif()
+	endforeach()
 	add_test(
 		NAME regression_benchmark
 		COMMAND ${G2_REGRESSION_PYTHON}
-				${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/telemetry/regression_check.py
+				${G2_TELEMETRY_TOOLS}/regression_check.py
 				--bin $<TARGET_FILE:offline_vio_replay> --baseline
 				${CMAKE_CURRENT_SOURCE_DIR}/regression_baseline.json)
 	# regression_check.py exits 77 on every skip path (missing scoring deps / capture / binary /
@@ -176,7 +191,7 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 	add_test(
 		NAME identity_swap_regression
 		COMMAND ${G2_REGRESSION_PYTHON}
-				${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/telemetry/identity_swap_check.py
+				${G2_TELEMETRY_TOOLS}/identity_swap_check.py
 				${CMAKE_CURRENT_BINARY_DIR}/identity_swap_regression --regression --bin
 				$<TARGET_FILE:offline_vio_replay>)
 	set_tests_properties(
