@@ -187,12 +187,13 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 		regression_benchmark PROPERTIES ENVIRONMENT "PYTHONNOUSERSITE=1" SKIP_RETURN_CODE 77 LABELS
 										g2_regression)
 
-	# Standing CROSS-DEVICE IDENTITY gate: replays the pinned identity-swap fixture (a capture whose
-	# 300 ms optical blackouts made the two controllers trade LED rings) and fails if ANY accepted
-	# optical pose inside the frozen episode windows lands on the partner's cleaned-GT instead of its
-	# own. Distinct from regression_benchmark, which scores each device against its own reference and
-	# so cannot tell a swap from ordinary error. Skips 77 like the gates above when the capture,
-	# harness or scoring deps are absent.
+	# Standing CROSS-DEVICE IDENTITY gate: replays every pinned identity-swap fixture (the xv1 session
+	# whose 300 ms optical blackouts made the two controllers trade LED rings, and the July-23 session
+	# whose hands-close instants do it with no forced dropout at all) and fails if ANY accepted optical
+	# pose inside a frozen episode window lands on the partner's cleaned-GT instead of its own.
+	# Distinct from regression_benchmark, which scores each device against its own reference and so
+	# cannot tell a swap from ordinary error. Skips 77 like the gates above when a capture, the
+	# harness or the scoring deps are absent.
 	add_test(
 		NAME identity_swap_regression
 		COMMAND ${G2_REGRESSION_PYTHON}
