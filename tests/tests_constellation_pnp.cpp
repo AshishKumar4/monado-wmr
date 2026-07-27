@@ -58,6 +58,18 @@ quat_from_rvec(const cv::Mat &rvec)
 	return q;
 }
 
+//! Inverse of quat_from_rvec (shortest-arc, so q and -q give the same vector).
+cv::Mat
+rvec_from_quat(const struct xrt_quat &q)
+{
+	const double n = std::sqrt((double)q.x * q.x + (double)q.y * q.y + (double)q.z * q.z);
+	if (n < 1e-12) {
+		return cv::Mat::zeros(3, 1, CV_64F);
+	}
+	const double s = (q.w < 0.f ? -1.0 : 1.0) * 2.0 * std::atan2(n, std::fabs((double)q.w)) / n;
+	return (cv::Mat_<double>(3, 1) << q.x * s, q.y * s, q.z * s);
+}
+
 //! A zero-distortion pinhole camera (RADTAN_8 with all coeffs 0 == pinhole undistort).
 struct camera_model
 make_pinhole()
@@ -109,7 +121,7 @@ build_scene(const std::vector<cv::Point3f> &obj,
 
 } // namespace
 
-TEST_CASE("near-coplanar few-LED solve recovers BOTH twins; truth is one of them")
+TEST_CASE("near-coplanar few-LED solve recovers the truth AND its geometric mirror twin")
 {
 	// A tilted planar LED patch (z=0 in object frame) — the geometry that admits the mirror two-fold.
 	const std::vector<cv::Point3f> obj = {
@@ -132,16 +144,61 @@ TEST_CASE("near-coplanar few-LED solve recovers BOTH twins; truth is one of them
 	                                          &ninliers, &twin, &has_twin);
 	REQUIRE(ok);
 
-	const struct xrt_quat qt = quat_from_rvec(rvec_true);
-	const double a_primary = quat_angle_deg(pose.orientation, qt);
-	const double a_twin = has_twin ? quat_angle_deg(twin.orientation, qt) : 1e3;
-
-	// The truth must be recovered as ONE of the candidates (reprojection cannot say which — that's the
-	// prior's job downstream; here we only require that the correct mode was enumerated, not lost).
-	REQUIRE(std::min(a_primary, a_twin) < 5.0);
-	// The tilted planar geometry genuinely has a second mode: a distinct twin must be reported.
+	// The blobs are exact, so the truth reprojects at 0.00 px against the twin's ~1.04 px: the
+	// reprojection-ranked solver returns the TRUTH as the primary. Pin that, not "one of the two is right"
+	// (which would leave the twin — the whole point of the call — unconstrained).
+	REQUIRE(quat_angle_deg(pose.orientation, quat_from_rvec(rvec_true)) < 0.5);
 	REQUIRE(has_twin);
-	REQUIRE(quat_angle_deg(pose.orientation, twin.orientation) > 20.0);
+
+	// THE property the optical front-end rests on: the twin is the GEOMETRIC MIRROR of the true pose —
+	// the patch normal reflected about the bearing to its centroid, centroid held fixed in the camera.
+	// Derived here from the KNOWN object-frame normal (the patch is exactly z=0), so it does not restate
+	// the solver's own SVD/analytic construction.
+	cv::Mat R_true;
+	cv::Rodrigues(rvec_true, R_true);
+	cv::Point3d c(0, 0, 0);
+	for (const cv::Point3f &p : obj) {
+		c += cv::Point3d(p.x, p.y, p.z);
+	}
+	c *= 1.0 / (double)obj.size();
+	const cv::Mat c_obj = (cv::Mat_<double>(3, 1) << c.x, c.y, c.z);
+	const cv::Mat c_cam = R_true * c_obj + tvec_true;
+	const cv::Mat bearing = c_cam / cv::norm(c_cam);
+	const cv::Mat n_cam = R_true * (cv::Mat_<double>(3, 1) << 0.0, 0.0, 1.0);
+	cv::Mat n_mirror = 2.0 * bearing.dot(n_cam) * bearing - n_cam; // reflect the normal about the view ray
+	n_mirror /= cv::norm(n_mirror);
+	const cv::Mat align_axis = n_cam.cross(n_mirror);
+	const double sa = cv::norm(align_axis);
+	cv::Mat R_align = cv::Mat::eye(3, 3, CV_64F);
+	if (sa > 1e-12) {
+		cv::Rodrigues(align_axis / sa * std::atan2(sa, n_cam.dot(n_mirror)), R_align);
+	}
+	const cv::Mat R_mirror = R_align * R_true;
+	cv::Mat rvec_mirror;
+	cv::Rodrigues(R_mirror, rvec_mirror);
+	const cv::Mat tvec_mirror = c_cam - R_mirror * c_obj;
+
+	// The solver LM-polishes the twin on its own inliers, moving it 1.49 deg / 2.5 mm off this
+	// weak-perspective mirror; 3 deg / 5 mm is ~2x that, and a fabricated twin sits 71 deg away.
+	CHECK(quat_angle_deg(twin.orientation, quat_from_rvec(rvec_mirror)) < 3.0);
+	const double dx = twin.position.x - tvec_mirror.at<double>(0);
+	const double dy = twin.position.y - tvec_mirror.at<double>(1);
+	const double dz = twin.position.z - tvec_mirror.at<double>(2);
+	CHECK(std::sqrt(dx * dx + dy * dy + dz * dz) < 0.005);
+
+	// ...and being the mirror, it is a genuine ALTERNATIVE EXPLANATION of the same image: it reprojects
+	// back onto the same blobs at 1.04 px RMS (full perspective breaks the ambiguity only weakly at this
+	// scale). Any non-mirror twin lands ~8 px out. This subsumes the old "> 20 deg apart" distinctness
+	// check: the mirror is 59 deg from the primary and the twin is pinned to within 3 deg of it.
+	const std::vector<cv::Point2f> px_twin =
+	    project(obj, rvec_from_quat(twin.orientation),
+	            (cv::Mat_<double>(3, 1) << twin.position.x, twin.position.y, twin.position.z));
+	double sum_sq = 0.0;
+	for (size_t i = 0; i < px_twin.size(); i++) {
+		const double ex = px_twin[i].x - blobs[i].x, ey = px_twin[i].y - blobs[i].y;
+		sum_sq += ex * ex + ey * ey;
+	}
+	CHECK(std::sqrt(sum_sq / (double)px_twin.size()) < 2.0);
 }
 
 TEST_CASE("well-conditioned non-coplanar solve is unambiguous (recovers truth, no spurious twin)")

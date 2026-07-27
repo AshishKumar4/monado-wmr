@@ -3932,12 +3932,16 @@ TEST_CASE("kalman: full accel ellipsoid calibration recovers a known per-axis sc
 	}
 	double T[9];
 	REQUIRE(kf->debug_get_accel_calibration(T) == true); // fitted from the orientations
-	CHECK(T[0] == Approx(1.0 / sx).margin(0.04));         // diagonal ~ 1/S (recovers the per-axis scale)
-	CHECK(T[4] == Approx(1.0 / sy).margin(0.04));
-	CHECK(T[8] == Approx(1.0 / sz).margin(0.04));
-	CHECK(std::abs(T[1]) < 0.05); // ~no spurious misalignment (off-diagonal near 0)
-	CHECK(std::abs(T[2]) < 0.05);
-	CHECK(std::abs(T[5]) < 0.05);
+	// The 14 orientations are exact and rest-only, so the only input error is the float32 accel
+	// quantisation (~6e-8 relative); the fit lands within 5.3e-6 of S^-1 on every axis. 1e-4 is 20x
+	// that residual yet 99x tighter than the SMALLEST identity gap (|1 - 1/sz| = 0.0099), so an
+	// unfitted/identity T cannot pass -- which is what makes this the magnitude pin.
+	CHECK(T[0] == Approx(1.0 / sx).margin(1e-4));
+	CHECK(T[4] == Approx(1.0 / sy).margin(1e-4));
+	CHECK(T[8] == Approx(1.0 / sz).margin(1e-4));
+	CHECK(std::abs(T[1]) < 1e-4); // a diagonal S must fit diagonal: no spurious misalignment
+	CHECK(std::abs(T[2]) < 1e-4);
+	CHECK(std::abs(T[5]) < 1e-4);
 }
 
 TEST_CASE("kalman: reported pose uncertainty falls with tracking and rises when optical is lost in motion")
@@ -4814,6 +4818,28 @@ mahalanobis2(const float zhat[2], const float S[4], double bx, double by)
 	return rx * (i00 * rx + i01 * ry) + ry * (i10 * rx + i11 * ry);
 }
 
+//! d² of a blob displaced @p disp px from zhat along the image direction that a small rotation of the
+//! filter's estimate (@p p, @p q) about world @p axis moves @p led_obj. The probe direction comes from the
+//! GEOMETRY -- never from S -- so the result measures what the gate does to a real tilt/yaw error.
+static double
+gate_d2_along_world_rot(const LEDCameraView &view,
+                        V3 p,
+                        Q q,
+                        V3 led_obj,
+                        V3 axis,
+                        const float zhat[2],
+                        const float S[4],
+                        double disp)
+{
+	const double delta = 0.01; // rad: small enough that the reprojection is locally linear
+	double u0, v0, u1, v1;
+	REQUIRE(reproject_filter(view, p, q, led_obj, u0, v0));
+	REQUIRE(reproject_filter(view, p, q_norm(q_mul(q_axis(axis, delta), q)), led_obj, u1, v1));
+	const double dx = u1 - u0, dy = v1 - v0, n = std::sqrt(dx * dx + dy * dy);
+	REQUIRE(n > 1e-9);
+	return mahalanobis2(zhat, S, (double)zhat[0] + disp * dx / n, (double)zhat[1] + disp * dy / n);
+}
+
 TEST_CASE("kalman: covariance-gated partial-fold association (in-gate folds, flip/garbage folds nothing)")
 {
 	using xrt::auxiliary::tracking::LEDObservation;
@@ -4895,15 +4921,28 @@ TEST_CASE("kalman: covariance-gated partial-fold association (in-gate folds, fli
 	// increment 2. This test therefore asserts only what the per-LED covariance gate actually guarantees:
 	// in-gate true blob folds, gross mislabel is rejected, and the gate is ANISOTROPIC (below).
 
-	// (2b) ANISOTROPY (the design's actual claim) — TEETH. The fully-converged S above is nearly isotropic
-	// (P collapsed -> S≈R=2.25·I), so it cannot exercise the claim. Build a state that IS anisotropic: a
-	// fresh filter bootstrapped then given just a FEW folds, so P (hence HPHᵀ) is still well above R and
-	// retains the anisotropic shape of the geometry. Then probe AT zhat (residual r0=0 exactly, so the
-	// result is purely S's shape, not a base residual) and displace by the SAME pixel magnitude along the
-	// TIGHT vs the LOOSE principal axis. For a residual r along an eigenvector d²=|r|²/λ, so a fixed
-	// |r|=disp gives d²_tight=disp²/λ_small, d²_loose=disp²/λ_big, hence d²_tight/d²_loose == λ_big/λ_small
-	// EXACTLY — the anisotropy of S, which is >1 iff S is genuinely anisotropic and ==1 iff isotropic. So
-	// this FAILS if HPHᵀ were zeroed (S=R, ratio 1.0): the H P Hᵀ term is load-bearing.
+	// (2b) ANISOTROPY (the design's actual claim) -- TEETH, as a DIFFERENTIAL over filter state. Probe the
+	// gate along image directions derived from the GEOMETRY: perturb the filter's own estimate about world-up
+	// (YAW -- gravity-blind, unobserved through a dropout) and about world-X (TILT -- which gravity anchors),
+	// and reproject to get the pixel direction each DOF moves this LED along (here almost exactly the image
+	// +u and -v axes respectively). Displace by the SAME pixel magnitude along each and compare d2. This
+	// never touches S's eigenvectors, so it measures the gate's effect on a real tilt/yaw error rather than
+	// restating S's own decomposition.
+	//
+	// Converged, P has collapsed to S ~= R = 2.25.I and the gate is ISOTROPIC: the ratio must be ~1. After an
+	// optical dropout, IMU-only propagation inflates P anisotropically (the gyro grows the orientation block
+	// while gravity holds the tilt sub-block tighter than yaw), so HPH^T rises above R and tilt gets gated
+	// ~1.70x tighter than yaw. Pinning BOTH regimes is what gives this teeth: a hand-rolled or constant S,
+	// a zeroed HPH^T, or a wrong H cannot move between them.
+	const double PROBE_PX = 5.0;
+	{
+		const double d2_yaw = gate_d2_along_world_rot(view[0], fp, fq, led.pos[led_idx], {0, 1, 0}, zhat, S,
+		                                              PROBE_PX);
+		const double d2_tilt = gate_d2_along_world_rot(view[0], fp, fq, led.pos[led_idx], {1, 0, 0}, zhat, S,
+		                                               PROBE_PX);
+		INFO("converged d2_yaw=" << d2_yaw << " d2_tilt=" << d2_tilt);
+		CHECK(d2_tilt / d2_yaw == Approx(1.0).epsilon(0.02)); // S ~= R: no direction is privileged yet
+	}
 	{
 		auto kfa = KalmanFusionInterface::create();
 		REQUIRE(kfa != nullptr);
@@ -4918,43 +4957,24 @@ TEST_CASE("kalman: covariance-gated partial-fold association (in-gate folds, fli
 			ta += imu_dt; tsa += imu_dt_ns;
 			if (ta >= next) { next += 1.0 / 60.0; eskf_feed_leds(kfa.get(), tsa, gt_pose(ta), led, cam, view, rnga, 1.5, 0); }
 		}
-		// Then an optical DROPOUT: IMU-only propagation inflates P ANISOTROPICALLY (the gyro grows the
-		// orientation block; gravity keeps the tilt sub-block tighter than yaw), so HPHᵀ rises well above
-		// R and S takes on the geometry's anisotropy. This is exactly the post-dropout regime the gate is
-		// designed for (wide where uncertain, tight where the gravity anchor holds).
-		for (int i = 0; i < 60; i++) {
+		for (int i = 0; i < 60; i++) { // then the optical DROPOUT: IMU-only propagation inflates P
 			GTPose g = gt_pose(ta);
 			feed_imu(kfa.get(), tsa, gen_accel_body(g.q, gt_accel_world(ta)), to_xrt_vec3(gt_gyro_body(ta)));
 			ta += imu_dt; tsa += imu_dt_ns;
 		}
 		float zA[2], SA[4];
 		REQUIRE(kfa->predict_led_gate(tsa, o, view[0], zA, SA));
-		const double a = SA[0], b = SA[1], d = SA[3];
-		const double tr = a + d, det = a * d - b * b;
-		const double disc = std::sqrt(std::max(0.0, tr * tr / 4.0 - det));
-		const double l_big = tr / 2.0 + disc, l_small = tr / 2.0 - disc; // eigenvalues (px^2)
-		REQUIRE(l_small > 0.0);
-		const double aniso_ratio = l_big / l_small;
-		INFO("l_big=" << l_big << " l_small=" << l_small << " anisotropy=" << aniso_ratio);
-		REQUIRE(aniso_ratio > 1.05); // S must genuinely BE anisotropic for this state (else the test has no teeth)
-		// Eigenvector for the LARGE eigenvalue (loose axis); the tight one is orthogonal.
-		double ex, ey;
-		if (std::abs(b) > 1e-12) {
-			ex = l_big - d; ey = b;
-		} else {
-			ex = (a >= d) ? 1.0 : 0.0; ey = (a >= d) ? 0.0 : 1.0;
-		}
-		const double en = std::hypot(ex, ey); ex /= en; ey /= en;
-		const double sx = -ey, sy = ex; // tight (orthogonal) axis
-		const double disp = 2.2 * std::sqrt(l_small); // a fixed pixel magnitude
-		// Probe relative to zhat itself => r0 == the displacement, no base-residual contamination.
-		const double d2_tight = mahalanobis2(zA, SA, (double)zA[0] + disp * sx, (double)zA[1] + disp * sy);
-		const double d2_loose = mahalanobis2(zA, SA, (double)zA[0] + disp * ex, (double)zA[1] + disp * ey);
-		INFO("d2_tight=" << d2_tight << " d2_loose=" << d2_loose << " ratio=" << d2_tight / d2_loose);
-		// Same |r| is "farther" on the tight axis, by EXACTLY the anisotropy ratio (the load-bearing claim).
-		CHECK(d2_tight == Approx(2.2 * 2.2).epsilon(1e-6));               // disp²/λ_small == 2.2² on the tight axis
-		CHECK(d2_loose == Approx(2.2 * 2.2 / aniso_ratio).epsilon(1e-6)); // and disp²/λ_big on the loose axis
-		CHECK(d2_tight / d2_loose == Approx(aniso_ratio).epsilon(1e-6));  // ratio == λ_big/λ_small (== 1 if isotropic)
+		xrt_space_relation rel_a{};
+		kfa->get_prediction(tsa, &rel_a, nullptr);
+		const V3 pa{rel_a.pose.position.x, rel_a.pose.position.y, rel_a.pose.position.z};
+		const Q qa = from_xrt_quat(rel_a.pose.orientation);
+		const double d2_yaw = gate_d2_along_world_rot(view[0], pa, qa, led.pos[led_idx], {0, 1, 0}, zA, SA,
+		                                              PROBE_PX);
+		const double d2_tilt = gate_d2_along_world_rot(view[0], pa, qa, led.pos[led_idx], {1, 0, 0}, zA, SA,
+		                                               PROBE_PX);
+		INFO("dropout d2_yaw=" << d2_yaw << " d2_tilt=" << d2_tilt);
+		CHECK(d2_tilt > d2_yaw);                              // gravity anchors tilt; yaw is the loose DOF
+		CHECK(d2_tilt / d2_yaw == Approx(1.70).epsilon(0.05)); // and by this much (isotropic would be 1.00)
 	}
 
 	// (3) COVARIANCE HONESTY: a partial fold of a SINGLE in-gate LED must keep the orientation covariance

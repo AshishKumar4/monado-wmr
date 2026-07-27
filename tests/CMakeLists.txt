@@ -55,11 +55,29 @@ if(XRT_BUILD_DRIVER_HANDTRACKING)
 	list(APPEND tests tests_levenbergmarquardt)
 endif()
 
+# Every case in these is tagged [.][needgpu], so on a headless machine the binary legitimately runs zero
+# cases. Only they may pass --allow-running-no-tests, and ctest turns their "No tests ran" banner into a
+# visible SKIP: a green square over zero coverage is indistinguishable from a green square over real
+# coverage. Every other test must FAIL if it ever runs nothing.
+set(gpu_gated_tests
+    tests_aux_d3d_d3d11
+    tests_aux_d3d_d3d12
+    tests_comp_client_d3d11
+    tests_comp_client_d3d12
+    tests_comp_client_opengl
+    tests_comp_client_vulkan
+	)
+
 foreach(testname ${tests})
 	add_executable(${testname} ${testname}.cpp)
 	target_link_libraries(${testname} PRIVATE xrt-external-catch2)
 	target_link_libraries(${testname} PRIVATE aux_util)
-	add_test(NAME ${testname} COMMAND ${testname} --success --allow-running-no-tests)
+	if(testname IN_LIST gpu_gated_tests)
+		add_test(NAME ${testname} COMMAND ${testname} --success --allow-running-no-tests)
+		set_tests_properties(${testname} PROPERTIES SKIP_REGULAR_EXPRESSION "No tests ran")
+	else()
+		add_test(NAME ${testname} COMMAND ${testname} --success)
+	endif()
 	set_target_properties(${testname} PROPERTIES FOLDER monado_tests)
 endforeach()
 
@@ -86,14 +104,14 @@ add_executable(tests_association_hypothesis tests_association_hypothesis.cpp)
 target_link_libraries(tests_association_hypothesis PRIVATE xrt-external-catch2 aux_util)
 target_include_directories(
 	tests_association_hypothesis PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/tracking/constellation)
-add_test(NAME tests_association_hypothesis COMMAND tests_association_hypothesis --success --allow-running-no-tests)
+add_test(NAME tests_association_hypothesis COMMAND tests_association_hypothesis --success)
 set_target_properties(tests_association_hypothesis PROPERTIES FOLDER monado_tests)
 
 add_executable(tests_l2_accept_gate tests_l2_accept_gate.cpp)
 target_link_libraries(tests_l2_accept_gate PRIVATE xrt-external-catch2)
 target_include_directories(
 	tests_l2_accept_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/tracking/constellation)
-add_test(NAME tests_l2_accept_gate COMMAND tests_l2_accept_gate --success --allow-running-no-tests)
+add_test(NAME tests_l2_accept_gate COMMAND tests_l2_accept_gate --success)
 set_target_properties(tests_l2_accept_gate PROPERTIES FOLDER monado_tests)
 
 # Recorded cam0 timestamp sequences of the 2026-07-06 crashed + healthy sessions.
@@ -136,10 +154,25 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 	if(NOT G2_REGRESSION_PYTHON)
 		set(G2_REGRESSION_PYTHON ${Python3_EXECUTABLE})
 	endif()
+
+	# The scoring tools live in the research tree that contains this checkout, which is three levels
+	# up from the MAIN checkout and four or more from a git worktree — the project's normal way of
+	# working. A fixed ../../../ therefore silently pointed both standing gates at a nonexistent file
+	# in every worktree. Walk up until the tools are found; if they are not, keep the fixed path so
+	# the gates fail loudly rather than disappearing from the board.
+	set(G2_TELEMETRY_TOOLS ${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/telemetry)
+	set(_g2_probe ${CMAKE_CURRENT_SOURCE_DIR})
+	foreach(_ RANGE 8)
+		get_filename_component(_g2_probe ${_g2_probe} DIRECTORY)
+		if(EXISTS ${_g2_probe}/tools/telemetry/regression_check.py)
+			set(G2_TELEMETRY_TOOLS ${_g2_probe}/tools/telemetry)
+			break()
+		endif()
+	endforeach()
 	add_test(
 		NAME regression_benchmark
 		COMMAND ${G2_REGRESSION_PYTHON}
-				${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/telemetry/regression_check.py
+				${G2_TELEMETRY_TOOLS}/regression_check.py
 				--bin $<TARGET_FILE:offline_vio_replay> --baseline
 				${CMAKE_CURRENT_SOURCE_DIR}/regression_baseline.json --out
 				${CMAKE_CURRENT_BINARY_DIR}/regression_benchmark)
@@ -163,7 +196,7 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 	add_test(
 		NAME identity_swap_regression
 		COMMAND ${G2_REGRESSION_PYTHON}
-				${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/telemetry/identity_swap_check.py
+				${G2_TELEMETRY_TOOLS}/identity_swap_check.py
 				${CMAKE_CURRENT_BINARY_DIR}/identity_swap_regression --regression --bin
 				$<TARGET_FILE:offline_vio_replay>)
 	set_tests_properties(
@@ -219,7 +252,7 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 	target_include_directories(
 		tests_constellation_pnp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/tracking/constellation
 										${OpenCV_INCLUDE_DIRS})
-	add_test(NAME tests_constellation_pnp COMMAND tests_constellation_pnp --success --allow-running-no-tests)
+	add_test(NAME tests_constellation_pnp COMMAND tests_constellation_pnp --success)
 	set_target_properties(tests_constellation_pnp PROPERTIES FOLDER monado_tests)
 
 	# Decoupled unit tests for per-LED multi-camera triangulation and the L1 single-cam-depth verdict.
@@ -230,7 +263,7 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 	target_include_directories(
 		tests_multicam_triangulate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/tracking/constellation
 										   ${OpenCV_INCLUDE_DIRS})
-	add_test(NAME tests_multicam_triangulate COMMAND tests_multicam_triangulate --success --allow-running-no-tests)
+	add_test(NAME tests_multicam_triangulate COMMAND tests_multicam_triangulate --success)
 	set_target_properties(tests_multicam_triangulate PROPERTIES FOLDER monado_tests)
 
 	# Decoupled unit tests for the kept-alive 2-mode yaw belief.
@@ -241,7 +274,7 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 	target_include_directories(
 		tests_yaw_belief PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/tracking/constellation
 								 ${OpenCV_INCLUDE_DIRS})
-	add_test(NAME tests_yaw_belief COMMAND tests_yaw_belief --success --allow-running-no-tests)
+	add_test(NAME tests_yaw_belief COMMAND tests_yaw_belief --success)
 	set_target_properties(tests_yaw_belief PROPERTIES FOLDER monado_tests)
 
 	# Decoupled, adversarial unit tests for the blob-detection layer (saturated-centroid recovery,
@@ -253,7 +286,7 @@ if(XRT_HAVE_OPENCV AND TARGET constellation_tracker)
 	target_include_directories(
 		tests_blobwatch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/tracking/constellation
 								${OpenCV_INCLUDE_DIRS})
-	add_test(NAME tests_blobwatch COMMAND tests_blobwatch --success --allow-running-no-tests)
+	add_test(NAME tests_blobwatch COMMAND tests_blobwatch --success)
 	set_target_properties(tests_blobwatch PROPERTIES FOLDER monado_tests)
 
 	# Detection-eval harness: runs the REAL blobwatch on PGM frames and dumps blob centroids as
@@ -275,7 +308,7 @@ if(XRT_BUILD_DRIVER_WMR)
 	target_link_libraries(
 		tests_wmr_config PRIVATE xrt-external-catch2 xrt-interfaces aux_math aux_util xrt-external-cjson)
 	target_include_directories(tests_wmr_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/xrt/drivers)
-	add_test(NAME tests_wmr_config COMMAND tests_wmr_config --success --allow-running-no-tests)
+	add_test(NAME tests_wmr_config COMMAND tests_wmr_config --success)
 	set_target_properties(tests_wmr_config PROPERTIES FOLDER monado_tests)
 endif()
 
